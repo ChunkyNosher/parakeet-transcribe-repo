@@ -1,0 +1,11 @@
+# yt-dlp batch downloader temporary files
+temp_format_check.txt
+temp_full_format.txt
+*.debug
+
+# Keep the dependencies folder structure but ignore specific temp files
+yt-dlp batch downloader dependencies/temp_*.txt
+yt-dlp batch downloader dependencies/*.debug
+
+# Keep logs folder but allow user to commit specific logs if needed
+# (logs are not ignored by default as they may be useful for troubleshooting)
