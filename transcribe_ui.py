@@ -1,11 +1,19 @@
 import gradio as gr
 import nemo.collections.asr as nemo_asr
-import nemo.collections.speechlm2 as slm  # Required for Canary SALM model
 import torch
 import os
 import sys
 import time
 from pathlib import Path
+
+# Try to import SALM module for Canary model
+# This may not be available in older NeMo versions
+try:
+    import nemo.collections.speechlm2 as slm
+    SALM_AVAILABLE = True
+except ImportError:
+    slm = None
+    SALM_AVAILABLE = False
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -18,6 +26,10 @@ AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 
 # Separator string for output formatting
 SEPARATOR = '=' * 60
+
+# Canary model revision - pinned to prevent re-downloads when HuggingFace repo updates
+# Update this hash if you want to use a newer version of Canary
+CANARY_PINNED_REVISION = "2399591399e4e6438fa7804f2f1f1660"
 
 # Model configurations
 # Note: Canary uses SALM architecture that cannot be saved as .nemo file
@@ -32,8 +44,7 @@ MODEL_CONFIGS = {
     },
     "canary": {
         "hf_model_id": "nvidia/canary-qwen-2.5b",
-        # Pinned revision to prevent re-downloads when HuggingFace repo updates
-        "revision": "2399591399e4e6438fa7804f2f1f1660",
+        "revision": CANARY_PINNED_REVISION,
         "max_batch_size": 16,  # Increased from default
         "display_name": "Canary-Qwen-2.5B",
         "loading_method": "huggingface"  # Load from HuggingFace using SALM
@@ -214,6 +225,17 @@ def load_model(model_name, show_progress=False):
         else:
             # Canary: Load from HuggingFace using SALM with pinned revision
             # SALM (Speech-Aware Language Model) architecture cannot be saved as .nemo
+            
+            # Check if SALM module is available
+            if not SALM_AVAILABLE:
+                raise ImportError(_format_canary_error(
+                    title="SALM MODULE NOT AVAILABLE!",
+                    display_name=config['display_name'],
+                    problem_msg="The nemo.collections.speechlm2 module is not installed.",
+                    solution_msg="Please upgrade NeMo to version 2.6.0 or later: pip install nemo_toolkit[all]>=2.6.0",
+                    original_error=None
+                ))
+            
             hf_model_id = config["hf_model_id"]
             revision = config.get("revision")
             
