@@ -15,6 +15,9 @@ VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.m4v'}
 # Audio file extensions
 AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 
+# Separator string for output formatting
+SEPARATOR = '=' * 60
+
 # Model configurations
 MODEL_CONFIGS = {
     "parakeet": {
@@ -114,7 +117,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         # Handle both single file and multiple files
         # Gradio gr.File with file_count="multiple" returns list of file objects
         # Each file object has a .name attribute with the path
-        if audio_files is None:
+        if audio_files is None or (isinstance(audio_files, list) and len(audio_files) == 0):
             return "⚠️ Please upload an audio or video file first", "", None
         
         # Convert file objects to paths
@@ -132,9 +135,6 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             file_list = [audio_files.name]
         else:
             file_list = [str(audio_files)]
-        
-        if len(file_list) == 0:
-            return "⚠️ Please upload an audio or video file first", "", None
         
         is_batch = len(file_list) > 1
         
@@ -269,9 +269,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             # Combine transcriptions with file headers
             combined_transcription = ""
             for i, (info, trans) in enumerate(zip(file_info, all_transcriptions)):
-                combined_transcription += f"\n{'='*60}\n"
+                combined_transcription += f"\n{SEPARATOR}\n"
                 combined_transcription += f"FILE {i+1}: {info['name']}\n"
-                combined_transcription += f"{'='*60}\n\n"
+                combined_transcription += f"{SEPARATOR}\n\n"
                 combined_transcription += trans + "\n"
             
             transcription_output = combined_transcription
@@ -329,12 +329,12 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f.write(f"Model: {model_choice}\n")
                     f.write(f"Total Duration: {int(total_duration // 60)}m {int(total_duration % 60)}s\n")
                     f.write(f"Processing Time: {total_time:.2f}s\n")
-                    f.write(f"\n{'='*60}\n")
+                    f.write(f"\n{SEPARATOR}\n")
                     
                     for i, (info, trans) in enumerate(zip(file_info, all_transcriptions)):
                         f.write(f"\nFILE {i+1}: {info['name']}\n")
                         f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
-                        f.write(f"{'='*60}\n\n")
+                        f.write(f"{SEPARATOR}\n\n")
                         f.write(trans)
                         f.write("\n")
                 else:
@@ -343,15 +343,15 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f.write(f"Model: {model_choice}\n")
                     f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
                     f.write(f"Processing Time: {total_time:.2f}s\n")
-                    f.write(f"\n{'='*60}\n")
+                    f.write(f"\n{SEPARATOR}\n")
                     f.write(f"TRANSCRIPTION\n")
-                    f.write(f"{'='*60}\n\n")
-                    f.write(result[0].text)
+                    f.write(f"{SEPARATOR}\n\n")
+                    f.write(transcription)
                     
                     if include_timestamps and hasattr(result[0], 'words') and result[0].words:
-                        f.write(f"\n\n{'='*60}\n")
+                        f.write(f"\n\n{SEPARATOR}\n")
                         f.write(f"WORD-LEVEL TIMESTAMPS\n")
-                        f.write(f"{'='*60}\n\n")
+                        f.write(f"{SEPARATOR}\n\n")
                         for word in result[0].words:
                             f.write(f"{word.start:.2f}s - {word.end:.2f}s: {word.text}\n")
             
@@ -360,6 +360,13 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         return status, transcription_output, output_file
         
     except Exception as e:
+        # Get actual VRAM info for error message
+        if torch.cuda.is_available():
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            vram_info = f"you have {vram_total:.0f}GB"
+        else:
+            vram_info = "no GPU detected"
+        
         error_msg = f"""
 ### ❌ Error During Transcription
 
@@ -369,7 +376,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 
 **Troubleshooting:**
 1. Make sure the audio/video file is valid
-2. Check that you have enough VRAM (you have 12GB)
+2. Check that you have enough VRAM ({vram_info})
 3. Try a shorter audio file first
 4. Restart the interface if models are stuck
 5. For video files, ensure FFmpeg is installed
@@ -409,15 +416,39 @@ CUDA is not available. Please check:
 """
     return info
 
+def get_privacy_performance_info():
+    """Generate dynamic privacy & performance information"""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_info = f"**GPU**: {gpu_name} ({vram_total:.0f}GB VRAM)"
+    else:
+        gpu_info = "**GPU**: CPU Mode (No CUDA GPU detected)"
+    
+    return f"""
+### Privacy:
+- ✅ 100% local processing
+- ✅ No internet required (after model download)
+- ✅ Your audio never leaves your computer
+
+### Performance Optimizations:
+- {gpu_info}
+- **Speed**: 40-100× faster than real-time
+- **Example**: 1 hour audio → 30-60 seconds processing
+- **Mixed Precision**: FP16 inference for 1.5-2.5× speedup
+- **TF32 Tensor Cores**: Enabled for matrix operations
+- **Dynamic Batch Sizing**: Optimized based on audio duration
+"""
+
 # Create the Gradio interface
 with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     
     # Header
     gr.Markdown("""
     # 🎙️ NVIDIA NeMo Local Audio Transcription
-    ### Powered by Parakeet-TDT & Canary-Qwen on Your RTX 4080
+    ### Powered by Parakeet-TDT & Canary-Qwen on Your Local GPU
     
-    Transform your audio files into accurate text transcriptions using state-of-the-art AI models running entirely on your local GPU.
+    Transform your audio and video files into accurate text transcriptions using state-of-the-art AI models running entirely on your local GPU.
     """)
     
     # System info at the top
@@ -546,20 +577,7 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         """)
     
     with gr.Accordion("🔒 Privacy & Performance", open=False):
-        gr.Markdown("""
-        ### Privacy:
-        - ✅ 100% local processing
-        - ✅ No internet required (after model download)
-        - ✅ Your audio never leaves your computer
-        
-        ### Performance Optimizations:
-        - **GPU**: RTX 4080 Laptop (12GB VRAM)
-        - **Speed**: 40-100× faster than real-time
-        - **Example**: 1 hour audio → 30-60 seconds processing
-        - **Mixed Precision**: FP16 inference for 1.5-2.5× speedup
-        - **TF32 Tensor Cores**: Enabled for matrix operations
-        - **Dynamic Batch Sizing**: Optimized based on audio duration
-        """)
+        gr.Markdown(get_privacy_performance_info())
     
     # Connect button
     transcribe_btn.click(
