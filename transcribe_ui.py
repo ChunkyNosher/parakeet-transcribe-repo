@@ -6,6 +6,15 @@ import sys
 import time
 from pathlib import Path
 
+# Try to import SALM module for Canary model
+# This may not be available in older NeMo versions
+try:
+    import nemo.collections.speechlm2 as slm
+    SALM_AVAILABLE = True
+except ImportError:
+    slm = None
+    SALM_AVAILABLE = False
+
 # Global model cache to avoid reloading
 models_cache = {}
 
@@ -18,17 +27,27 @@ AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 # Separator string for output formatting
 SEPARATOR = '=' * 60
 
+# Canary model revision - pinned to prevent re-downloads when HuggingFace repo updates
+# Update this hash if you want to use a newer version of Canary
+CANARY_PINNED_REVISION = "2399591399e4e6438fa7804f2f1f1660"
+
 # Model configurations
+# Note: Canary uses SALM architecture that cannot be saved as .nemo file
+# Parakeet: Loads from local .nemo file (offline)
+# Canary: Loads from HuggingFace cache with pinned revision (first use downloads, then cached)
 MODEL_CONFIGS = {
     "parakeet": {
         "local_path": "local_models/parakeet.nemo",
         "max_batch_size": 32,  # Increased from 16
-        "display_name": "Parakeet-TDT-0.6B v2"
+        "display_name": "Parakeet-TDT-0.6B v2",
+        "loading_method": "local"  # Load from local .nemo file
     },
     "canary": {
-        "local_path": "local_models/canary.nemo", 
+        "hf_model_id": "nvidia/canary-qwen-2.5b",
+        "revision": CANARY_PINNED_REVISION,
         "max_batch_size": 16,  # Increased from default
-        "display_name": "Canary-Qwen-2.5B"
+        "display_name": "Canary-Qwen-2.5B",
+        "loading_method": "huggingface"  # Load from HuggingFace using SALM
     }
 }
 
@@ -38,15 +57,16 @@ def get_script_dir():
 
 def validate_local_models():
     """
-    Validate that local .nemo model files exist before launching UI.
+    Validate that Parakeet local .nemo model file exists before launching UI.
+    
+    Note: Canary uses SALM architecture and loads from HuggingFace cache,
+    so it doesn't require a local .nemo file.
     
     Returns:
-        bool: True if all models exist, False otherwise
+        bool: True if Parakeet model exists, False otherwise
     """
     script_dir = get_script_dir()
     local_models_dir = script_dir / "local_models"
-    
-    missing_files = []
     
     # Check if local_models directory exists
     if not local_models_dir.exists():
@@ -55,29 +75,27 @@ def validate_local_models():
         print("="*80)
         print(f"\nThe 'local_models/' directory does not exist.")
         print(f"Expected location: {local_models_dir}")
-        print("\nRequired files:")
+        print("\nRequired file:")
         print(f"  • {local_models_dir / 'parakeet.nemo'}")
-        print(f"  • {local_models_dir / 'canary.nemo'}")
-        print("\nThese files must be created once using the setup script.")
+        print("\nNote: Canary loads from HuggingFace cache (no local file needed)")
+        print("\nThe Parakeet file must be created once using the setup script.")
         print("Please run: python setup_local_models.py")
         print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
         print("="*80 + "\n")
         return False
     
-    # Check for each .nemo file
-    for model_name, config in MODEL_CONFIGS.items():
-        model_path = script_dir / config["local_path"]
-        if not model_path.exists():
-            missing_files.append((model_name, model_path))
+    # Only check for Parakeet .nemo file (Canary uses HuggingFace)
+    parakeet_config = MODEL_CONFIGS["parakeet"]
+    parakeet_path = script_dir / parakeet_config["local_path"]
     
-    if missing_files:
+    if not parakeet_path.exists():
         print("\n" + "="*80)
-        print("❌ LOCAL MODELS NOT FOUND!")
+        print("❌ PARAKEET MODEL NOT FOUND!")
         print("="*80)
-        print("\nMissing model files:")
-        for model_name, path in missing_files:
-            print(f"  • {path} ({MODEL_CONFIGS[model_name]['display_name']})")
-        print("\nThese files must be created once using the setup script.")
+        print(f"\nMissing model file:")
+        print(f"  • {parakeet_path} ({parakeet_config['display_name']})")
+        print("\nNote: Canary loads from HuggingFace cache (no local file needed)")
+        print("\nThe Parakeet file must be created once using the setup script.")
         print("Please run: python setup_local_models.py")
         print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
         print("="*80 + "\n")
@@ -147,7 +165,14 @@ def _format_model_error(title, model_path, display_name, problem_msg, solution_m
 
 
 def load_model(model_name, show_progress=False):
-    """Load model from local .nemo file if not already in memory cache.
+    """Load model using the appropriate method based on model type.
+    
+    - Parakeet: Loads from local .nemo file using restore_from()
+    - Canary: Loads from HuggingFace using SALM.from_pretrained() with pinned revision
+    
+    Canary uses SALM (Speech-Aware Language Model) architecture that cannot be 
+    packaged as .nemo files. It loads from HuggingFace cache with a pinned revision
+    to prevent re-downloads.
     
     Args:
         model_name: "parakeet" or "canary"
@@ -157,44 +182,161 @@ def load_model(model_name, show_progress=False):
         The loaded ASR model
         
     Raises:
-        FileNotFoundError: If the .nemo file doesn't exist
+        FileNotFoundError: If the Parakeet .nemo file doesn't exist
+        ConnectionError: If Canary download fails due to network issues
+        OSError: If Canary download fails due to disk space issues
     """
     if model_name not in models_cache:
         config = MODEL_CONFIGS[model_name]
         script_dir = get_script_dir()
-        model_path = script_dir / config["local_path"]
-        
-        # Check if .nemo file exists
-        if not model_path.exists():
-            raise FileNotFoundError(_format_model_error(
-                title="MODEL FILE NOT FOUND!",
-                model_path=model_path,
-                display_name=config['display_name'],
-                problem_msg="The .nemo file must be created once using the setup script.",
-                solution_msg="Please run: python setup_local_models.py"
-            ))
-        
-        print(f"📦 Loading {config['display_name']} from local file...")
         
         start_time = time.time()
-        try:
-            models_cache[model_name] = nemo_asr.models.ASRModel.restore_from(
-                str(model_path)
-            )
-        except FileNotFoundError as e:
-            # Re-raise with more helpful message
-            raise FileNotFoundError(_format_model_error(
-                title="FAILED TO LOAD MODEL!",
-                model_path=model_path,
-                display_name=config['display_name'],
-                problem_msg="The .nemo file may be corrupted or incomplete.",
-                solution_msg="Please recreate it using: python setup_local_models.py",
-                original_error=e
-            ))
+        
+        if config.get("loading_method") == "local":
+            # Parakeet: Load from local .nemo file
+            model_path = script_dir / config["local_path"]
+            
+            # Check if .nemo file exists
+            if not model_path.exists():
+                raise FileNotFoundError(_format_model_error(
+                    title="MODEL FILE NOT FOUND!",
+                    model_path=model_path,
+                    display_name=config['display_name'],
+                    problem_msg="The .nemo file must be created once using the setup script.",
+                    solution_msg="Please run: python setup_local_models.py"
+                ))
+            
+            print(f"📦 Loading {config['display_name']} from local file...")
+            
+            try:
+                models_cache[model_name] = nemo_asr.models.ASRModel.restore_from(
+                    str(model_path)
+                )
+            except FileNotFoundError as e:
+                # Re-raise with more helpful message
+                raise FileNotFoundError(_format_model_error(
+                    title="FAILED TO LOAD MODEL!",
+                    model_path=model_path,
+                    display_name=config['display_name'],
+                    problem_msg="The .nemo file may be corrupted or incomplete.",
+                    solution_msg="Please recreate it using: python setup_local_models.py",
+                    original_error=e
+                ))
+        else:
+            # Canary: Load from HuggingFace using SALM with pinned revision
+            # SALM (Speech-Aware Language Model) architecture cannot be saved as .nemo
+            
+            # Check if SALM module is available
+            if not SALM_AVAILABLE:
+                raise ImportError(_format_canary_error(
+                    title="SALM MODULE NOT AVAILABLE!",
+                    display_name=config['display_name'],
+                    problem_msg="The nemo.collections.speechlm2 module is not installed.",
+                    solution_msg="Please upgrade NeMo to version 2.6.0 or later: pip install nemo_toolkit[all]>=2.6.0",
+                    original_error=None
+                ))
+            
+            hf_model_id = config["hf_model_id"]
+            revision = config.get("revision")
+            
+            print(f"📦 Loading {config['display_name']} from HuggingFace cache...")
+            if revision:
+                print(f"   Using pinned revision: {revision[:12]}...")
+            print("   (First load downloads ~5GB, subsequent loads use cache)")
+            
+            try:
+                # Use SALM.from_pretrained for Canary-Qwen-2.5B
+                # The revision parameter pins to a specific commit to prevent re-downloads
+                models_cache[model_name] = slm.models.SALM.from_pretrained(
+                    hf_model_id,
+                    revision=revision
+                )
+            except ConnectionError as e:
+                # Network error during download
+                raise ConnectionError(_format_canary_error(
+                    title="NETWORK ERROR LOADING CANARY!",
+                    display_name=config['display_name'],
+                    problem_msg="Failed to connect to HuggingFace to download the model.",
+                    solution_msg="Please check your internet connection and try again.",
+                    original_error=e
+                ))
+            except OSError as e:
+                # Disk space or file system error
+                error_str = str(e).lower()
+                if "no space" in error_str or "disk" in error_str:
+                    raise OSError(_format_canary_error(
+                        title="DISK SPACE ERROR LOADING CANARY!",
+                        display_name=config['display_name'],
+                        problem_msg="Insufficient disk space to download the model (~5GB required).",
+                        solution_msg="Please free up disk space and try again.",
+                        original_error=e
+                    ))
+                raise OSError(_format_canary_error(
+                    title="FILE SYSTEM ERROR LOADING CANARY!",
+                    display_name=config['display_name'],
+                    problem_msg="A file system error occurred while loading the model.",
+                    solution_msg="Please check file permissions and try again.",
+                    original_error=e
+                ))
+            except Exception as e:
+                # Generic error handler for other issues
+                raise RuntimeError(_format_canary_error(
+                    title="ERROR LOADING CANARY!",
+                    display_name=config['display_name'],
+                    problem_msg=f"An unexpected error occurred: {type(e).__name__}",
+                    solution_msg="Try clearing the cache and retrying. If the problem persists, check the console for details.",
+                    original_error=e
+                ))
         
         load_time = time.time() - start_time
         print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
     return models_cache[model_name]
+
+
+def _format_canary_error(title, display_name, problem_msg, solution_msg, original_error=None):
+    """Format a Canary model loading error message with consistent styling.
+    
+    Args:
+        title: Error title (e.g., "NETWORK ERROR LOADING CANARY!")
+        display_name: Human-readable model name
+        problem_msg: Description of what went wrong
+        solution_msg: How to fix the issue
+        original_error: Original exception message if wrapping an error
+    
+    Returns:
+        Formatted error message string
+    """
+    error_lines = [
+        f"\n{'='*80}",
+        f"❌ {title}",
+        f"{'='*80}",
+        "",
+        f"Model: {display_name}",
+        "",
+        "Note: Canary uses SALM architecture and loads from HuggingFace cache.",
+        "      First load requires internet connection (~5GB download).",
+        "      Subsequent loads work offline (cached).",
+    ]
+    
+    if original_error:
+        error_lines.append(f"\nOriginal error: {str(original_error)}")
+    
+    error_lines.extend([
+        "",
+        f"Problem: {problem_msg}",
+        f"Solution: {solution_msg}",
+        "",
+        "Troubleshooting steps:",
+        "  1. Check your internet connection",
+        "  2. Ensure you have at least 10GB free disk space",
+        "  3. Try clearing cache: Remove ~/.cache/torch/NeMo folder",
+        "  4. If problem persists, check console output for details",
+        "",
+        "See docs/manual/canary-hybrid-loading-fix.md for more information.",
+        f"{'='*80}",
+    ])
+    
+    return "\n".join(error_lines)
 
 def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps):
     """
@@ -531,10 +673,15 @@ def get_privacy_performance_info():
     
     return f"""
 ### Privacy:
-- ✅ 100% local & offline processing
-- ✅ No internet connection required
+- ✅ All transcription processing happens locally on your machine
 - ✅ Your audio never leaves your computer
-- ✅ Models stored locally as .nemo files
+- ✅ Parakeet: 100% offline (loads from local .nemo file)
+- ✅ Canary: Offline after first load (cached from HuggingFace)
+
+### Model Storage:
+- **Parakeet**: `local_models/parakeet.nemo` (~2.4GB)
+- **Canary**: HuggingFace cache (~5.3GB) - uses SALM architecture
+- Note: Canary cannot be saved as .nemo due to SALM model architecture
 
 ### Performance Optimizations:
 - {gpu_info}
@@ -543,7 +690,7 @@ def get_privacy_performance_info():
 - **Mixed Precision**: FP16 inference for 1.5-2.5× speedup
 - **TF32 Tensor Cores**: Enabled for matrix operations
 - **Dynamic Batch Sizing**: Optimized based on audio duration
-- **Local Loading**: Fast model loading from local .nemo files
+- **Memory Caching**: Models stay in RAM after first load
 """
 
 # Create the Gradio interface
@@ -628,13 +775,14 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Speed: ~40-60× real-time
             - Accuracy: 93.32% (6.68% WER)
             - Best for: Quick transcriptions, bulk processing
-            - Loads from: `local_models/parakeet.nemo`
+            - Loads from: `local_models/parakeet.nemo` (instant, offline)
             
             **Canary-Qwen-2.5B:**
             - Speed: ~50-100× real-time
             - Accuracy: 94.37% (5.63% WER)  
             - Best for: Critical accuracy, technical content
-            - Loads from: `local_models/canary.nemo`
+            - Loads from: HuggingFace cache (first use downloads ~5GB, then cached)
+            - Note: Uses SALM architecture (cannot be saved as .nemo file)
             """)
         
         # Right column - Output
@@ -676,17 +824,22 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - 🎬 **Video Support**: MP4, AVI, MKV, MOV, WEBM, FLV, M4V
         - 📦 **Batch Processing**: Upload multiple files at once
         - ⚡ **GPU Optimized**: Uses FP16 mixed precision for faster processing
-        - 🔒 **100% Offline**: Models load from local files, no internet needed
+        - 🔒 **Privacy First**: All processing happens locally on your machine
+        
+        ### Model Loading:
+        - **Parakeet**: Loads from local `.nemo` file (instant, works offline)
+        - **Canary**: Loads from HuggingFace cache (first use downloads ~5GB, then works offline)
+        - Both models stay in memory after first load (instant subsequent use)
         
         ### Tips:
-        - Models load from local `.nemo` files in the `local_models/` folder
-        - First transcription loads model into memory (~2-3 seconds)
+        - First transcription loads model into memory (~2-3 seconds for Parakeet, ~10-15s for Canary first time)
         - Subsequent transcriptions reuse cached model (instant)
         - Processing time: ~30-60 seconds per hour of audio
         - Video files: Audio is automatically extracted
         
         ### Setup:
-        - Models must be set up once using `setup_local_models.py`
+        - Run `python setup_local_models.py` to set up Parakeet
+        - Canary downloads automatically on first use (no setup needed)
         - See `docs/manual/user-model-setup-guide.md` for instructions
         """)
     
@@ -718,17 +871,27 @@ if __name__ == "__main__":
     
     print("="*80)
     
-    # Validate local models exist before launching UI
-    print("\n📦 Checking local model files...")
+    # Validate models - Parakeet from local, Canary from HuggingFace
+    print("\n📦 Checking model availability...")
     script_dir = get_script_dir()
-    for model_name, config in MODEL_CONFIGS.items():
-        model_path = script_dir / config["local_path"]
-        status = "✅ Found" if model_path.exists() else "❌ Missing"
-        print(f"   {config['display_name']}: {status}")
-        if model_path.exists():
-            size_mb = model_path.stat().st_size / (1024 * 1024)
-            print(f"      Path: {model_path}")
-            print(f"      Size: {size_mb:.1f} MB")
+    
+    # Check Parakeet (local .nemo file)
+    parakeet_config = MODEL_CONFIGS["parakeet"]
+    parakeet_path = script_dir / parakeet_config["local_path"]
+    if parakeet_path.exists():
+        size_mb = parakeet_path.stat().st_size / (1024 * 1024)
+        print(f"   {parakeet_config['display_name']}: ✅ Found (local .nemo)")
+        print(f"      Path: {parakeet_path}")
+        print(f"      Size: {size_mb:.1f} MB")
+    else:
+        print(f"   {parakeet_config['display_name']}: ❌ Missing")
+    
+    # Show Canary info (loads from HuggingFace)
+    canary_config = MODEL_CONFIGS["canary"]
+    print(f"   {canary_config['display_name']}: 📡 Loads from HuggingFace cache")
+    print(f"      Model ID: {canary_config['hf_model_id']}")
+    print(f"      Revision: {canary_config['revision'][:12]}...")
+    print(f"      Note: Downloads ~5GB on first use, then cached offline")
     
     if not validate_local_models():
         sys.exit(1)
