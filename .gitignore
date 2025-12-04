@@ -9,3 +9,11 @@ yt-dlp batch downloader dependencies/*.debug
 
 # Keep logs folder but allow user to commit specific logs if needed
 # (logs are not ignored by default as they may be useful for troubleshooting)
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
