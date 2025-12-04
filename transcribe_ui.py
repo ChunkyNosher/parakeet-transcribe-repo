@@ -2,9 +2,9 @@ import gradio as gr
 import nemo.collections.asr as nemo_asr
 import torch
 import os
+import sys
 import time
 from pathlib import Path
-from huggingface_hub import scan_cache_dir
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -21,28 +21,69 @@ SEPARATOR = '=' * 60
 # Model configurations
 MODEL_CONFIGS = {
     "parakeet": {
-        "repo_id": "nvidia/parakeet-tdt-0.6b-v2",
+        "local_path": "local_models/parakeet.nemo",
         "max_batch_size": 32,  # Increased from 16
         "display_name": "Parakeet-TDT-0.6B v2"
     },
     "canary": {
-        "repo_id": "nvidia/canary-qwen-2.5b", 
+        "local_path": "local_models/canary.nemo", 
         "max_batch_size": 16,  # Increased from default
         "display_name": "Canary-Qwen-2.5B"
     }
 }
 
-def check_model_cached(model_name):
-    """Check if a model is already cached in HuggingFace cache"""
-    try:
-        cache_info = scan_cache_dir()
-        model_repo_id = MODEL_CONFIGS[model_name]["repo_id"]
-        for repo in cache_info.repos:
-            if model_repo_id in repo.repo_id:
-                return True
+def get_script_dir():
+    """Get the directory where the script is located"""
+    return Path(__file__).parent.absolute()
+
+def validate_local_models():
+    """
+    Validate that local .nemo model files exist before launching UI.
+    
+    Returns:
+        bool: True if all models exist, False otherwise
+    """
+    script_dir = get_script_dir()
+    local_models_dir = script_dir / "local_models"
+    
+    missing_files = []
+    
+    # Check if local_models directory exists
+    if not local_models_dir.exists():
+        print("\n" + "="*80)
+        print("❌ LOCAL MODELS NOT FOUND!")
+        print("="*80)
+        print(f"\nThe 'local_models/' directory does not exist.")
+        print(f"Expected location: {local_models_dir}")
+        print("\nRequired files:")
+        print(f"  • {local_models_dir / 'parakeet.nemo'}")
+        print(f"  • {local_models_dir / 'canary.nemo'}")
+        print("\nThese files must be created once using the setup script.")
+        print("Please run: python setup_local_models.py")
+        print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
+        print("="*80 + "\n")
         return False
-    except Exception:
+    
+    # Check for each .nemo file
+    for model_name, config in MODEL_CONFIGS.items():
+        model_path = script_dir / config["local_path"]
+        if not model_path.exists():
+            missing_files.append((model_name, model_path))
+    
+    if missing_files:
+        print("\n" + "="*80)
+        print("❌ LOCAL MODELS NOT FOUND!")
+        print("="*80)
+        print("\nMissing model files:")
+        for model_name, path in missing_files:
+            print(f"  • {path} ({MODEL_CONFIGS[model_name]['display_name']})")
+        print("\nThese files must be created once using the setup script.")
+        print("Please run: python setup_local_models.py")
+        print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
+        print("="*80 + "\n")
         return False
+    
+    return True
 
 def get_dynamic_batch_size(duration, model_key):
     """Calculate optimal batch size based on audio duration and model"""
@@ -68,27 +109,62 @@ def setup_gpu_optimizations():
         print("✅ GPU optimizations enabled (TF32, cuDNN benchmark)")
 
 def load_model(model_name, show_progress=False):
-    """Load model if not already in cache
+    """Load model from local .nemo file if not already in memory cache.
     
     Args:
         model_name: "parakeet" or "canary"
         show_progress: Whether to show loading progress (for startup)
+    
+    Returns:
+        The loaded ASR model
+        
+    Raises:
+        FileNotFoundError: If the .nemo file doesn't exist
     """
     if model_name not in models_cache:
         config = MODEL_CONFIGS[model_name]
-        is_cached = check_model_cached(model_name)
+        script_dir = get_script_dir()
+        model_path = script_dir / config["local_path"]
         
-        if is_cached:
-            print(f"📦 Loading {config['display_name']} from cache...")
-        else:
-            print(f"⬇️ Downloading {config['display_name']} (first time, please wait)...")
+        # Check if .nemo file exists
+        if not model_path.exists():
+            error_msg = (
+                f"\n{'='*80}\n"
+                f"❌ MODEL FILE NOT FOUND!\n"
+                f"{'='*80}\n\n"
+                f"Missing: {model_path}\n"
+                f"Model: {config['display_name']}\n\n"
+                f"The .nemo file must be created once using the setup script.\n"
+                f"Please run: python setup_local_models.py\n\n"
+                f"See docs/manual/user-model-setup-guide.md for instructions.\n"
+                f"{'='*80}\n"
+            )
+            raise FileNotFoundError(error_msg)
+        
+        print(f"📦 Loading {config['display_name']} from local file...")
         
         start_time = time.time()
-        models_cache[model_name] = nemo_asr.models.ASRModel.from_pretrained(
-            config["repo_id"]
-        )
-        load_time = time.time() - start_time
+        try:
+            models_cache[model_name] = nemo_asr.models.ASRModel.restore_from(
+                str(model_path)
+            )
+        except FileNotFoundError as e:
+            # Re-raise with more helpful message
+            error_msg = (
+                f"\n{'='*80}\n"
+                f"❌ FAILED TO LOAD MODEL!\n"
+                f"{'='*80}\n\n"
+                f"File path: {model_path}\n"
+                f"Model: {config['display_name']}\n"
+                f"Original error: {str(e)}\n\n"
+                f"The .nemo file may be corrupted or incomplete.\n"
+                f"Please recreate it using: python setup_local_models.py\n\n"
+                f"See docs/manual/user-model-setup-guide.md for instructions.\n"
+                f"{'='*80}\n"
+            )
+            raise FileNotFoundError(error_msg)
         
+        load_time = time.time() - start_time
         print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
     return models_cache[model_name]
 
@@ -427,9 +503,10 @@ def get_privacy_performance_info():
     
     return f"""
 ### Privacy:
-- ✅ 100% local processing
-- ✅ No internet required (after model download)
+- ✅ 100% local & offline processing
+- ✅ No internet connection required
 - ✅ Your audio never leaves your computer
+- ✅ Models stored locally as .nemo files
 
 ### Performance Optimizations:
 - {gpu_info}
@@ -438,6 +515,7 @@ def get_privacy_performance_info():
 - **Mixed Precision**: FP16 inference for 1.5-2.5× speedup
 - **TF32 Tensor Cores**: Enabled for matrix operations
 - **Dynamic Batch Sizing**: Optimized based on audio duration
+- **Local Loading**: Fast model loading from local .nemo files
 """
 
 # Create the Gradio interface
@@ -446,9 +524,9 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     # Header
     gr.Markdown("""
     # 🎙️ NVIDIA NeMo Local Audio Transcription
-    ### Powered by Parakeet-TDT & Canary-Qwen on Your Local GPU
+    ### 100% Offline - Powered by Local Parakeet-TDT & Canary-Qwen Models
     
-    Transform your audio and video files into accurate text transcriptions using state-of-the-art AI models running entirely on your local GPU.
+    Transform your audio and video files into accurate text transcriptions using state-of-the-art AI models stored locally on your system. No internet required.
     """)
     
     # System info at the top
@@ -522,11 +600,13 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Speed: ~40-60× real-time
             - Accuracy: 93.32% (6.68% WER)
             - Best for: Quick transcriptions, bulk processing
+            - Loads from: `local_models/parakeet.nemo`
             
             **Canary-Qwen-2.5B:**
             - Speed: ~50-100× real-time
             - Accuracy: 94.37% (5.63% WER)  
             - Best for: Critical accuracy, technical content
+            - Loads from: `local_models/canary.nemo`
             """)
         
         # Right column - Output
@@ -568,12 +648,18 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - 🎬 **Video Support**: MP4, AVI, MKV, MOV, WEBM, FLV, M4V
         - 📦 **Batch Processing**: Upload multiple files at once
         - ⚡ **GPU Optimized**: Uses FP16 mixed precision for faster processing
+        - 🔒 **100% Offline**: Models load from local files, no internet needed
         
         ### Tips:
-        - First run downloads models (~20-30 seconds with progress)
-        - Subsequent runs are much faster (models cached)
+        - Models load from local `.nemo` files in the `local_models/` folder
+        - First transcription loads model into memory (~2-3 seconds)
+        - Subsequent transcriptions reuse cached model (instant)
         - Processing time: ~30-60 seconds per hour of audio
         - Video files: Audio is automatically extracted
+        
+        ### Setup:
+        - Models must be set up once using `setup_local_models.py`
+        - See `docs/manual/user-model-setup-guide.md` for instructions
         """)
     
     with gr.Accordion("🔒 Privacy & Performance", open=False):
@@ -604,12 +690,20 @@ if __name__ == "__main__":
     
     print("="*80)
     
-    # Check model cache status
-    print("\n📦 Checking model cache...")
+    # Validate local models exist before launching UI
+    print("\n📦 Checking local model files...")
+    script_dir = get_script_dir()
     for model_name, config in MODEL_CONFIGS.items():
-        is_cached = check_model_cached(model_name)
-        status = "✅ Cached" if is_cached else "⬇️ Will download on first use"
+        model_path = script_dir / config["local_path"]
+        status = "✅ Found" if model_path.exists() else "❌ Missing"
         print(f"   {config['display_name']}: {status}")
+        if model_path.exists():
+            size_mb = model_path.stat().st_size / (1024 * 1024)
+            print(f"      Path: {model_path}")
+            print(f"      Size: {size_mb:.1f} MB")
+    
+    if not validate_local_models():
+        sys.exit(1)
     
     print("\n" + "="*80)
     print("\n🌐 Opening in browser at: http://127.0.0.1:7860")
