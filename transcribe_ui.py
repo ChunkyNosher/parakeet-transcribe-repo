@@ -108,6 +108,44 @@ def setup_gpu_optimizations():
         torch.backends.cudnn.benchmark = True
         print("✅ GPU optimizations enabled (TF32, cuDNN benchmark)")
 
+def _format_model_error(title, model_path, display_name, problem_msg, solution_msg, original_error=None):
+    """Format a model loading error message with consistent styling.
+    
+    Args:
+        title: Error title (e.g., "MODEL FILE NOT FOUND!")
+        model_path: Path to the model file
+        display_name: Human-readable model name
+        problem_msg: Description of what went wrong
+        solution_msg: How to fix the issue
+        original_error: Original exception message if wrapping an error
+    
+    Returns:
+        Formatted error message string
+    """
+    error_lines = [
+        f"\n{'='*80}",
+        f"❌ {title}",
+        f"{'='*80}",
+        "",
+        f"File path: {model_path}",
+        f"Model: {display_name}",
+    ]
+    
+    if original_error:
+        error_lines.append(f"Original error: {str(original_error)}")
+    
+    error_lines.extend([
+        "",
+        problem_msg,
+        solution_msg,
+        "",
+        "See docs/manual/user-model-setup-guide.md for instructions.",
+        f"{'='*80}",
+    ])
+    
+    return "\n".join(error_lines)
+
+
 def load_model(model_name, show_progress=False):
     """Load model from local .nemo file if not already in memory cache.
     
@@ -128,18 +166,13 @@ def load_model(model_name, show_progress=False):
         
         # Check if .nemo file exists
         if not model_path.exists():
-            error_msg = (
-                f"\n{'='*80}\n"
-                f"❌ MODEL FILE NOT FOUND!\n"
-                f"{'='*80}\n\n"
-                f"Missing: {model_path}\n"
-                f"Model: {config['display_name']}\n\n"
-                f"The .nemo file must be created once using the setup script.\n"
-                f"Please run: python setup_local_models.py\n\n"
-                f"See docs/manual/user-model-setup-guide.md for instructions.\n"
-                f"{'='*80}\n"
-            )
-            raise FileNotFoundError(error_msg)
+            raise FileNotFoundError(_format_model_error(
+                title="MODEL FILE NOT FOUND!",
+                model_path=model_path,
+                display_name=config['display_name'],
+                problem_msg="The .nemo file must be created once using the setup script.",
+                solution_msg="Please run: python setup_local_models.py"
+            ))
         
         print(f"📦 Loading {config['display_name']} from local file...")
         
@@ -150,19 +183,14 @@ def load_model(model_name, show_progress=False):
             )
         except FileNotFoundError as e:
             # Re-raise with more helpful message
-            error_msg = (
-                f"\n{'='*80}\n"
-                f"❌ FAILED TO LOAD MODEL!\n"
-                f"{'='*80}\n\n"
-                f"File path: {model_path}\n"
-                f"Model: {config['display_name']}\n"
-                f"Original error: {str(e)}\n\n"
-                f"The .nemo file may be corrupted or incomplete.\n"
-                f"Please recreate it using: python setup_local_models.py\n\n"
-                f"See docs/manual/user-model-setup-guide.md for instructions.\n"
-                f"{'='*80}\n"
-            )
-            raise FileNotFoundError(error_msg)
+            raise FileNotFoundError(_format_model_error(
+                title="FAILED TO LOAD MODEL!",
+                model_path=model_path,
+                display_name=config['display_name'],
+                problem_msg="The .nemo file may be corrupted or incomplete.",
+                solution_msg="Please recreate it using: python setup_local_models.py",
+                original_error=e
+            ))
         
         load_time = time.time() - start_time
         print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
