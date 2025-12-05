@@ -17,3 +17,7 @@ __pycache__/
 *.pyd
 .Python
 *.so
+
+# Exclude large model files
+local_models/
+*.nemo
