@@ -31,7 +31,7 @@ AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 SEPARATOR = '=' * 60
 
 # Canary model revision - set to None to use the latest model version from HuggingFace
-# You can pin to a specific commit by using a valid 40-char SHA-1 hash, 7-12 char short hash,
+# You can pin to a specific commit by using a valid 40-char SHA-1 hash, short hash (4+ chars),
 # branch name (e.g., "main"), or tag name. The previous value was an invalid 32-char hash.
 CANARY_PINNED_REVISION = None
 
@@ -224,12 +224,25 @@ def load_model(model_name, show_progress=False):
                 if "WinError 32" in error_str or "being used by another process" in error_str:
                     # This is likely a temp file cleanup issue, not a model loading failure.
                     # Provide a helpful error message with troubleshooting steps.
+                    problem = (
+                        "Windows temp file cleanup failed (WinError 32). This is often "
+                        "caused by antivirus software (especially Windows Defender), "
+                        "cloud sync services (OneDrive, Dropbox, Google Drive), or "
+                        "file indexing services monitoring the temp folder."
+                    )
+                    solution = (
+                        "Troubleshooting steps:\n"
+                        "1) Add %TEMP% folder to antivirus exclusions\n"
+                        "2) Pause cloud sync or exclude temp folder\n"
+                        "3) Close other applications accessing temp files\n"
+                        "4) Restart your computer and try again"
+                    )
                     raise PermissionError(_format_model_error(
                         title="WINDOWS FILE LOCK ERROR!",
                         model_path=model_path,
                         display_name=config['display_name'],
-                        problem_msg="Windows temp file cleanup failed (WinError 32). This is often caused by antivirus software (especially Windows Defender), cloud sync services (OneDrive, Dropbox, Google Drive), or file indexing services monitoring the temp folder.",
-                        solution_msg="Troubleshooting steps:\n1) Add %TEMP% folder to antivirus exclusions\n2) Pause cloud sync or exclude temp folder\n3) Close other applications accessing temp files\n4) Restart your computer and try again",
+                        problem_msg=problem,
+                        solution_msg=solution,
                         original_error=e
                     ))
                 else:
