@@ -981,7 +981,11 @@ if __name__ == "__main__":
     if SALM_AVAILABLE:
         print(f"   {canary_config['display_name']}: 📡 Loads from HuggingFace cache")
         print(f"      Model ID: {canary_config['hf_model_id']}")
-        print(f"      Revision: {canary_config['revision'][:12]}...")
+        revision = canary_config.get("revision")
+        if revision:
+            print(f"      Revision: {revision[:12]}...")
+        else:
+            print(f"      Revision: latest (no pinning)")
         print(f"      Note: Downloads ~5GB on first use, then cached offline")
     else:
         print(f"   {canary_config['display_name']}: ⚠️ Unavailable (SALM not installed)")
@@ -1002,3 +1006,4 @@ if __name__ == "__main__":
         inbrowser=True,
         show_error=True
     )
+
