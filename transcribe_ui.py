@@ -7,13 +7,16 @@ import time
 from pathlib import Path
 
 # Try to import SALM module for Canary model
-# This may not be available in older NeMo versions
+# SALM (Speech-Aware Language Model) is required for Canary-Qwen-2.5B
+# This requires NeMo 2.6+ with speechlm2 collection installed
 try:
-    import nemo.collections.speechlm2 as slm
+    from nemo.collections.speechlm2.models import SALM
     SALM_AVAILABLE = True
-except ImportError:
-    slm = None
+    SALM_IMPORT_ERROR = None
+except ImportError as e:
+    SALM = None
     SALM_AVAILABLE = False
+    SALM_IMPORT_ERROR = str(e)
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -247,7 +250,7 @@ def load_model(model_name, show_progress=False):
             try:
                 # Use SALM.from_pretrained for Canary-Qwen-2.5B
                 # The revision parameter pins to a specific commit to prevent re-downloads
-                models_cache[model_name] = slm.models.SALM.from_pretrained(
+                models_cache[model_name] = SALM.from_pretrained(
                     hf_model_id,
                     revision=revision
                 )
@@ -337,6 +340,35 @@ def _format_canary_error(title, display_name, problem_msg, solution_msg, origina
     ])
     
     return "\n".join(error_lines)
+
+
+def validate_salm_availability():
+    """
+    Validate SALM module availability at startup and print warning if not available.
+    
+    This gives users immediate feedback about Canary availability without preventing
+    the script from starting (Parakeet should still work).
+    
+    Returns:
+        bool: True if SALM is available, False otherwise
+    """
+    if not SALM_AVAILABLE:
+        print("\n" + "="*80)
+        print("⚠️  WARNING: SALM MODULE NOT AVAILABLE")
+        print("="*80)
+        print("\nCanary model will NOT work in this session.")
+        print("Parakeet model will work normally.")
+        print("\nTo enable Canary-Qwen-2.5B support:")
+        print("  1. Upgrade NeMo to version 2.6.0 or later:")
+        print("     pip install --upgrade \"nemo_toolkit[all]\"")
+        print("  2. Restart this application")
+        if SALM_IMPORT_ERROR:
+            print(f"\nImport error details: {SALM_IMPORT_ERROR}")
+        print("\nSee docs/manual/user-model-setup-guide.md for more information.")
+        print("="*80 + "\n")
+        return False
+    return True
+
 
 def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps):
     """
@@ -633,6 +665,8 @@ If the error persists, please check the console output for more details.
 
 def get_system_info():
     """Display system information"""
+    salm_status = "✅ Yes (Canary available)" if SALM_AVAILABLE else "❌ No (install nemo_toolkit[all])"
+    
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -648,17 +682,20 @@ def get_system_info():
 **CUDA Version**: {torch.version.cuda}
 **PyTorch Version**: {torch.__version__}
 **NeMo Available**: ✅ Yes
+**SALM Available**: {salm_status}
 
 **Status**: ✅ Ready for transcription
 """
     else:
-        info = """
+        info = f"""
 ### ⚠️ No GPU Detected
 
 CUDA is not available. Please check:
 1. NVIDIA GPU drivers are installed
 2. CUDA Toolkit is installed
 3. PyTorch was installed with CUDA support
+
+**SALM Available**: {salm_status}
 """
     return info
 
@@ -776,6 +813,7 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Accuracy: 93.32% (6.68% WER)
             - Best for: Quick transcriptions, bulk processing
             - Loads from: `local_models/parakeet.nemo` (instant, offline)
+            - Requirements: Base NeMo installation
             
             **Canary-Qwen-2.5B:**
             - Speed: ~50-100× real-time
@@ -783,6 +821,8 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Best for: Critical accuracy, technical content
             - Loads from: HuggingFace cache (first use downloads ~5GB, then cached)
             - Note: Uses SALM architecture (cannot be saved as .nemo file)
+            - **Requirements**: NeMo 2.6+ with speechlm2 collection
+            - Install: `pip install --upgrade "nemo_toolkit[all]"`
             """)
         
         # Right column - Output
@@ -831,6 +871,13 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - **Canary**: Loads from HuggingFace cache (first use downloads ~5GB, then works offline)
         - Both models stay in memory after first load (instant subsequent use)
         
+        ### Requirements:
+        - **Parakeet**: Works with base NeMo installation
+        - **Canary**: Requires NeMo 2.6+ with speechlm2 collection
+          - Install: `pip install --upgrade "nemo_toolkit[all]"`
+          - First use downloads ~5GB from HuggingFace
+          - Subsequent uses load from cache (offline)
+        
         ### Tips:
         - First transcription loads model into memory (~2-3 seconds for Parakeet, ~10-15s for Canary first time)
         - Subsequent transcriptions reuse cached model (instant)
@@ -841,6 +888,13 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - Run `python setup_local_models.py` to set up Parakeet
         - Canary downloads automatically on first use (no setup needed)
         - See `docs/manual/user-model-setup-guide.md` for instructions
+        
+        ### Troubleshooting SALM Errors (Canary):
+        If you see "SALM MODULE NOT AVAILABLE" when using Canary:
+        1. Upgrade NeMo: `pip install --upgrade "nemo_toolkit[all]"`
+        2. Restart this application
+        3. Check console for detailed error messages
+        4. See `docs/manual/canary-hybrid-loading-fix.md` for more help
         """)
     
     with gr.Accordion("🔒 Privacy & Performance", open=False):
@@ -871,6 +925,9 @@ if __name__ == "__main__":
     
     print("="*80)
     
+    # Check SALM availability for Canary model
+    validate_salm_availability()
+    
     # Validate models - Parakeet from local, Canary from HuggingFace
     print("\n📦 Checking model availability...")
     script_dir = get_script_dir()
@@ -888,10 +945,14 @@ if __name__ == "__main__":
     
     # Show Canary info (loads from HuggingFace)
     canary_config = MODEL_CONFIGS["canary"]
-    print(f"   {canary_config['display_name']}: 📡 Loads from HuggingFace cache")
-    print(f"      Model ID: {canary_config['hf_model_id']}")
-    print(f"      Revision: {canary_config['revision'][:12]}...")
-    print(f"      Note: Downloads ~5GB on first use, then cached offline")
+    if SALM_AVAILABLE:
+        print(f"   {canary_config['display_name']}: 📡 Loads from HuggingFace cache")
+        print(f"      Model ID: {canary_config['hf_model_id']}")
+        print(f"      Revision: {canary_config['revision'][:12]}...")
+        print(f"      Note: Downloads ~5GB on first use, then cached offline")
+    else:
+        print(f"   {canary_config['display_name']}: ⚠️ Unavailable (SALM not installed)")
+        print(f"      Requires: pip install --upgrade \"nemo_toolkit[all]\"")
     
     if not validate_local_models():
         sys.exit(1)
