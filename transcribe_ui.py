@@ -30,9 +30,10 @@ AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 # Separator string for output formatting
 SEPARATOR = '=' * 60
 
-# Canary model revision - pinned to prevent re-downloads when HuggingFace repo updates
-# Update this hash if you want to use a newer version of Canary
-CANARY_PINNED_REVISION = "2399591399e4e6438fa7804f2f1f1660"
+# Canary model revision - set to None to use the latest model version from HuggingFace
+# You can pin to a specific commit by using a valid 40-char SHA-1 hash, short hash (4+ chars),
+# branch name (e.g., "main"), or tag name. The previous value was an invalid 32-char hash.
+CANARY_PINNED_REVISION = None
 
 # Model configurations
 # Note: Canary uses SALM architecture that cannot be saved as .nemo file
@@ -215,6 +216,38 @@ def load_model(model_name, show_progress=False):
                 models_cache[model_name] = nemo_asr.models.ASRModel.restore_from(
                     str(model_path)
                 )
+            except PermissionError as e:
+                # Windows-specific: Handle temp file cleanup failures (WinError 32)
+                # This occurs when NeMo extracts .nemo to temp dir but file handles aren't
+                # properly closed before cleanup. On Windows, files in use cannot be deleted.
+                error_str = str(e)
+                if "WinError 32" in error_str or "being used by another process" in error_str:
+                    # This is likely a temp file cleanup issue, not a model loading failure.
+                    # Provide a helpful error message with troubleshooting steps.
+                    problem = (
+                        "Windows temp file cleanup failed (WinError 32). This is often "
+                        "caused by antivirus software (especially Windows Defender), "
+                        "cloud sync services (OneDrive, Dropbox, Google Drive), or "
+                        "file indexing services monitoring the temp folder."
+                    )
+                    solution = (
+                        "Troubleshooting steps:\n"
+                        "1) Add %TEMP% folder to antivirus exclusions\n"
+                        "2) Pause cloud sync or exclude temp folder\n"
+                        "3) Close other applications accessing temp files\n"
+                        "4) Restart your computer and try again"
+                    )
+                    raise PermissionError(_format_model_error(
+                        title="WINDOWS FILE LOCK ERROR!",
+                        model_path=model_path,
+                        display_name=config['display_name'],
+                        problem_msg=problem,
+                        solution_msg=solution,
+                        original_error=e
+                    ))
+                else:
+                    # Non-Windows or different permission error - re-raise
+                    raise
             except FileNotFoundError as e:
                 # Re-raise with more helpful message
                 raise FileNotFoundError(_format_model_error(
