@@ -235,7 +235,7 @@ def load_model(model_name, show_progress=False):
                     title="SALM MODULE NOT AVAILABLE!",
                     display_name=config['display_name'],
                     problem_msg="The nemo.collections.speechlm2 module is not installed.",
-                    solution_msg="Please upgrade NeMo to version 2.6.0 or later: pip install nemo_toolkit[all]>=2.6.0",
+                    solution_msg='Please upgrade NeMo to version 2.6.0 or later:\n    pip install --upgrade "nemo_toolkit[all]"',
                     original_error=None
                 ))
             
