@@ -799,13 +799,13 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             )
             
             gr.Markdown("""
-**Supported audio formats**: WAV, MP3, FLAC, M4A, OGG, AAC, WMA
-
-**Supported video formats**: MP4, AVI, MKV, MOV, WEBM, FLV, M4V
-*(Audio will be automatically extracted from video files)*
-
-💡 **Tip**: Select multiple files for batch processing!
-""")
+            **Supported audio formats**: WAV, MP3, FLAC, M4A, OGG, AAC, WMA
+            
+            **Supported video formats**: MP4, AVI, MKV, MOV, WEBM, FLV, M4V
+            *(Audio will be automatically extracted from video files)*
+            
+            💡 **Tip**: Select multiple files for batch processing!
+            """)
             
             gr.Markdown("### ⚙️ Settings")
             
@@ -933,11 +933,12 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     with gr.Accordion("🔒 Privacy & Performance", open=False):
         gr.Markdown(get_privacy_performance_info())
     
-    # Connect button
+    # Connect button - queue=True ensures proper callback execution
     transcribe_btn.click(
         fn=transcribe_audio,
         inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox],
-        outputs=[status_output, transcription_output, file_output]
+        outputs=[status_output, transcription_output, file_output],
+        queue=True
     )
 
 # Launch
