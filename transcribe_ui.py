@@ -100,8 +100,11 @@ def get_model_key_from_choice(choice_text):
         "Canary-1B v2": "canary-1b-v2",
         "Canary-1B": "canary-1b",
         # Legacy support
-        "Parakeet-TDT-0.6B v2": "parakeet-v3",  # Map old to new
-        "Canary-Qwen-2.5B": "canary-1b-v2"  # Map old SALM model to new standard model
+        "Parakeet-TDT-0.6B v2": "parakeet-v3",  # Map old to new multilingual version
+        # Legacy SALM model mapping: Canary-Qwen-2.5B was a 2.5B param SALM-based model
+        # We map it to Canary-1B-v2 (1B param, standard encoder-decoder architecture)
+        # Trade-off: Slightly different model size, but gains multilingual support + simpler architecture
+        "Canary-Qwen-2.5B": "canary-1b-v2"
     }
     
     # Try exact matches first
@@ -120,8 +123,8 @@ def validate_local_models():
     """
     Validate that Parakeet local .nemo model file exists before launching UI.
     
-    Note: Canary uses SALM architecture and loads from HuggingFace cache,
-    so it doesn't require a local .nemo file.
+    Note: Canary models load from HuggingFace cache automatically,
+    so they don't require local .nemo files.
     
     Returns:
         bool: True if Parakeet model exists, False otherwise
@@ -272,6 +275,8 @@ def load_model(model_name, show_progress=False):
                 )
             except PermissionError as e:
                 # Windows-specific: Handle temp file cleanup failures (WinError 32)
+                # This occurs when NeMo extracts .nemo to temp dir but file handles aren't
+                # properly closed before cleanup. On Windows, files in use cannot be deleted.
                 error_str = str(e)
                 if "WinError 32" in error_str or "being used by another process" in error_str:
                     problem = (
