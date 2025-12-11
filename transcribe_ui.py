@@ -477,7 +477,8 @@ def _load_with_retry(restore_path, config, max_retries=3):
                     f"  3. Restart your computer\n"
                     f"  4. Run as Administrator\n"
                     f"  5. Disable Windows Search indexing for:\n"
-                    f"     {CACHE_DIR}\n\n"
+                    f"     {CACHE_DIR}\n"
+                    f"     (especially the tmp subdirectory)\n\n"
                     f"⚙️ Cache Location:\n"
                     f"  {CACHE_DIR}\n\n"
                     f"If this persists, try manually deleting the cache and temp directories.\n"
@@ -488,7 +489,9 @@ def _load_with_retry(restore_path, config, max_retries=3):
                 raise
         
         except Exception as e:
-            # Other exceptions - retry with same backoff logic
+            # Other exceptions - retry for transient issues
+            # Note: Broad exception handling is intentional here to handle various
+            # transient failures (disk I/O, network, etc.) during model extraction
             if attempt < max_retries - 1:
                 delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  Extraction error (attempt {attempt + 1}/{max_retries}): {e}")
