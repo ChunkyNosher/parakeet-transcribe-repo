@@ -64,6 +64,24 @@ import tempfile
 tempfile.tempdir = str(_temp_dir)
 
 # ============================================================================
+# FIX #3: Validate tempfile Configuration
+# ============================================================================
+# Verify that tempfile.gettempdir() returns our custom cache directory.
+# This ensures all subsequent tempfile operations (including NeMo's internal
+# manifest creation during inference) will use our controlled location
+# instead of system %TEMP%, preventing Windows file locking issues.
+# ============================================================================
+
+# Validate that our tempfile configuration took effect
+_actual_temp = tempfile.gettempdir()
+if _actual_temp != str(_temp_dir):
+    print(f"⚠️  WARNING: tempfile.gettempdir() returned {_actual_temp}")
+    print(f"   Expected: {_temp_dir}")
+    print(f"   This may cause file locking issues!")
+else:
+    print(f"✓ Temp directory verified: {_temp_dir}")
+
+# ============================================================================
 # NOW import libraries (after cache directories are configured)
 # ============================================================================
 
@@ -72,9 +90,16 @@ import nemo.collections.asr as nemo_asr
 import torch
 import time
 import gc
+import shutil
+import hashlib
 
 # Global model cache to avoid reloading
 models_cache = {}
+
+# Create cache subdirectory for Gradio uploads
+# This prevents manifest.json file locking issues during NeMo inference
+_gradio_cache_dir = _cache_dir / "gradio_uploads"
+_gradio_cache_dir.mkdir(parents=True, exist_ok=True)
 
 # Video file extensions supported (librosa + FFmpeg backend handles audio extraction)
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.m4v'}
@@ -246,6 +271,66 @@ def validate_local_models():
     
     print("\n💡 Tip: Run 'python setup_local_models.py' to download all models locally")
     print("="*80 + "\n")
+
+def copy_gradio_file_to_cache(file_path, max_retries=3):
+    """Copy Gradio uploaded file to cache directory to prevent manifest.json file locking.
+    
+    Gradio uploads files to its own temp directory. When NeMo reads these files,
+    it may create manifest.json in that location or in system temp, which can
+    cause WinError 32 (file in use) issues on Windows.
+    
+    This function copies uploaded files from Gradio's temp to our controlled
+    cache directory BEFORE passing to NeMo, ensuring all NeMo operations
+    (including internal manifest creation) happen in our cache location.
+    
+    Args:
+        file_path: Path to Gradio uploaded file
+        max_retries: Maximum retry attempts for file copy (handles transient locks)
+        
+    Returns:
+        Path to file in cache directory
+        
+    Raises:
+        OSError: If file copy fails after all retries
+    """
+    file_path = Path(file_path)
+    
+    # Generate unique filename using hash of original path + filename
+    # This prevents collisions from multiple uploads of same filename
+    # SHA-256 is used for secure, collision-resistant filename generation
+    path_hash = hashlib.sha256(str(file_path).encode()).hexdigest()[:16]
+    cached_filename = f"{path_hash}_{file_path.name}"
+    cached_path = _gradio_cache_dir / cached_filename
+    
+    # If file already cached, return immediately
+    if cached_path.exists():
+        return str(cached_path)
+    
+    # Copy with retry logic for Windows file locks
+    base_delay = 0.2  # 200ms base delay
+    
+    for attempt in range(max_retries):
+        try:
+            shutil.copy2(file_path, cached_path)
+            return str(cached_path)
+            
+        except (OSError, PermissionError) as e:
+            error_str = str(e)
+            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+            
+            if is_file_lock and attempt < max_retries - 1:
+                delay = base_delay * (attempt + 1)  # Linear backoff: 0.2s, 0.4s, 0.6s
+                print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+                time.sleep(delay)
+                continue
+            
+            # Final retry failed or non-file-lock error
+            raise OSError(
+                f"Failed to copy file to cache after {attempt + 1} attempts.\n"
+                f"Source: {file_path}\n"
+                f"Destination: {cached_path}\n"
+                f"Error: {error_str}"
+            )
 
 def get_dynamic_batch_size(duration, model_key):
     """Calculate optimal batch size based on audio duration and model"""
@@ -804,6 +889,15 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         
         load_time = time.time() - start_time
         
+        # ============================================================================
+        # FIX #4: Copy Gradio Uploads to Cache Directory
+        # ============================================================================
+        # Copy uploaded files from Gradio's temp directory to our controlled cache
+        # directory BEFORE processing. This prevents NeMo from creating manifest.json
+        # files in Gradio's temp location or system temp, which can cause WinError 32
+        # file locking issues on Windows.
+        # ============================================================================
+        
         # Process files and detect video files
         processed_files = []
         file_info = []
@@ -811,27 +905,34 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         video_count = 0
         
         for file_path in file_list:
-            file_ext = os.path.splitext(file_path)[1].lower()
+            # Copy file to cache directory to prevent manifest.json locking issues
+            try:
+                cached_file_path = copy_gradio_file_to_cache(file_path)
+                print(f"📁 Using cached file: {os.path.basename(cached_file_path)}")
+            except OSError as e:
+                return f"❌ Failed to copy uploaded file to cache.\n\nError: {str(e)}", "", None
+            
+            file_ext = os.path.splitext(cached_file_path)[1].lower()
             is_video = file_ext in VIDEO_EXTENSIONS
             
             if is_video:
                 video_count += 1
-                print(f"🎬 Extracting audio from video: {os.path.basename(file_path)}")
+                print(f"🎬 Extracting audio from video: {os.path.basename(cached_file_path)}")
             
             # librosa.get_duration handles both audio and video files (via FFmpeg)
             try:
-                duration = librosa.get_duration(path=file_path)
+                duration = librosa.get_duration(path=cached_file_path)
             except Exception as e:
                 # Handle case where video has no audio track
                 if is_video:
-                    return f"❌ Video file '{os.path.basename(file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
+                    return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
                 raise
             
             total_duration += duration
-            processed_files.append(file_path)
+            processed_files.append(cached_file_path)
             file_info.append({
-                "path": file_path,
-                "name": os.path.basename(file_path),
+                "path": cached_file_path,
+                "name": os.path.basename(file_path),  # Use original name for display
                 "duration": duration,
                 "is_video": is_video
             })
@@ -844,24 +945,94 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         if video_count > 0:
             video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
         
+        # ============================================================================
+        # FIX #5: Add Comprehensive Retry Logic for Transcription
+        # ============================================================================
+        # NeMo's transcribe() method may create temporary manifest.json files
+        # internally during inference. If Windows services lock these files,
+        # we get WinError 32. Add retry logic with exponential backoff.
+        # ============================================================================
+        
         # Transcribe with mixed precision (FP16) for GPU acceleration
         inference_start = time.time()
         
-        if torch.cuda.is_available():
-            # Use mixed precision (FP16) for faster inference on CUDA
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                result = model.transcribe(
-                    processed_files, 
-                    batch_size=batch_size,
-                    timestamps=include_timestamps
-                )
-        else:
-            # CPU fallback - no autocast
-            result = model.transcribe(
-                processed_files, 
-                batch_size=batch_size,
-                timestamps=include_timestamps
-            )
+        max_retries = 3
+        base_delay = 0.5  # 500ms base delay
+        
+        for attempt in range(max_retries):
+            try:
+                if torch.cuda.is_available():
+                    # Use mixed precision (FP16) for faster inference on CUDA
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        result = model.transcribe(
+                            processed_files, 
+                            batch_size=batch_size,
+                            timestamps=include_timestamps
+                        )
+                else:
+                    # CPU fallback - no autocast
+                    result = model.transcribe(
+                        processed_files, 
+                        batch_size=batch_size,
+                        timestamps=include_timestamps
+                    )
+                
+                # Success! Break out of retry loop
+                break
+                
+            except PermissionError as e:
+                error_str = str(e)
+                is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+                
+                if is_file_lock and attempt < max_retries - 1:
+                    # File lock detected during transcription - retry with linear backoff
+                    delay = base_delay * (attempt + 1)  # Linear backoff: 0.5s, 1.0s, 1.5s
+                    print(f"⏳ Transcription file lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+                    
+                    # Force garbage collection before retry
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    time.sleep(delay)
+                    continue
+                
+                elif is_file_lock:
+                    # Final retry failed
+                    return (
+                        f"### ❌ Transcription Failed: File Lock Error\n\n"
+                        f"The transcription process failed due to persistent file locking.\n"
+                        f"This typically happens when Windows services hold file handles open.\n\n"
+                        f"**Tried {max_retries} times** without success.\n\n"
+                        f"**Solutions:**\n"
+                        f"1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
+                        f"2. Add cache directory to antivirus exclusions: `{CACHE_DIR}`\n"
+                        f"3. Restart your computer\n"
+                        f"4. Run as Administrator\n\n"
+                        f"**Technical Details:**\n"
+                        f"```\n{error_str}\n```",
+                        "", None
+                    )
+                else:
+                    # Different PermissionError - re-raise
+                    raise
+                    
+            except Exception as e:
+                # Other exceptions during transcription
+                if attempt < max_retries - 1:
+                    delay = base_delay * (attempt + 1)  # Linear backoff
+                    print(f"⚠️  Transcription error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
+                    print(f"   Retrying in {delay:.1f}s...")
+                    
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    time.sleep(delay)
+                    continue
+                else:
+                    # Final attempt failed - re-raise
+                    raise
         
         inference_time = time.time() - inference_start
         total_time = time.time() - start_time
