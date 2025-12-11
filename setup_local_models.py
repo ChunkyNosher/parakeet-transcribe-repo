@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Simplified setup: Only downloads and saves Parakeet as .nemo file.
-Canary uses SALM architecture and will load from HuggingFace cache automatically.
+Simplified setup: Downloads and saves Parakeet models as .nemo files.
+Canary models load automatically from HuggingFace on first use.
 
-Why only Parakeet?
-- Canary-Qwen-2.5B is a SALM (Speech-Aware Language Model) that cannot be 
-  saved as a .nemo file due to its architecture
-- Canary will download to HuggingFace cache on first use (~5GB)
-- Once cached, Canary works offline like Parakeet
+Available Parakeet models:
+- Parakeet-TDT-0.6B-v3: 600M params, 25 languages, multilingual (RECOMMENDED)
+- Parakeet-TDT-1.1B: 1.1B params, English only, best accuracy (1.5% WER)
 
-See docs/manual/canary-hybrid-loading-fix.md for technical details.
+Both models can be saved to local .nemo files for faster offline loading.
+Canary models (Canary-1B, Canary-1B-v2) download automatically on first use.
+
+See docs/manual/comprehensive-asr-model-integration-guide.md for details.
 """
 
 import nemo.collections.asr as nemo_asr
@@ -27,25 +28,59 @@ def create_local_models_directory():
 
 
 def download_and_save_parakeet():
-    """Download Parakeet model and save as .nemo file."""
+    """Download and save a Parakeet model as .nemo file."""
     print("\n" + "="*80)
-    print("📦 Downloading Parakeet-TDT-0.6B v2 from HuggingFace...")
+    print("📦 PARAKEET MODEL SELECTION")
     print("="*80)
-    print("This will take ~2-5 minutes depending on your connection.")
-    print("Model size: ~1.2 GB download, ~2.4 GB saved\n")
+    print("\nAvailable models:")
+    print("\n1. Parakeet-TDT-0.6B-v3 (RECOMMENDED)")
+    print("   - Size: ~1.2 GB download, ~2.4 GB saved")
+    print("   - Languages: 25 European languages with auto-detection")
+    print("   - Speed: 3,380× real-time (ultra-fast)")
+    print("   - Accuracy: ~1.7% WER")
+    print("   - Best for: Multilingual transcription, general use")
+    
+    print("\n2. Parakeet-TDT-1.1B")
+    print("   - Size: ~2.2 GB download, ~4.5 GB saved")
+    print("   - Languages: English only")
+    print("   - Speed: 1,336× real-time")
+    print("   - Accuracy: 1.5% WER (BEST available)")
+    print("   - Best for: Maximum English transcription accuracy")
+    
+    print("\n" + "="*80)
+    choice = input("\nSelect model to download (1 or 2): ").strip()
+    
+    if choice == "1":
+        model_id = "nvidia/parakeet-tdt-0.6b-v3"
+        model_name = "Parakeet-TDT-0.6B-v3"
+        download_size = "~1.2 GB"
+        saved_size = "~2.4 GB"
+    elif choice == "2":
+        model_id = "nvidia/parakeet-tdt-1.1b"
+        model_name = "Parakeet-TDT-1.1B"
+        download_size = "~2.2 GB"
+        saved_size = "~4.5 GB"
+    else:
+        print("\n❌ Invalid choice. Please run again and select 1 or 2.")
+        sys.exit(1)
+    
+    print("\n" + "="*80)
+    print(f"📦 Downloading {model_name} from HuggingFace...")
+    print("="*80)
+    print(f"Download size: {download_size}")
+    print(f"Saved size: {saved_size}")
+    print("This will take ~2-5 minutes depending on your connection.\n")
     
     try:
         # Download from HuggingFace
-        model = nemo_asr.models.ASRModel.from_pretrained(
-            "nvidia/parakeet-tdt-0.6b-v2"
-        )
-        print("\n✓ Parakeet downloaded successfully")
+        model = nemo_asr.models.ASRModel.from_pretrained(model_id)
+        print(f"\n✓ {model_name} downloaded successfully")
         
         # Save to local file
-        print("\n💾 Saving Parakeet to local_models/parakeet.nemo...")
+        print(f"\n💾 Saving {model_name} to local_models/parakeet.nemo...")
         output_path = os.path.abspath("local_models/parakeet.nemo")
         model.save_to(output_path)
-        print(f"✓ Parakeet saved successfully to {output_path}")
+        print(f"✓ {model_name} saved successfully to {output_path}")
         
         # Verify file exists and has reasonable size
         if os.path.exists(output_path):
@@ -63,7 +98,7 @@ def download_and_save_parakeet():
         return True
         
     except Exception as e:
-        print(f"\n❌ Error downloading/saving Parakeet:")
+        print(f"\n❌ Error downloading/saving {model_name}:")
         print(f"   {type(e).__name__}: {str(e)}")
         import traceback
         print("\nFull traceback:")
@@ -95,16 +130,16 @@ def verify_setup():
 
 def main():
     print("\n" + "="*80)
-    print("📦 NeMo ASR Local Model Setup (Parakeet Only)")
+    print("📦 NeMo ASR Local Model Setup")
     print("="*80)
     print("\nThis script will:")
     print("  1. Create local_models/ directory")
-    print("  2. Download Parakeet-TDT-0.6B v2 (~1.2 GB)")
-    print("  3. Save as local .nemo file (~2.4 GB)")
-    print("\n⚠️  Note about Canary:")
-    print("  Canary-Qwen-2.5B uses SALM architecture that cannot be saved as .nemo.")
-    print("  It will download automatically from HuggingFace on first use (~5GB)")
-    print("  and be cached for offline use after that.")
+    print("  2. Download your selected Parakeet model")
+    print("  3. Save as local .nemo file")
+    print("\n⚠️  Note about other models:")
+    print("  - Canary-1B and Canary-1B-v2 download automatically from HuggingFace")
+    print("  - They will be cached for offline use after first download")
+    print("  - No setup script needed for Canary models")
     print("\nEstimated time: 5-10 minutes\n")
     
     response = input("Continue with Parakeet setup? (y/n): ").strip().lower()
@@ -139,8 +174,8 @@ def main():
         print("\nModel loading behavior:")
         print(f"  • Parakeet: Loads from {os.path.abspath('local_models/parakeet.nemo')}")
         print("              (instant, works offline)")
-        print("  • Canary:   Downloads from HuggingFace on first use (~5GB)")
-        print("              (then cached for offline use)")
+        print("  • Canary models: Download from HuggingFace on first use")
+        print("                   (then cached for offline use)")
         print("\n⚠️  Keep the local_models folder - deleting it requires re-download")
         print("="*80 + "\n")
     else:
