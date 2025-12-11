@@ -179,13 +179,12 @@ def get_script_dir():
 
 def validate_local_models():
     """
-    Validate local model setup and provide informational messages.
+    Display local model setup status and provide informational messages.
     
     With "local_or_huggingface" loading method, local .nemo files are OPTIONAL.
     Models will automatically download from HuggingFace if local files are missing.
     
-    Returns:
-        bool: Always returns True (no longer blocks startup)
+    This function is informational only and does not block startup.
     """
     script_dir = get_script_dir()
     local_models_dir = script_dir / "local_models"
@@ -230,9 +229,6 @@ def validate_local_models():
     
     print("\n💡 Tip: Run 'python setup_local_models.py' to download all models locally")
     print("="*80 + "\n")
-    
-    # Always return True - no longer blocks startup
-    return True
 
 def get_dynamic_batch_size(duration, model_key):
     """Calculate optimal batch size based on audio duration and model"""
@@ -298,6 +294,9 @@ def _format_model_error(title, model_path, display_name, problem_msg, solution_m
 def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
     """Load model from HuggingFace with retry logic for Windows file lock issues.
     
+    Uses linear backoff delays (0.2s, 0.4s, 0.6s) to allow Windows services
+    time to release file handles between retry attempts.
+    
     Args:
         hf_model_id: HuggingFace model ID (e.g., "nvidia/parakeet-tdt-0.6b-v3")
         config: Model configuration dict
@@ -307,20 +306,24 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
         Loaded ASR model
         
     Raises:
-        PermissionError, ConnectionError, OSError, RuntimeError on failure
+        PermissionError: If file lock persists after all retries
+        ConnectionError: If HuggingFace download fails
+        OSError: If disk space or file system issues occur
     """
-    base_delay = 0.2  # 200ms base delay for retries
+    base_delay = 0.2  # 200ms base delay for linear backoff retries
+    last_error = None
     
     for attempt in range(max_retries):
         try:
             return nemo_asr.models.ASRModel.from_pretrained(hf_model_id)
             
         except PermissionError as e:
+            last_error = e
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
             if is_file_lock and attempt < max_retries - 1:
-                # File lock detected - retry with backoff
+                # File lock detected - retry with linear backoff
                 delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
                 print(f"⏳ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 
@@ -360,7 +363,7 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
                     f"{'='*80}"
                 )
             else:
-                # Different PermissionError (not file lock)
+                # Different PermissionError (not file lock) - re-raise immediately
                 raise PermissionError(
                     f"\n{'='*80}\n"
                     f"❌ PERMISSION ERROR!\n"
@@ -373,7 +376,10 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
                     f"{'='*80}"
                 )
     
-    # Should never reach here, but just in case
+    # This is reached if all attempts fail without raising an exception
+    # (should not happen with current logic, but provides safety)
+    if last_error:
+        raise last_error
     raise RuntimeError(f"Failed to load model after {max_retries} attempts")
 
 

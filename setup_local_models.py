@@ -219,7 +219,7 @@ def download_all_models():
     print("Estimated time: 15-45 minutes (depends on connection)")
     
     confirm = input("\nProceed with batch download? (y/n): ").strip().lower()
-    if confirm != 'y':
+    if confirm not in ('y', 'yes'):
         print("\n❌ Batch download cancelled")
         return
     
