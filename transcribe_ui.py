@@ -1,10 +1,59 @@
+# ============================================================================
+# WINDOWS TEMP FILE FIX - Configure cache directories BEFORE importing libraries
+# ============================================================================
+# This prevents WinError 32 (file in use) errors on Windows caused by:
+# - Antivirus software scanning %TEMP% folder
+# - Cloud sync services (OneDrive, Dropbox, Google Drive) monitoring temp files
+# - Windows Search/Indexing service holding file handles
+#
+# By setting TORCH_HOME, HF_HOME, and TMPDIR BEFORE importing NeMo/PyTorch,
+# all model downloads and extractions go to a project-local cache directory
+# that Windows services typically don't monitor.
+# ============================================================================
+
+import os
+import sys
+from pathlib import Path
+
+# Get script directory and create cache directory structure
+_script_dir = Path(__file__).parent.absolute()
+_cache_dir = _script_dir / "model_cache"
+_cache_dir.mkdir(parents=True, exist_ok=True)
+
+# Set cache environment variables BEFORE importing torch/NeMo
+# This affects all subsequent model downloads and extractions
+os.environ["TORCH_HOME"] = str(_cache_dir / "torch")
+os.environ["HF_HOME"] = str(_cache_dir / "huggingface")
+os.environ["NEMO_CACHE_DIR"] = str(_cache_dir / "nemo")
+
+# Set TMPDIR to use our cache instead of Windows %TEMP%
+# This is the CRITICAL line that prevents file lock issues
+os.environ["TMPDIR"] = str(_cache_dir / "tmp")
+if sys.platform == "win32":
+    # Windows uses different env vars for temp directory
+    os.environ["TEMP"] = str(_cache_dir / "tmp")
+    os.environ["TMP"] = str(_cache_dir / "tmp")
+
+# Create temp directory
+_temp_dir = _cache_dir / "tmp"
+_temp_dir.mkdir(parents=True, exist_ok=True)
+
+# Create other cache subdirectories
+(_cache_dir / "torch").mkdir(parents=True, exist_ok=True)
+(_cache_dir / "huggingface").mkdir(parents=True, exist_ok=True)
+(_cache_dir / "nemo").mkdir(parents=True, exist_ok=True)
+
+# Store cache_dir for error messages later
+CACHE_DIR = _cache_dir
+
+# ============================================================================
+# NOW import libraries (after cache directories are configured)
+# ============================================================================
+
 import gradio as gr
 import nemo.collections.asr as nemo_asr
 import torch
-import os
-import sys
 import time
-from pathlib import Path
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -21,15 +70,20 @@ SEPARATOR = '=' * 60
 # Model configurations
 # All models use standard ASRModel.from_pretrained() API (no SALM required)
 # Parakeet models: Can load from local .nemo file OR HuggingFace
-# Canary models: Load from HuggingFace (except legacy Canary-Qwen which uses SALM)
+# Canary models: Load from HuggingFace or local .nemo file if downloaded
+#
+# loading_method options:
+#   - "local": ONLY load from local .nemo file (fails if missing)
+#   - "huggingface": ONLY load from HuggingFace
+#   - "local_or_huggingface": Try local first, fallback to HuggingFace
 MODEL_CONFIGS = {
     # ========== PARAKEET MODELS ==========
     "parakeet-v3": {
-        "local_path": "local_models/parakeet.nemo",
+        "local_path": "local_models/parakeet-0.6b-v3.nemo",  # Unique filename
         "hf_model_id": "nvidia/parakeet-tdt-0.6b-v3",
         "max_batch_size": 32,
         "display_name": "Parakeet-TDT-0.6B v3",
-        "loading_method": "local",  # Can be "local" or "huggingface"
+        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-TDT",
         "parameters": "600M",
         "languages": 25,
@@ -40,10 +94,11 @@ MODEL_CONFIGS = {
     },
     
     "parakeet-1.1b": {
+        "local_path": "local_models/parakeet-1.1b.nemo",  # Unique filename
         "hf_model_id": "nvidia/parakeet-tdt-1.1b",
         "max_batch_size": 24,
         "display_name": "Parakeet-TDT-1.1B",
-        "loading_method": "huggingface",
+        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-TDT",
         "parameters": "1.1B",
         "languages": 1,
@@ -55,10 +110,11 @@ MODEL_CONFIGS = {
     
     # ========== CANARY MODELS ==========
     "canary-1b": {
+        "local_path": "local_models/canary-1b.nemo",  # Unique filename
         "hf_model_id": "nvidia/canary-1b",
         "max_batch_size": 16,
         "display_name": "Canary-1B",
-        "loading_method": "huggingface",
+        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-Transformer",
         "parameters": "1B",
         "languages": 25,
@@ -70,10 +126,11 @@ MODEL_CONFIGS = {
     },
     
     "canary-1b-v2": {
+        "local_path": "local_models/canary-1b-v2.nemo",  # Unique filename
         "hf_model_id": "nvidia/canary-1b-v2",
         "max_batch_size": 16,
         "display_name": "Canary-1B v2",
-        "loading_method": "huggingface",
+        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-Transformer",
         "parameters": "1B",
         "languages": 25,
@@ -121,50 +178,59 @@ def get_script_dir():
 
 def validate_local_models():
     """
-    Validate that Parakeet local .nemo model file exists before launching UI.
+    Validate local model setup and provide informational messages.
     
-    Note: Canary models load from HuggingFace cache automatically,
-    so they don't require local .nemo files.
+    With "local_or_huggingface" loading method, local .nemo files are OPTIONAL.
+    Models will automatically download from HuggingFace if local files are missing.
     
     Returns:
-        bool: True if Parakeet model exists, False otherwise
+        bool: Always returns True (no longer blocks startup)
     """
     script_dir = get_script_dir()
     local_models_dir = script_dir / "local_models"
     
+    print("\n" + "="*80)
+    print("📦 Model Availability Check")
+    print("="*80)
+    
     # Check if local_models directory exists
     if not local_models_dir.exists():
-        print("\n" + "="*80)
-        print("❌ LOCAL MODELS NOT FOUND!")
-        print("="*80)
-        print(f"\nThe 'local_models/' directory does not exist.")
-        print(f"Expected location: {local_models_dir}")
-        print("\nRequired file:")
-        print(f"  • {local_models_dir / 'parakeet.nemo'}")
-        print("\nNote: Canary models load from HuggingFace automatically (no local file needed)")
-        print("\nThe Parakeet file must be created once using the setup script.")
-        print("Please run: python setup_local_models.py")
-        print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
-        print("="*80 + "\n")
-        return False
+        print(f"\n📁 Local models directory not found: {local_models_dir}")
+        print("   This is OK - models will download from HuggingFace on first use.")
+        print("   To download models locally, run: python setup_local_models.py")
+    else:
+        print(f"\n📁 Local models directory: {local_models_dir}")
     
-    # Only check for Parakeet .nemo file (Canary models use HuggingFace)
-    parakeet_config = MODEL_CONFIGS["parakeet-v3"]
-    parakeet_path = script_dir / parakeet_config["local_path"]
+    # Check each model's local availability
+    local_found = []
+    hf_fallback = []
     
-    if not parakeet_path.exists():
-        print("\n" + "="*80)
-        print("❌ PARAKEET MODEL NOT FOUND!")
-        print("="*80)
-        print(f"\nMissing model file:")
-        print(f"  • {parakeet_path} ({parakeet_config['display_name']})")
-        print("\nNote: Canary models load from HuggingFace automatically (no local file needed)")
-        print("\nThe Parakeet file must be created once using the setup script.")
-        print("Please run: python setup_local_models.py")
-        print("\nSee docs/manual/user-model-setup-guide.md for instructions.")
-        print("="*80 + "\n")
-        return False
+    for model_key, config in MODEL_CONFIGS.items():
+        local_path = config.get("local_path")
+        if local_path:
+            full_path = script_dir / local_path
+            if full_path.exists():
+                size_mb = full_path.stat().st_size / (1024 * 1024)
+                local_found.append(f"   ✅ {config['display_name']}: {full_path.name} ({size_mb:.1f} MB)")
+            else:
+                hf_fallback.append(f"   📥 {config['display_name']}: Will download from HuggingFace ({config['hf_model_id']})")
+        else:
+            hf_fallback.append(f"   📥 {config['display_name']}: HuggingFace only ({config['hf_model_id']})")
     
+    if local_found:
+        print("\n📦 Local .nemo files found (instant loading):")
+        for msg in local_found:
+            print(msg)
+    
+    if hf_fallback:
+        print("\n📡 Models to download on first use:")
+        for msg in hf_fallback:
+            print(msg)
+    
+    print("\n💡 Tip: Run 'python setup_local_models.py' to download all models locally")
+    print("="*80 + "\n")
+    
+    # Always return True - no longer blocks startup
     return True
 
 def get_dynamic_batch_size(duration, model_key):
@@ -228,12 +294,99 @@ def _format_model_error(title, model_path, display_name, problem_msg, solution_m
     return "\n".join(error_lines)
 
 
+def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
+    """Load model from HuggingFace with retry logic for Windows file lock issues.
+    
+    Args:
+        hf_model_id: HuggingFace model ID (e.g., "nvidia/parakeet-tdt-0.6b-v3")
+        config: Model configuration dict
+        max_retries: Maximum number of retry attempts for file lock errors
+    
+    Returns:
+        Loaded ASR model
+        
+    Raises:
+        PermissionError, ConnectionError, OSError, RuntimeError on failure
+    """
+    import gc
+    
+    base_delay = 0.2  # 200ms base delay for retries
+    
+    for attempt in range(max_retries):
+        try:
+            return nemo_asr.models.ASRModel.from_pretrained(hf_model_id)
+            
+        except PermissionError as e:
+            error_str = str(e)
+            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+            
+            if is_file_lock and attempt < max_retries - 1:
+                # File lock detected - retry with backoff
+                delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
+                print(f"⏳ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+                
+                # Force garbage collection and cache cleanup before retry
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                time.sleep(delay)
+                continue
+            
+            elif is_file_lock:
+                # Final retry failed - provide detailed diagnostics
+                raise PermissionError(
+                    f"\n{'='*80}\n"
+                    f"❌ FILE LOCK ERROR (PERSISTED AFTER {max_retries} RETRIES)\n"
+                    f"{'='*80}\n\n"
+                    f"Model: {config['display_name']}\n"
+                    f"HuggingFace ID: {hf_model_id}\n\n"
+                    f"The model extraction cannot complete due to persistent file locks.\n"
+                    f"This typically happens when Windows services hold file handles open.\n\n"
+                    f"🔒 Likely Causes:\n"
+                    f"  1. Windows Defender or antivirus scanning temp files\n"
+                    f"  2. OneDrive, Google Drive, or Dropbox syncing the cache folder\n"
+                    f"  3. Windows Search or Windows Indexing Service\n"
+                    f"  4. Another Python process accessing the same models\n\n"
+                    f"💡 Solutions (in order of likelihood to work):\n"
+                    f"  1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
+                    f"  2. Add cache directory to antivirus exclusions:\n"
+                    f"     {CACHE_DIR}\n"
+                    f"  3. Restart your computer\n"
+                    f"  4. Run as Administrator\n"
+                    f"  5. Disable Windows Search indexing\n\n"
+                    f"⚙️ Cache Location:\n"
+                    f"  {CACHE_DIR}\n\n"
+                    f"If this persists, try manually deleting the cache directory.\n"
+                    f"{'='*80}"
+                )
+            else:
+                # Different PermissionError (not file lock)
+                raise PermissionError(
+                    f"\n{'='*80}\n"
+                    f"❌ PERMISSION ERROR!\n"
+                    f"{'='*80}\n\n"
+                    f"Model: {config['display_name']}\n"
+                    f"Error: {error_str}\n\n"
+                    f"The process does not have permission to access the cache directory.\n"
+                    f"Try running as Administrator or checking directory permissions.\n"
+                    f"Cache location: {CACHE_DIR}\n"
+                    f"{'='*80}"
+                )
+    
+    # Should never reach here, but just in case
+    raise RuntimeError(f"Failed to load model after {max_retries} attempts")
+
+
 def load_model(model_name, show_progress=False):
     """Load model using the appropriate method based on model type.
     
     All models now use standard ASRModel API (no SALM required).
-    - Parakeet: Can load from local .nemo file OR HuggingFace
-    - Canary: Loads from HuggingFace using standard ASRModel
+    
+    Loading methods:
+    - "local": ONLY load from local .nemo file (fails if missing)
+    - "huggingface": ONLY load from HuggingFace
+    - "local_or_huggingface": Try local first, fallback to HuggingFace
     
     Args:
         model_name: Model key from MODEL_CONFIGS (e.g., "parakeet-v3", "canary-1b-v2")
@@ -243,18 +396,97 @@ def load_model(model_name, show_progress=False):
         The loaded ASR model
         
     Raises:
-        FileNotFoundError: If the local .nemo file doesn't exist
+        FileNotFoundError: If the local .nemo file doesn't exist (for "local" method)
         ConnectionError: If HuggingFace download fails due to network issues
         OSError: If download fails due to disk space issues
+        PermissionError: If file locks prevent model extraction
     """
     if model_name not in models_cache:
         config = MODEL_CONFIGS[model_name]
         script_dir = get_script_dir()
+        loading_method = config.get("loading_method", "huggingface")
         
         start_time = time.time()
         
-        if config.get("loading_method") == "local":
-            # Load from local .nemo file
+        # ============================================================
+        # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
+        # ============================================================
+        if loading_method == "local_or_huggingface":
+            local_path = config.get("local_path")
+            model_path = script_dir / local_path if local_path else None
+            
+            # Try loading from local .nemo file first
+            if model_path and model_path.exists():
+                print(f"📦 Loading {config['display_name']} from local file...")
+                print(f"   Path: {model_path}")
+                
+                try:
+                    models_cache[model_name] = nemo_asr.models.ASRModel.restore_from(
+                        str(model_path)
+                    )
+                    load_time = time.time() - start_time
+                    print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
+                    return models_cache[model_name]
+                    
+                except PermissionError as e:
+                    error_str = str(e)
+                    if "WinError 32" in error_str or "being used by another process" in error_str:
+                        print(f"⚠️  Local file locked, falling back to HuggingFace...")
+                        # Fall through to HuggingFace download
+                    else:
+                        raise
+                        
+                except Exception as e:
+                    # Local file exists but is corrupted or invalid
+                    print(f"⚠️  Local file corrupted or invalid: {e}")
+                    print(f"   Falling back to HuggingFace download...")
+                    # Fall through to HuggingFace download
+            else:
+                # Local file not found - inform user
+                print(f"📦 Loading {config['display_name']} from HuggingFace...")
+                if model_path:
+                    print(f"   Local .nemo file not found: {model_path}")
+                print(f"   To download locally, run: python setup_local_models.py")
+            
+            # Load from HuggingFace (either no local file, or local file failed)
+            hf_model_id = config["hf_model_id"]
+            print(f"   Model ID: {hf_model_id}")
+            print("   (First load downloads model, subsequent loads use cache)")
+            
+            try:
+                models_cache[model_name] = _load_from_huggingface_with_retry(
+                    hf_model_id, config, max_retries=3
+                )
+            except ConnectionError as e:
+                raise ConnectionError(
+                    f"\n{'='*80}\n"
+                    f"❌ NETWORK ERROR LOADING MODEL!\n"
+                    f"{'='*80}\n\n"
+                    f"Model: {config['display_name']}\n"
+                    f"Failed to connect to HuggingFace to download the model.\n\n"
+                    f"Solution: Please check your internet connection and try again.\n"
+                    f"Original error: {str(e)}\n"
+                    f"{'='*80}"
+                )
+            except OSError as e:
+                error_str = str(e).lower()
+                if "no space" in error_str or "disk" in error_str:
+                    raise OSError(
+                        f"\n{'='*80}\n"
+                        f"❌ DISK SPACE ERROR!\n"
+                        f"{'='*80}\n\n"
+                        f"Model: {config['display_name']}\n"
+                        f"Insufficient disk space to download the model.\n\n"
+                        f"Solution: Please free up disk space and try again.\n"
+                        f"Original error: {str(e)}\n"
+                        f"{'='*80}"
+                    )
+                raise
+        
+        # ============================================================
+        # LOCAL: Strictly load from local .nemo file only
+        # ============================================================
+        elif loading_method == "local":
             model_path = script_dir / config["local_path"]
             
             # Check if .nemo file exists
@@ -274,9 +506,6 @@ def load_model(model_name, show_progress=False):
                     str(model_path)
                 )
             except PermissionError as e:
-                # Windows-specific: Handle temp file cleanup failures (WinError 32)
-                # This occurs when NeMo extracts .nemo to temp dir but file handles aren't
-                # properly closed before cleanup. On Windows, files in use cannot be deleted.
                 error_str = str(e)
                 if "WinError 32" in error_str or "being used by another process" in error_str:
                     problem = (
@@ -287,10 +516,11 @@ def load_model(model_name, show_progress=False):
                     )
                     solution = (
                         "Troubleshooting steps:\n"
-                        "1) Add %TEMP% folder to antivirus exclusions\n"
-                        "2) Pause cloud sync or exclude temp folder\n"
-                        "3) Close other applications accessing temp files\n"
-                        "4) Restart your computer and try again"
+                        f"1) The cache is now at: {CACHE_DIR}\n"
+                        "2) Add this folder to antivirus exclusions\n"
+                        "3) Pause cloud sync or exclude this folder\n"
+                        "4) Close other applications accessing temp files\n"
+                        "5) Restart your computer and try again"
                     )
                     raise PermissionError(_format_model_error(
                         title="WINDOWS FILE LOCK ERROR!",
@@ -311,8 +541,11 @@ def load_model(model_name, show_progress=False):
                     solution_msg="Please recreate it using: python setup_local_models.py",
                     original_error=e
                 ))
+        
+        # ============================================================
+        # HUGGINGFACE: Load from HuggingFace only
+        # ============================================================
         else:
-            # Load from HuggingFace using standard ASRModel API
             hf_model_id = config["hf_model_id"]
             
             print(f"📦 Loading {config['display_name']} from HuggingFace...")
@@ -320,9 +553,8 @@ def load_model(model_name, show_progress=False):
             print("   (First load downloads model, subsequent loads use cache)")
             
             try:
-                # All Canary and Parakeet models use standard ASRModel API
-                models_cache[model_name] = nemo_asr.models.ASRModel.from_pretrained(
-                    hf_model_id
+                models_cache[model_name] = _load_from_huggingface_with_retry(
+                    hf_model_id, config, max_retries=3
                 )
             except ConnectionError as e:
                 raise ConnectionError(
@@ -355,6 +587,7 @@ def load_model(model_name, show_progress=False):
                     f"Model: {config['display_name']}\n"
                     f"A file system error occurred while loading the model.\n\n"
                     f"Solution: Please check file permissions and try again.\n"
+                    f"Cache location: {CACHE_DIR}\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*80}"
                 )
@@ -366,7 +599,7 @@ def load_model(model_name, show_progress=False):
                     f"Model: {config['display_name']}\n"
                     f"An unexpected error occurred: {type(e).__name__}\n\n"
                     f"Solution: Try clearing the cache and retrying.\n"
-                    f"Cache location: ~/.cache/torch/NeMo/\n"
+                    f"Cache location: {CACHE_DIR}\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*80}"
                 )
@@ -430,8 +663,44 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         # Start timing
         start_time = time.time()
         
-        # Load model (uses cache if already loaded)
-        model = load_model(model_key)
+        # Load model with explicit error handling for Gradio display
+        # This ensures any model loading errors appear in the UI status box
+        try:
+            model = load_model(model_key)
+        except PermissionError as e:
+            # File lock or permission error - display in Gradio status
+            error_msg = str(e)
+            print(f"GRADIO_ERROR (PermissionError): {error_msg}")
+            return f"### ❌ Model Loading Error\n\n{error_msg}", "", None
+        except ConnectionError as e:
+            error_msg = str(e)
+            print(f"GRADIO_ERROR (ConnectionError): {error_msg}")
+            return f"### ❌ Network Error\n\n{error_msg}", "", None
+        except FileNotFoundError as e:
+            error_msg = str(e)
+            print(f"GRADIO_ERROR (FileNotFoundError): {error_msg}")
+            return f"### ❌ File Not Found\n\n{error_msg}", "", None
+        except OSError as e:
+            error_msg = str(e)
+            print(f"GRADIO_ERROR (OSError): {error_msg}")
+            return f"### ❌ File System Error\n\n{error_msg}", "", None
+        except RuntimeError as e:
+            error_msg = str(e)
+            print(f"GRADIO_ERROR (RuntimeError): {error_msg}")
+            return f"### ❌ Runtime Error\n\n{error_msg}", "", None
+        except Exception as e:
+            error_msg = (
+                f"{'='*80}\n"
+                f"❌ UNEXPECTED ERROR LOADING MODEL\n"
+                f"{'='*80}\n\n"
+                f"Type: {type(e).__name__}\n"
+                f"Message: {str(e)}\n\n"
+                f"Please check the console for more details.\n"
+                f"{'='*80}"
+            )
+            print(f"GRADIO_ERROR (Unexpected): {error_msg}")
+            return f"### ❌ Unexpected Error\n\n{error_msg}", "", None
+        
         load_time = time.time() - start_time
         
         # Process files and detect video files
@@ -718,13 +987,20 @@ def get_privacy_performance_info():
 ### Privacy:
 - ✅ All transcription processing happens locally on your machine
 - ✅ Your audio never leaves your computer
-- ✅ Parakeet: 100% offline (loads from local .nemo file)
-- ✅ Canary: Offline after first load (cached from HuggingFace)
+- ✅ All models: Try local .nemo first, then HuggingFace fallback
+- ✅ Once downloaded, models work offline from cache
 
 ### Model Storage:
-- **Parakeet v3**: `local_models/parakeet.nemo` (~2.4GB) or HuggingFace cache
-- **Parakeet 1.1B**: HuggingFace cache (~4.5GB)
-- **Canary Models**: HuggingFace cache (~2-5GB depending on model)
+- **Local .nemo files**: `local_models/` directory (run `python setup_local_models.py`)
+  - `parakeet-0.6b-v3.nemo` (~2.4GB)
+  - `parakeet-1.1b.nemo` (~4.5GB)
+  - `canary-1b.nemo` (~5.0GB)
+  - `canary-1b-v2.nemo` (~5.0GB)
+- **HuggingFace Cache**: `model_cache/` directory (auto-downloads if .nemo missing)
+
+### Cache Location:
+- **Custom cache**: `{CACHE_DIR}` (prevents Windows temp file issues)
+- This directory is used for all model downloads and extraction
 
 ### Performance Optimizations:
 - {gpu_info}
@@ -821,14 +1097,14 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Speed: 3,380× real-time (ultra-fast)
             - Accuracy: ~1.7% WER
             - VRAM: 3-4 GB
-            - Loads from: `local_models/parakeet.nemo` OR HuggingFace
+            - Loads from: `local_models/parakeet-0.6b-v3.nemo` OR HuggingFace
             
             **Parakeet-TDT-1.1B** (Best Accuracy):
             - Languages: English only
             - Speed: 1,336× real-time
             - Accuracy: **1.5% WER** (best available)
             - VRAM: 5-6 GB
-            - Loads from: HuggingFace
+            - Loads from: `local_models/parakeet-1.1b.nemo` OR HuggingFace
             
             **Canary-1B v2** (Multilingual + Translation):
             - Languages: 25 European languages
@@ -836,14 +1112,16 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             - Accuracy: 1.88% WER (English)
             - VRAM: 4-5 GB
             - Features: **Speech Translation** (AST)
-            - Loads from: HuggingFace
+            - Loads from: `local_models/canary-1b-v2.nemo` OR HuggingFace
             
             **Canary-1B** (Standard):
             - Languages: 25 European languages
             - Speed: ~200× real-time
             - Accuracy: ~1.9% WER (English)
             - VRAM: 4-5 GB
-            - Loads from: HuggingFace
+            - Loads from: `local_models/canary-1b.nemo` OR HuggingFace
+            
+            💡 **Tip**: Run `python setup_local_models.py` to download models locally for faster loading.
             """)
         
         # Right column - Output
@@ -889,8 +1167,9 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - 🌍 **Multilingual**: Support for 25 European languages (model dependent)
         
         ### Model Loading:
-        - **Parakeet v3**: Loads from local `.nemo` file (instant, works offline)
-        - **Other Models**: Load from HuggingFace cache on first use
+        - **All Models**: Try local `.nemo` file first, then HuggingFace fallback
+        - Local files load instantly (no internet required)
+        - HuggingFace downloads are cached for future offline use
         - All models stay in memory after first load (instant subsequent use)
         
         ### Tips:
@@ -902,9 +1181,10 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - Choose Parakeet-v3 or Canary for multilingual support
         - Canary models support speech translation features
         
-        ### Setup:
-        - Run `python setup_local_models.py` to set up Parakeet v3 locally
-        - Other models download automatically on first use (no setup needed)
+        ### Setup (Optional but Recommended):
+        - Run `python setup_local_models.py` to download models locally
+        - You can download all 4 models or select specific ones
+        - Local `.nemo` files load faster than HuggingFace downloads
         - See `docs/manual/user-model-setup-guide.md` for instructions
         """)
     
@@ -925,46 +1205,26 @@ if __name__ == "__main__":
     print("🚀 Starting NVIDIA NeMo Transcription Interface")
     print("="*80)
     
+    # Show cache directory info
+    print(f"\n📁 Cache Directory: {CACHE_DIR}")
+    print("   (Used for model downloads and extraction - prevents Windows temp file issues)")
+    
     if torch.cuda.is_available():
-        print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"\n✅ GPU: {torch.cuda.get_device_name(0)}")
         print(f"✅ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
         print(f"✅ CUDA: {torch.version.cuda}")
         
         # Enable GPU optimizations (TF32, cuDNN)
         setup_gpu_optimizations()
     else:
-        print("⚠️  WARNING: No CUDA GPU detected!")
+        print("\n⚠️  WARNING: No CUDA GPU detected!")
     
     print("="*80)
     
-    # Validate models - Parakeet from local, Canary models from HuggingFace
-    print("\n📦 Checking model availability...")
-    script_dir = get_script_dir()
+    # Validate models - uses new validation that shows local vs HuggingFace status
+    validate_local_models()
     
-    # Check Parakeet (local .nemo file)
-    parakeet_config = MODEL_CONFIGS["parakeet-v3"]
-    parakeet_path = script_dir / parakeet_config["local_path"]
-    if parakeet_path.exists():
-        size_mb = parakeet_path.stat().st_size / (1024 * 1024)
-        print(f"   {parakeet_config['display_name']}: ✅ Found (local .nemo)")
-        print(f"      Path: {parakeet_path}")
-        print(f"      Size: {size_mb:.1f} MB")
-    else:
-        print(f"   {parakeet_config['display_name']}: ❌ Missing")
-    
-    # Show info about available models
-    print(f"\n📡 Available Models (download on first use):")
-    for key in ["parakeet-1.1b", "canary-1b", "canary-1b-v2"]:
-        config = MODEL_CONFIGS[key]
-        print(f"   {config['display_name']}: HuggingFace")
-        print(f"      Model ID: {config['hf_model_id']}")
-        print(f"      Languages: {config['languages']}")
-        print(f"      VRAM: {config['vram_gb']} GB")
-    
-    if not validate_local_models():
-        sys.exit(1)
-    
-    print("\n" + "="*80)
+    print("="*80)
     print("\n🌐 Opening in browser at: http://127.0.0.1:7860")
     print("💡 Keep this terminal open while using the interface")
     print("🛑 Press Ctrl+C to stop\n")
