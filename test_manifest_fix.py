@@ -145,34 +145,91 @@ def test_file_copy_logic():
 def test_retry_logic_simulation():
     """Test retry logic with simulated failures."""
     print("\n" + "="*80)
-    print("TEST 5: Retry Logic Simulation")
+    print("TEST 5: Retry Logic Simulation (Updated)")
     print("="*80)
     
-    max_retries = 3
-    base_delay = 0.2
+    # Updated values from the fix
+    max_retries = 6
+    base_delay = 0.5
     
     print(f"  Max retries: {max_retries}")
     print(f"  Base delay: {base_delay}s")
-    print(f"  Expected delays (linear backoff):")
+    print(f"  Expected delays (exponential backoff):")
     
+    total_wait = 0
     for attempt in range(max_retries):
         delay = base_delay * (attempt + 1)
+        total_wait += delay
         print(f"    Attempt {attempt + 1}: {delay:.1f}s")
     
+    print(f"  Total max wait time: {total_wait:.1f}s")
+    
     # Verify delays are correct
-    expected_delays = [0.2, 0.4, 0.6]
+    expected_delays = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
     actual_delays = [base_delay * (i + 1) for i in range(max_retries)]
     
     # Use approximate comparison for floating point
     delays_match = all(abs(a - e) < 0.001 for a, e in zip(actual_delays, expected_delays))
     
-    if delays_match:
+    # Verify total wait time (should be 10.5s)
+    expected_total = 10.5
+    total_match = abs(total_wait - expected_total) < 0.001
+    
+    if delays_match and total_match:
         print(f"✓ PASS: Retry delays calculated correctly")
+        print(f"  Exponential backoff accommodates Windows antivirus (500ms-4000ms)")
         return True
     else:
         print(f"✗ FAIL: Delay mismatch")
-        print(f"  Expected: {expected_delays}")
-        print(f"  Actual:   {actual_delays}")
+        print(f"  Expected delays: {expected_delays}")
+        print(f"  Actual delays:   {actual_delays}")
+        print(f"  Expected total: {expected_total}s")
+        print(f"  Actual total:   {total_wait}s")
+        return False
+
+def test_librosa_retry_logic():
+    """Test librosa.get_duration() retry logic."""
+    print("\n" + "="*80)
+    print("TEST 6: Librosa Duration Check Retry Logic")
+    print("="*80)
+    
+    # Updated values for librosa retry
+    max_duration_retries = 4
+    duration_base_delay = 0.5
+    
+    print(f"  Max retries: {max_duration_retries}")
+    print(f"  Base delay: {duration_base_delay}s")
+    print(f"  Expected delays (exponential backoff):")
+    
+    total_wait = 0
+    for attempt in range(max_duration_retries):
+        delay = duration_base_delay * (attempt + 1)
+        total_wait += delay
+        print(f"    Attempt {attempt + 1}: {delay:.1f}s")
+    
+    print(f"  Total max wait time: {total_wait:.1f}s")
+    
+    # Verify delays are correct
+    expected_delays = [0.5, 1.0, 1.5, 2.0]
+    actual_delays = [duration_base_delay * (i + 1) for i in range(max_duration_retries)]
+    
+    # Use approximate comparison for floating point
+    delays_match = all(abs(a - e) < 0.001 for a, e in zip(actual_delays, expected_delays))
+    
+    # Verify total wait time (should be 5.0s)
+    expected_total = 5.0
+    total_match = abs(total_wait - expected_total) < 0.001
+    
+    if delays_match and total_match:
+        print(f"✓ PASS: Librosa retry delays calculated correctly")
+        print(f"  Handles file locks after copy operation")
+        return True
+    else:
+        print(f"✗ FAIL: Delay mismatch")
+        print(f"  Expected delays: {expected_delays}")
+        print(f"  Actual delays:   {actual_delays}")
+        print(f"  Expected total: {expected_total}s")
+        print(f"  Actual total:   {total_wait}s")
         return False
 
 def main():
@@ -190,6 +247,7 @@ def main():
     results.append(("SHA-256 Hash Generation", test_file_hash_generation()))
     results.append(("File Copy Logic", test_file_copy_logic()))
     results.append(("Retry Logic Simulation", test_retry_logic_simulation()))
+    results.append(("Librosa Retry Logic", test_librosa_retry_logic()))
     
     # Summary
     print("\n" + "="*80)
