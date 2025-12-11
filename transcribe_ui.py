@@ -54,6 +54,7 @@ import gradio as gr
 import nemo.collections.asr as nemo_asr
 import torch
 import time
+import gc
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -308,8 +309,6 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
     Raises:
         PermissionError, ConnectionError, OSError, RuntimeError on failure
     """
-    import gc
-    
     base_delay = 0.2  # 200ms base delay for retries
     
     for attempt in range(max_retries):
