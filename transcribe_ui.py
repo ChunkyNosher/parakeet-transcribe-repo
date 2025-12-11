@@ -124,7 +124,7 @@ MODEL_CONFIGS = {
     "parakeet-v3": {
         "local_path": "local_models/parakeet-0.6b-v3.nemo",  # Unique filename
         "hf_model_id": "nvidia/parakeet-tdt-0.6b-v3",
-        "max_batch_size": 32,
+        "max_batch_size": 32,  # Reference only - NeMo uses default file batching
         "display_name": "Parakeet-TDT-0.6B v3",
         "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-TDT",
@@ -139,7 +139,7 @@ MODEL_CONFIGS = {
     "parakeet-1.1b": {
         "local_path": "local_models/parakeet-1.1b.nemo",  # Unique filename
         "hf_model_id": "nvidia/parakeet-tdt-1.1b",
-        "max_batch_size": 24,
+        "max_batch_size": 24,  # Reference only - NeMo uses default file batching
         "display_name": "Parakeet-TDT-1.1B",
         "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-TDT",
@@ -155,7 +155,7 @@ MODEL_CONFIGS = {
     "canary-1b": {
         "local_path": "local_models/canary-1b.nemo",  # Unique filename
         "hf_model_id": "nvidia/canary-1b",
-        "max_batch_size": 16,
+        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
         "display_name": "Canary-1B",
         "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-Transformer",
@@ -171,7 +171,7 @@ MODEL_CONFIGS = {
     "canary-1b-v2": {
         "local_path": "local_models/canary-1b-v2.nemo",  # Unique filename
         "hf_model_id": "nvidia/canary-1b-v2",
-        "max_batch_size": 16,
+        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
         "display_name": "Canary-1B v2",
         "loading_method": "local_or_huggingface",  # Try local, fallback to HF
         "architecture": "FastConformer-Transformer",
@@ -272,7 +272,7 @@ def validate_local_models():
     print("\n💡 Tip: Run 'python setup_local_models.py' to download all models locally")
     print("="*80 + "\n")
 
-def copy_gradio_file_to_cache(file_path, max_retries=3):
+def copy_gradio_file_to_cache(file_path, max_retries=6):
     """Copy Gradio uploaded file to cache directory to prevent manifest.json file locking.
     
     Gradio uploads files to its own temp directory. When NeMo reads these files,
@@ -285,7 +285,7 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
     
     Args:
         file_path: Path to Gradio uploaded file
-        max_retries: Maximum retry attempts for file copy (handles transient locks)
+        max_retries: Maximum retry attempts for file copy (default: 6 for Windows antivirus)
         
     Returns:
         Path to file in cache directory
@@ -307,19 +307,29 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
         return str(cached_path)
     
     # Copy with retry logic for Windows file locks
-    base_delay = 0.2  # 200ms base delay
+    # Use exponential backoff to accommodate antivirus scanning (500ms-4000ms)
+    base_delay = 0.5  # 500ms base delay
     
     for attempt in range(max_retries):
         try:
             shutil.copy2(file_path, cached_path)
-            return str(cached_path)
+            
+            # Validate file was actually written and is readable
+            if cached_path.exists() and cached_path.stat().st_size > 0:
+                return str(cached_path)
+            else:
+                # File exists but is empty or invalid - treat as failure
+                if cached_path.exists():
+                    cached_path.unlink()  # Remove invalid file
+                raise OSError(f"File copy succeeded but file is empty or invalid: {cached_path}")
             
         except (OSError, PermissionError) as e:
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
             if is_file_lock and attempt < max_retries - 1:
-                delay = base_delay * (attempt + 1)  # Linear backoff: 0.2s, 0.4s, 0.6s
+                # Exponential backoff: 0.5s, 1.0s, 1.5s, 2.0s, 2.5s, 3.0s = 10.5s total
+                delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 time.sleep(delay)
                 continue
@@ -333,17 +343,17 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
             )
 
 def get_dynamic_batch_size(duration, model_key):
-    """Calculate optimal batch size based on audio duration and model"""
-    max_batch = MODEL_CONFIGS[model_key]["max_batch_size"]
+    """Calculate optimal batch size based on audio duration and model
     
-    if duration < 60:  # Under 1 minute
-        return min(8, max_batch)
-    elif duration < 300:  # Under 5 minutes
-        return min(16, max_batch)
-    elif duration < 900:  # Under 15 minutes
-        return min(24, max_batch)
-    else:  # Longer audio
-        return max_batch
+    DEPRECATED: This function is no longer used. NeMo's transcribe() method
+    handles batch sizing automatically based on available VRAM. The batch_size
+    parameter in transcribe() controls how many FILES are batched together,
+    not duration-based splitting.
+    
+    Kept for reference only - will be removed in future version.
+    """
+    # Return NeMo's default batch_size for file batching
+    return 4
 
 def setup_gpu_optimizations():
     """Enable GPU optimizations for better performance"""
@@ -920,13 +930,36 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 print(f"🎬 Extracting audio from video: {os.path.basename(cached_file_path)}")
             
             # librosa.get_duration handles both audio and video files (via FFmpeg)
-            try:
-                duration = librosa.get_duration(path=cached_file_path)
-            except Exception as e:
-                # Handle case where video has no audio track
-                if is_video:
-                    return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
-                raise
+            # Add retry logic to handle Windows antivirus scanning the newly-copied file
+            duration = None
+            max_duration_retries = 4
+            duration_base_delay = 0.5
+            
+            for attempt in range(max_duration_retries):
+                try:
+                    duration = librosa.get_duration(path=cached_file_path)
+                    break  # Success - exit retry loop
+                except (OSError, PermissionError) as e:
+                    if attempt < max_duration_retries - 1:
+                        # File may still be locked by antivirus - retry with exponential backoff
+                        delay = duration_base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s, 2.0s
+                        print(f"   ⚠️  File lock on duration check (attempt {attempt + 1}/{max_duration_retries}), waiting {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Final retry failed - handle based on file type
+                        if is_video:
+                            return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
+                        raise
+                except Exception as e:
+                    # Other errors (e.g., video has no audio track)
+                    if is_video:
+                        return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
+                    raise
+            
+            if duration is None:
+                # Should not reach here, but handle gracefully
+                return f"❌ Failed to determine duration for '{os.path.basename(cached_file_path)}' after {max_duration_retries} attempts.", "", None
             
             total_duration += duration
             processed_files.append(cached_file_path)
@@ -937,8 +970,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 "is_video": is_video
             })
         
-        # Calculate optimal batch size based on total duration
-        batch_size = get_dynamic_batch_size(total_duration, model_key)
+        # Use NeMo's default batch_size for file batching
+        # NeMo handles optimal batching automatically based on VRAM
+        batch_size = 4  # NeMo default for file-count batching
         
         # Prepare status update for video processing
         video_status = ""
@@ -1113,12 +1147,19 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             
             # Format timestamps if requested
             timestamp_text = ""
-            if include_timestamps and hasattr(result[0], 'words') and result[0].words:
-                timestamp_text = "\n\n### Word-Level Timestamps (first 50 words):\n\n"
-                for i, word in enumerate(result[0].words[:50]):
-                    timestamp_text += f"`{word.start:.2f}s - {word.end:.2f}s` → **{word.text}**\n\n"
-                if len(result[0].words) > 50:
-                    timestamp_text += f"\n*...and {len(result[0].words) - 50} more words*"
+            if include_timestamps and hasattr(result[0], 'timestamp') and result[0].timestamp:
+                # Access timestamp dictionary following official NeMo API pattern
+                word_timestamps = result[0].timestamp.get('word', [])
+                if word_timestamps:
+                    timestamp_text = "\n\n### Word-Level Timestamps (first 50 words):\n\n"
+                    for i, stamp in enumerate(word_timestamps[:50]):
+                        # Each stamp is a dict with 'start', 'end', 'word' or 'segment' keys
+                        start = stamp.get('start', 0.0)
+                        end = stamp.get('end', 0.0)
+                        word = stamp.get('word', stamp.get('segment', ''))
+                        timestamp_text += f"`{start:.2f}s - {end:.2f}s` → **{word}**\n\n"
+                    if len(word_timestamps) > 50:
+                        timestamp_text += f"\n*...and {len(word_timestamps) - 50} more words*"
             
             file_type_msg = "🎬 Video file detected - audio extracted automatically\n" if info["is_video"] else ""
             
@@ -1175,12 +1216,19 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f.write(f"{SEPARATOR}\n\n")
                     f.write(transcription)
                     
-                    if include_timestamps and hasattr(result[0], 'words') and result[0].words:
-                        f.write(f"\n\n{SEPARATOR}\n")
-                        f.write(f"WORD-LEVEL TIMESTAMPS\n")
-                        f.write(f"{SEPARATOR}\n\n")
-                        for word in result[0].words:
-                            f.write(f"{word.start:.2f}s - {word.end:.2f}s: {word.text}\n")
+                    if include_timestamps and hasattr(result[0], 'timestamp') and result[0].timestamp:
+                        # Access timestamp dictionary following official NeMo API pattern
+                        word_timestamps = result[0].timestamp.get('word', [])
+                        if word_timestamps:
+                            f.write(f"\n\n{SEPARATOR}\n")
+                            f.write(f"WORD-LEVEL TIMESTAMPS\n")
+                            f.write(f"{SEPARATOR}\n\n")
+                            for stamp in word_timestamps:
+                                # Each stamp is a dict with 'start', 'end', 'word' or 'segment' keys
+                                start = stamp.get('start', 0.0)
+                                end = stamp.get('end', 0.0)
+                                word = stamp.get('word', stamp.get('segment', ''))
+                                f.write(f"{start:.2f}s - {end:.2f}s: {word}\n")
             
             status += f"\n💾 **Saved to**: `{output_file}`"
         
