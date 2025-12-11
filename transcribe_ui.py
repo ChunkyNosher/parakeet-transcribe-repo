@@ -297,7 +297,8 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
     
     # Generate unique filename using hash of original path + filename
     # This prevents collisions from multiple uploads of same filename
-    path_hash = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
+    # Note: MD5 is used only for filename generation (not security), but SHA-256 is preferred
+    path_hash = hashlib.sha256(str(file_path).encode()).hexdigest()[:16]
     cached_filename = f"{path_hash}_{file_path.name}"
     cached_path = _gradio_cache_dir / cached_filename
     
@@ -307,7 +308,6 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
     
     # Copy with retry logic for Windows file locks
     base_delay = 0.2  # 200ms base delay
-    last_error = None
     
     for attempt in range(max_retries):
         try:
@@ -315,12 +315,11 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
             return str(cached_path)
             
         except (OSError, PermissionError) as e:
-            last_error = e
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
             if is_file_lock and attempt < max_retries - 1:
-                delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
+                delay = base_delay * (attempt + 1)  # Linear backoff: 0.2s, 0.4s, 0.6s
                 print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 time.sleep(delay)
                 continue
@@ -332,11 +331,6 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
                     f"Destination: {cached_path}\n"
                     f"Error: {error_str}"
                 )
-    
-    # Should never reach here, but safety fallback
-    if last_error:
-        raise last_error
-    raise RuntimeError(f"Failed to copy file after {max_retries} attempts")
 
 def get_dynamic_batch_size(duration, model_key):
     """Calculate optimal batch size based on audio duration and model"""
@@ -963,8 +957,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         inference_start = time.time()
         
         max_retries = 3
-        base_delay = 0.5
-        last_error = None
+        base_delay = 0.5  # 500ms base delay
         
         for attempt in range(max_retries):
             try:
@@ -988,13 +981,12 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 break
                 
             except PermissionError as e:
-                last_error = e
                 error_str = str(e)
                 is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
                 
                 if is_file_lock and attempt < max_retries - 1:
-                    # File lock detected during transcription - retry
-                    delay = base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s
+                    # File lock detected during transcription - retry with linear backoff
+                    delay = base_delay * (attempt + 1)  # Linear backoff: 0.5s, 1.0s, 1.5s
                     print(f"⏳ Transcription file lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                     
                     # Force garbage collection before retry
@@ -1028,7 +1020,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             except Exception as e:
                 # Other exceptions during transcription
                 if attempt < max_retries - 1:
-                    delay = base_delay * (attempt + 1)
+                    delay = base_delay * (attempt + 1)  # Linear backoff
                     print(f"⚠️  Transcription error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
                     print(f"   Retrying in {delay:.1f}s...")
                     
