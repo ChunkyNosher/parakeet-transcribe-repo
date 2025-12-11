@@ -154,7 +154,7 @@ def test_retry_logic_simulation():
     
     print(f"  Max retries: {max_retries}")
     print(f"  Base delay: {base_delay}s")
-    print(f"  Expected delays (exponential backoff):")
+    print(f"  Expected delays (linear backoff):")
     
     total_wait = 0
     for attempt in range(max_retries):
@@ -177,7 +177,7 @@ def test_retry_logic_simulation():
     
     if delays_match and total_match:
         print(f"✓ PASS: Retry delays calculated correctly")
-        print(f"  Exponential backoff accommodates Windows antivirus (500ms-4000ms)")
+        print(f"  Linear backoff accommodates Windows antivirus (500ms-4000ms)")
         return True
     else:
         print(f"✗ FAIL: Delay mismatch")
@@ -199,7 +199,7 @@ def test_librosa_retry_logic():
     
     print(f"  Max retries: {max_duration_retries}")
     print(f"  Base delay: {duration_base_delay}s")
-    print(f"  Expected delays (exponential backoff):")
+    print(f"  Expected delays (linear backoff):")
     
     total_wait = 0
     for attempt in range(max_duration_retries):

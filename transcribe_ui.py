@@ -307,7 +307,7 @@ def copy_gradio_file_to_cache(file_path, max_retries=6):
         return str(cached_path)
     
     # Copy with retry logic for Windows file locks
-    # Use exponential backoff to accommodate antivirus scanning (500ms-4000ms)
+    # Use linear backoff to accommodate antivirus scanning (500ms-4000ms)
     base_delay = 0.5  # 500ms base delay
     
     for attempt in range(max_retries):
@@ -328,7 +328,7 @@ def copy_gradio_file_to_cache(file_path, max_retries=6):
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
             if is_file_lock and attempt < max_retries - 1:
-                # Exponential backoff: 0.5s, 1.0s, 1.5s, 2.0s, 2.5s, 3.0s = 10.5s total
+                # Linear backoff: 0.5s, 1.0s, 1.5s, 2.0s, 2.5s, 3.0s = 10.5s total
                 delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 time.sleep(delay)
@@ -941,7 +941,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     break  # Success - exit retry loop
                 except (OSError, PermissionError) as e:
                     if attempt < max_duration_retries - 1:
-                        # File may still be locked by antivirus - retry with exponential backoff
+                        # File may still be locked by antivirus - retry with linear backoff
                         delay = duration_base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s, 2.0s
                         print(f"   ⚠️  File lock on duration check (attempt {attempt + 1}/{max_duration_retries}), waiting {delay:.1f}s...")
                         time.sleep(delay)
