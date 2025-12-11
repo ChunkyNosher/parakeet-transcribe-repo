@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Simplified setup: Downloads and saves Parakeet models as .nemo files.
-Canary models load automatically from HuggingFace on first use.
+Multi-Model Setup Script: Downloads and saves all Parakeet & Canary models as .nemo files.
 
-Available Parakeet models:
-- Parakeet-TDT-0.6B-v3: 600M params, 25 languages, multilingual (RECOMMENDED)
-- Parakeet-TDT-1.1B: 1.1B params, English only, best accuracy (1.5% WER)
+This script supports downloading all 4 ASR models with unique filenames:
+  - Parakeet-TDT-0.6B-v3: parakeet-0.6b-v3.nemo (~2.4 GB)
+  - Parakeet-TDT-1.1B:    parakeet-1.1b.nemo    (~4.5 GB)
+  - Canary-1B:            canary-1b.nemo        (~5.0 GB)
+  - Canary-1B-v2:         canary-1b-v2.nemo     (~5.0 GB)
 
-Both models can be saved to local .nemo files for faster offline loading.
-Canary models (Canary-1B, Canary-1B-v2) download automatically on first use.
+Features:
+  - Menu-driven model selection
+  - Download one or multiple models
+  - Batch download all models
+  - Check what's already downloaded
+  - Verify file integrity after download
 
 See docs/manual/comprehensive-asr-model-integration-guide.md for details.
 """
@@ -16,6 +21,54 @@ See docs/manual/comprehensive-asr-model-integration-guide.md for details.
 import nemo.collections.asr as nemo_asr
 import os
 import sys
+
+# ============================================================================
+# MODEL DEFINITIONS
+# ============================================================================
+# Each model has a unique filename to prevent overwrites
+
+MODELS_TO_DOWNLOAD = {
+    "1": {
+        "model_id": "nvidia/parakeet-tdt-0.6b-v3",
+        "filename": "parakeet-0.6b-v3.nemo",
+        "display_name": "Parakeet-TDT-0.6B-v3 (Multilingual)",
+        "download_size": "~1.2 GB",
+        "saved_size": "~2.4 GB",
+        "min_size_gb": 1.5,  # Minimum expected file size in GB for validation
+        "description": "25 languages, auto-detection, 3,380× RTFx",
+        "recommended": True
+    },
+    "2": {
+        "model_id": "nvidia/parakeet-tdt-1.1b",
+        "filename": "parakeet-1.1b.nemo",
+        "display_name": "Parakeet-TDT-1.1B (Maximum Accuracy)",
+        "download_size": "~2.2 GB",
+        "saved_size": "~4.5 GB",
+        "min_size_gb": 3.0,
+        "description": "English only, 1.5% WER (best accuracy)",
+        "recommended": False
+    },
+    "3": {
+        "model_id": "nvidia/canary-1b",
+        "filename": "canary-1b.nemo",
+        "display_name": "Canary-1B (Multilingual + Translation)",
+        "download_size": "~2.5 GB",
+        "saved_size": "~5.0 GB",
+        "min_size_gb": 3.5,
+        "description": "25 languages, speech-to-text translation",
+        "recommended": False
+    },
+    "4": {
+        "model_id": "nvidia/canary-1b-v2",
+        "filename": "canary-1b-v2.nemo",
+        "display_name": "Canary-1B v2 (Multilingual + Translation)",
+        "download_size": "~2.5 GB",
+        "saved_size": "~5.0 GB",
+        "min_size_gb": 3.5,
+        "description": "25 languages, improved speech translation",
+        "recommended": False
+    }
+}
 
 
 def create_local_models_directory():
@@ -27,78 +80,128 @@ def create_local_models_directory():
         print("✓ local_models/ directory already exists")
 
 
-def download_and_save_parakeet():
-    """Download and save a Parakeet model as .nemo file."""
+def get_model_status():
+    """Check which models are already downloaded.
+    
+    Returns:
+        dict: Model choice -> status info (exists, size, valid)
+    """
+    status = {}
+    for choice, model in MODELS_TO_DOWNLOAD.items():
+        filepath = os.path.join("local_models", model["filename"])
+        if os.path.exists(filepath):
+            size_gb = os.path.getsize(filepath) / (1024**3)
+            is_valid = size_gb >= model["min_size_gb"]
+            status[choice] = {
+                "exists": True,
+                "size_gb": size_gb,
+                "valid": is_valid,
+                "path": filepath
+            }
+        else:
+            status[choice] = {
+                "exists": False,
+                "size_gb": 0,
+                "valid": False,
+                "path": filepath
+            }
+    return status
+
+
+def display_model_status():
+    """Display current status of all models."""
     print("\n" + "="*80)
-    print("📦 PARAKEET MODEL SELECTION")
+    print("📊 CURRENT MODEL STATUS")
     print("="*80)
-    print("\nAvailable models:")
-    print("\n1. Parakeet-TDT-0.6B-v3 (RECOMMENDED)")
-    print("   - Size: ~1.2 GB download, ~2.4 GB saved")
-    print("   - Languages: 25 European languages with auto-detection")
-    print("   - Speed: 3,380× real-time (ultra-fast)")
-    print("   - Accuracy: ~1.7% WER")
-    print("   - Best for: Multilingual transcription, general use")
     
-    print("\n2. Parakeet-TDT-1.1B")
-    print("   - Size: ~2.2 GB download, ~4.5 GB saved")
-    print("   - Languages: English only")
-    print("   - Speed: 1,336× real-time")
-    print("   - Accuracy: 1.5% WER (BEST available)")
-    print("   - Best for: Maximum English transcription accuracy")
+    status = get_model_status()
+    total_size = 0
+    downloaded_count = 0
+    
+    for choice, model in MODELS_TO_DOWNLOAD.items():
+        s = status[choice]
+        if s["exists"]:
+            downloaded_count += 1
+            total_size += s["size_gb"]
+            if s["valid"]:
+                print(f"\n  {choice}. {model['display_name']}")
+                print(f"     ✅ Downloaded ({s['size_gb']:.2f} GB)")
+                print(f"     📁 {s['path']}")
+            else:
+                print(f"\n  {choice}. {model['display_name']}")
+                print(f"     ⚠️  Downloaded but may be corrupted ({s['size_gb']:.2f} GB)")
+                print(f"        Expected minimum: {model['min_size_gb']} GB")
+        else:
+            print(f"\n  {choice}. {model['display_name']}")
+            print(f"     ❌ Not downloaded")
+            print(f"        Size: {model['download_size']} → {model['saved_size']}")
+    
+    print(f"\n" + "-"*40)
+    print(f"📦 Total: {downloaded_count}/{len(MODELS_TO_DOWNLOAD)} models ({total_size:.2f} GB)")
+    print("="*80 + "\n")
+
+
+def download_and_save_model(choice):
+    """Download and save a single model as .nemo file.
+    
+    Args:
+        choice: Model choice key from MODELS_TO_DOWNLOAD
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if choice not in MODELS_TO_DOWNLOAD:
+        print(f"❌ Invalid choice: {choice}")
+        return False
+    
+    model = MODELS_TO_DOWNLOAD[choice]
+    output_path = os.path.abspath(f"local_models/{model['filename']}")
     
     print("\n" + "="*80)
-    choice = input("\nSelect model to download (1 or 2): ").strip()
-    
-    if choice == "1":
-        model_id = "nvidia/parakeet-tdt-0.6b-v3"
-        model_name = "Parakeet-TDT-0.6B-v3"
-        download_size = "~1.2 GB"
-        saved_size = "~2.4 GB"
-    elif choice == "2":
-        model_id = "nvidia/parakeet-tdt-1.1b"
-        model_name = "Parakeet-TDT-1.1B"
-        download_size = "~2.2 GB"
-        saved_size = "~4.5 GB"
-    else:
-        print("\n❌ Invalid choice. Please run again and select 1 or 2.")
-        sys.exit(1)
-    
-    print("\n" + "="*80)
-    print(f"📦 Downloading {model_name} from HuggingFace...")
+    print(f"📦 DOWNLOADING: {model['display_name']}")
     print("="*80)
-    print(f"Download size: {download_size}")
-    print(f"Saved size: {saved_size}")
-    print("This will take ~2-5 minutes depending on your connection.\n")
+    print(f"   Model ID: {model['model_id']}")
+    print(f"   Output: {output_path}")
+    print(f"   Download size: {model['download_size']}")
+    print(f"   Saved size: {model['saved_size']}")
+    print(f"   Description: {model['description']}")
+    print("\nThis may take 2-10 minutes depending on your connection...\n")
     
     try:
         # Download from HuggingFace
-        model = nemo_asr.models.ASRModel.from_pretrained(model_id)
-        print(f"\n✓ {model_name} downloaded successfully")
+        print("   ⏳ Downloading from HuggingFace...")
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(model["model_id"])
+        print(f"   ✓ Downloaded {model['display_name']}")
         
         # Save to local file
-        print(f"\n💾 Saving {model_name} to local_models/parakeet.nemo...")
-        output_path = os.path.abspath("local_models/parakeet.nemo")
-        model.save_to(output_path)
-        print(f"✓ {model_name} saved successfully to {output_path}")
+        print(f"   💾 Saving to {model['filename']}...")
+        asr_model.save_to(output_path)
+        print(f"   ✓ Saved to {output_path}")
         
-        # Verify file exists and has reasonable size
+        # Verify file
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path) / (1024**3)
-            print(f"✓ Verified: parakeet.nemo ({file_size:.2f} GB)")
+            print(f"\n   📊 Verification:")
+            print(f"      File size: {file_size:.2f} GB")
             
-            if file_size < 0.5:
-                print(f"⚠️  Warning: File size seems small ({file_size:.2f} GB)")
+            if file_size < model["min_size_gb"]:
+                print(f"      ⚠️  Warning: File smaller than expected (min: {model['min_size_gb']} GB)")
+                print(f"         This may indicate a corrupted download.")
                 return False
+            else:
+                print(f"      ✅ File size OK (expected min: {model['min_size_gb']} GB)")
         else:
-            print("❌ File was not created!")
+            print(f"\n   ❌ ERROR: File was not created at {output_path}")
             return False
         
-        del model  # Free memory
+        # Clean up memory
+        del asr_model
+        
+        print(f"\n✅ {model['display_name']} ready for use!")
         return True
         
     except Exception as e:
-        print(f"\n❌ Error downloading/saving {model_name}:")
+        print(f"\n❌ Error downloading {model['display_name']}:")
         print(f"   {type(e).__name__}: {str(e)}")
         import traceback
         print("\nFull traceback:")
@@ -106,81 +209,95 @@ def download_and_save_parakeet():
         return False
 
 
-def verify_setup():
-    """Verify Parakeet .nemo file exists and is valid."""
+def download_all_models():
+    """Download all models in sequence."""
     print("\n" + "="*80)
-    print("🔍 Verifying Setup...")
+    print("📦 BATCH DOWNLOAD: ALL MODELS")
+    print("="*80)
+    print("\nThis will download all 4 models.")
+    print("Estimated total size: ~16-17 GB")
+    print("Estimated time: 15-45 minutes (depends on connection)")
+    
+    confirm = input("\nProceed with batch download? (y/n): ").strip().lower()
+    if confirm not in ('y', 'yes'):
+        print("\n❌ Batch download cancelled")
+        return
+    
+    results = {}
+    for choice in MODELS_TO_DOWNLOAD.keys():
+        success = download_and_save_model(choice)
+        results[choice] = success
+    
+    # Summary
+    print("\n" + "="*80)
+    print("📊 BATCH DOWNLOAD SUMMARY")
     print("="*80)
     
-    # Check Parakeet
-    parakeet_path = os.path.abspath("local_models/parakeet.nemo")
-    if not os.path.exists(parakeet_path):
-        print(f"❌ parakeet.nemo not found at {parakeet_path}")
-        return False
+    success_count = sum(1 for s in results.values() if s)
+    for choice, success in results.items():
+        model = MODELS_TO_DOWNLOAD[choice]
+        status = "✅ Success" if success else "❌ Failed"
+        print(f"   {model['display_name']}: {status}")
     
-    size = os.path.getsize(parakeet_path) / (1024**3)
-    if size < 0.5:
-        print(f"⚠️  parakeet.nemo too small ({size:.2f} GB), may be corrupted")
-        return False
+    print(f"\n   Total: {success_count}/{len(MODELS_TO_DOWNLOAD)} models downloaded successfully")
+    print("="*80 + "\n")
+
+
+def display_menu():
+    """Display the main menu and get user selection."""
+    print("\n" + "="*80)
+    print("📦 NeMo ASR Local Model Setup")
+    print("="*80)
+    print("\nSelect an option:\n")
     
-    print(f"✓ parakeet.nemo exists ({size:.2f} GB)")
-    print("\n✅ Parakeet setup complete!")
-    return True
+    for choice, model in MODELS_TO_DOWNLOAD.items():
+        rec = " [RECOMMENDED]" if model.get("recommended") else ""
+        print(f"  {choice}. Download {model['display_name']}{rec}")
+        print(f"     Size: {model['download_size']} → {model['saved_size']}")
+        print(f"     {model['description']}\n")
+    
+    print("  5. Download ALL models (batch mode)")
+    print("  6. Check what's already downloaded")
+    print("  0. Exit\n")
+    
+    return input("Enter your choice: ").strip()
 
 
 def main():
     print("\n" + "="*80)
-    print("📦 NeMo ASR Local Model Setup")
+    print("🚀 NeMo ASR Multi-Model Setup Script")
     print("="*80)
-    print("\nThis script will:")
-    print("  1. Create local_models/ directory")
-    print("  2. Download your selected Parakeet model")
-    print("  3. Save as local .nemo file")
-    print("\n⚠️  Note about other models:")
-    print("  - Canary-1B and Canary-1B-v2 download automatically from HuggingFace")
-    print("  - They will be cached for offline use after first download")
-    print("  - No setup script needed for Canary models")
-    print("\nEstimated time: 5-10 minutes\n")
-    
-    response = input("Continue with Parakeet setup? (y/n): ").strip().lower()
-    if response != 'y':
-        print("\n❌ Setup cancelled")
-        sys.exit(0)
+    print("\nThis script downloads ASR models and saves them as local .nemo files.")
+    print("Local files load faster and work completely offline.")
+    print("\nFeatures:")
+    print("  • Download individual models or all at once")
+    print("  • Unique filenames prevent overwrites")
+    print("  • Automatic integrity verification")
+    print("  • Works with transcribe_ui.py fallback loading")
     
     # Create directory
     create_local_models_directory()
     
-    # Download and save Parakeet
-    print("\n" + "="*80)
-    print("DOWNLOADING PARAKEET")
-    print("="*80)
-    parakeet_success = download_and_save_parakeet()
-    
-    if not parakeet_success:
-        print("\n❌ Parakeet setup failed.")
-        print("\nTroubleshooting:")
-        print("1. Check your internet connection")
-        print("2. Ensure you have at least 5GB free disk space")
-        print("3. Try running as administrator if on Windows")
-        print("4. Check antivirus isn't blocking file creation")
-        sys.exit(1)
-    
-    # Verify
-    if verify_setup():
-        print("\n" + "="*80)
-        print("✅ Setup Complete!")
-        print("="*80)
-        print("\nYou can now run transcribe_ui.py")
-        print("\nModel loading behavior:")
-        print(f"  • Parakeet: Loads from {os.path.abspath('local_models/parakeet.nemo')}")
-        print("              (instant, works offline)")
-        print("  • Canary models: Download from HuggingFace on first use")
-        print("                   (then cached for offline use)")
-        print("\n⚠️  Keep the local_models folder - deleting it requires re-download")
-        print("="*80 + "\n")
-    else:
-        print("\n❌ Setup verification failed")
-        sys.exit(1)
+    while True:
+        choice = display_menu()
+        
+        if choice == "0":
+            print("\n👋 Goodbye!")
+            break
+        elif choice == "5":
+            download_all_models()
+        elif choice == "6":
+            display_model_status()
+        elif choice in MODELS_TO_DOWNLOAD:
+            success = download_and_save_model(choice)
+            if success:
+                print("\n✅ Download complete!")
+            else:
+                print("\n❌ Download failed. See error above.")
+        else:
+            print("\n❌ Invalid choice. Please try again.")
+        
+        input("\nPress Enter to continue...")
 
 
 if __name__ == "__main__":
