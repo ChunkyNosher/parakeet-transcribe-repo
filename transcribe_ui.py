@@ -957,10 +957,6 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                         return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
                     raise
             
-            if duration is None:
-                # Should not reach here, but handle gracefully
-                return f"❌ Failed to determine duration for '{os.path.basename(cached_file_path)}' after {max_duration_retries} attempts.", "", None
-            
             total_duration += duration
             processed_files.append(cached_file_path)
             file_info.append({

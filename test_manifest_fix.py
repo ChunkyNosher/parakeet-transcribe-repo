@@ -145,7 +145,7 @@ def test_file_copy_logic():
 def test_retry_logic_simulation():
     """Test retry logic with simulated failures."""
     print("\n" + "="*80)
-    print("TEST 5: Retry Logic Simulation (Updated)")
+    print("TEST 5: File Copy Retry Logic")
     print("="*80)
     
     # Updated values from the fix
