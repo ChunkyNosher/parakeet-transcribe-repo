@@ -429,7 +429,6 @@ def _load_with_retry(restore_path, config, max_retries=3):
         OSError: If extraction or loading fails
     """
     base_delay = 0.2  # 200ms base delay for linear backoff
-    last_error = None
     
     for attempt in range(max_retries):
         try:
@@ -440,7 +439,6 @@ def _load_with_retry(restore_path, config, max_retries=3):
             return model
             
         except PermissionError as e:
-            last_error = e
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
@@ -486,12 +484,11 @@ def _load_with_retry(restore_path, config, max_retries=3):
                     f"{'='*80}"
                 )
             else:
-                # Different PermissionError (not file lock) - re-raise
+                # Different PermissionError (not file lock) - re-raise immediately
                 raise
         
         except Exception as e:
-            # Other exceptions during extraction
-            last_error = e
+            # Other exceptions - retry with same backoff logic
             if attempt < max_retries - 1:
                 delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  Extraction error (attempt {attempt + 1}/{max_retries}): {e}")
@@ -505,13 +502,8 @@ def _load_with_retry(restore_path, config, max_retries=3):
                 time.sleep(delay)
                 continue
             else:
-                # Final attempt failed
+                # Final attempt failed - re-raise the exception
                 raise
-    
-    # This is reached if all attempts fail without raising an exception
-    if last_error:
-        raise last_error
-    raise RuntimeError(f"Failed to load model after {max_retries} attempts")
 
 
 def load_model(model_name, show_progress=False):
