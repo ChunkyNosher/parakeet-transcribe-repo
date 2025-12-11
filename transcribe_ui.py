@@ -1201,7 +1201,7 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         fn=transcribe_audio,
         inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox],
         outputs=[status_output, transcription_output, file_output],
-        queue=True
+        queue=False
     )
 
 # Launch
