@@ -43,10 +43,6 @@ _temp_dir.mkdir(parents=True, exist_ok=True)
 (_cache_dir / "huggingface").mkdir(parents=True, exist_ok=True)
 (_cache_dir / "nemo").mkdir(parents=True, exist_ok=True)
 
-# Create extracted models directory for persistent model extraction cache
-# This prevents re-extraction on every model load, avoiding repeated temp file operations
-(_cache_dir / "extracted_models").mkdir(parents=True, exist_ok=True)
-
 # Store cache_dir for error messages later
 CACHE_DIR = _cache_dir
 
@@ -76,7 +72,6 @@ import nemo.collections.asr as nemo_asr
 import torch
 import time
 import gc
-import shutil  # For cleaning up corrupted extracted models
 
 # Global model cache to avoid reloading
 models_cache = {}
@@ -405,49 +400,24 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
     raise RuntimeError(f"Failed to load model after {max_retries} attempts")
 
 
-def _get_extracted_model_dir(model_name):
-    """Get the persistent extraction directory for a model.
+def _load_with_retry(restore_path, config, max_retries=3):
+    """Load model from .nemo file with retry logic for Windows file lock issues.
     
-    FIX #1: Pre-extracted Model Cache (model_extracted_dir)
+    Enhanced retry logic wrapper for ASRModel.restore_from() that handles
+    Windows file locking errors during model extraction.
     
-    This creates a persistent cache directory where .nemo files are extracted once
-    and reused on subsequent loads. This completely bypasses the temporary directory
-    extraction that causes Windows file locking issues.
-    
-    Benefits:
-    - Avoids repeated temp file operations that trigger antivirus scans
-    - Prevents WinError 32 by using persistent storage instead of temp directories
-    - Improves performance by only extracting once
-    - Works around NeMo's use of tempfile.TemporaryDirectory()
-    
-    Args:
-        model_name: Model key from MODEL_CONFIGS
-        
-    Returns:
-        Path object pointing to the extracted model directory
-    """
-    extracted_dir = CACHE_DIR / "extracted_models" / model_name
-    return extracted_dir
-
-
-def _load_with_extraction_cache(restore_path, model_name, config, max_retries=3):
-    """Load model using persistent extraction directory to avoid temp file issues.
-    
-    FIX #1: Pre-extracted Model Cache Implementation
-    
-    This function wraps ASRModel.restore_from() to use a persistent extraction
-    directory instead of temporary directories. This is the PRIMARY fix for
-    Windows file locking issues.
+    Since we've set tempfile.tempdir to use our custom cache directory (Fix #2),
+    NeMo's internal extraction will use that location instead of system %TEMP%.
+    This function adds retry logic to handle any remaining transient file locks.
     
     How it works:
-    1. Check if model is already extracted in cache
-    2. If not, extract to persistent cache directory
-    3. If extraction fails, cleanup and retry
-    4. On subsequent loads, use pre-extracted cache (much faster)
+    1. Attempts to load model using ASRModel.restore_from()
+    2. If WinError 32 occurs, cleanup and retry with linear backoff
+    3. Force garbage collection between retries to release file handles
+    4. Provides detailed error messages after all retries exhausted
     
     Args:
-        restore_path: Path to .nemo file or HuggingFace model ID
-        model_name: Model key for cache directory naming
+        restore_path: Path to .nemo file
         config: Model configuration dict
         max_retries: Maximum retry attempts for file lock errors
         
@@ -458,35 +428,15 @@ def _load_with_extraction_cache(restore_path, model_name, config, max_retries=3)
         PermissionError: If file lock persists after retries
         OSError: If extraction or loading fails
     """
-    extracted_dir = _get_extracted_model_dir(model_name)
     base_delay = 0.2  # 200ms base delay for linear backoff
     last_error = None
     
     for attempt in range(max_retries):
         try:
-            # Create extraction directory if it doesn't exist
-            extracted_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Check if model is already extracted
-            is_already_extracted = (
-                extracted_dir.exists() and 
-                len(list(extracted_dir.iterdir())) > 0
-            )
-            
-            if is_already_extracted:
-                print(f"   ✓ Using pre-extracted model cache: {extracted_dir.name}")
-            else:
-                print(f"   ⏳ Extracting model to persistent cache: {extracted_dir.name}")
-                print(f"      (This only happens once per model)")
-            
-            # Load model with extraction directory
-            # Note: restore_from does NOT support model_extracted_dir parameter directly
-            # We need to use a different approach - extract manually or use override_config_path
-            # For now, use standard restore_from and let it extract to our temp dir
+            # Load model - NeMo will extract to tempfile.tempdir location
             model = nemo_asr.models.ASRModel.restore_from(
                 restore_path=str(restore_path)
             )
-            
             return model
             
         except PermissionError as e:
@@ -498,14 +448,6 @@ def _load_with_extraction_cache(restore_path, model_name, config, max_retries=3)
                 # File lock detected - retry with linear backoff
                 delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
                 print(f"   ⚠️  File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
-                
-                # Clean up potentially corrupted extraction
-                if extracted_dir.exists():
-                    try:
-                        shutil.rmtree(extracted_dir)
-                        print(f"   🗑️  Cleaned up potentially corrupted extraction")
-                    except:
-                        pass  # Cleanup failure is not critical
                 
                 # Force garbage collection and cache cleanup before retry
                 gc.collect()
@@ -540,8 +482,7 @@ def _load_with_extraction_cache(restore_path, model_name, config, max_retries=3)
                     f"     {CACHE_DIR}\n\n"
                     f"⚙️ Cache Location:\n"
                     f"  {CACHE_DIR}\n\n"
-                    f"If this persists, try manually deleting:\n"
-                    f"  {extracted_dir}\n"
+                    f"If this persists, try manually deleting the cache and temp directories.\n"
                     f"{'='*80}"
                 )
             else:
@@ -552,16 +493,15 @@ def _load_with_extraction_cache(restore_path, model_name, config, max_retries=3)
             # Other exceptions during extraction
             last_error = e
             if attempt < max_retries - 1:
-                # Clean up and retry
-                if extracted_dir.exists():
-                    try:
-                        shutil.rmtree(extracted_dir)
-                    except:
-                        pass
-                
                 delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  Extraction error (attempt {attempt + 1}/{max_retries}): {e}")
                 print(f"   Retrying in {delay:.1f}s...")
+                
+                # Force garbage collection before retry
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 time.sleep(delay)
                 continue
             else:
@@ -617,10 +557,9 @@ def load_model(model_name, show_progress=False):
                 print(f"   Path: {model_path}")
                 
                 try:
-                    # Use extraction cache with retry logic
-                    models_cache[model_name] = _load_with_extraction_cache(
+                    # Use retry logic for file lock handling
+                    models_cache[model_name] = _load_with_retry(
                         restore_path=model_path,
-                        model_name=model_name,
                         config=config,
                         max_retries=3
                     )
@@ -702,10 +641,9 @@ def load_model(model_name, show_progress=False):
             print(f"📦 Loading {config['display_name']} from local file...")
             
             try:
-                # Use extraction cache with retry logic
-                models_cache[model_name] = _load_with_extraction_cache(
+                # Use retry logic for file lock handling
+                models_cache[model_name] = _load_with_retry(
                     restore_path=model_path,
-                    model_name=model_name,
                     config=config,
                     max_retries=3
                 )
