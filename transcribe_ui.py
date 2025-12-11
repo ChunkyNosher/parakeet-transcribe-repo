@@ -297,7 +297,7 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
     
     # Generate unique filename using hash of original path + filename
     # This prevents collisions from multiple uploads of same filename
-    # Note: MD5 is used only for filename generation (not security), but SHA-256 is preferred
+    # SHA-256 is used for secure, collision-resistant filename generation
     path_hash = hashlib.sha256(str(file_path).encode()).hexdigest()[:16]
     cached_filename = f"{path_hash}_{file_path.name}"
     cached_path = _gradio_cache_dir / cached_filename
@@ -323,14 +323,14 @@ def copy_gradio_file_to_cache(file_path, max_retries=3):
                 print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 time.sleep(delay)
                 continue
-            elif attempt == max_retries - 1:
-                # Final retry failed
-                raise OSError(
-                    f"Failed to copy file to cache after {max_retries} attempts.\n"
-                    f"Source: {file_path}\n"
-                    f"Destination: {cached_path}\n"
-                    f"Error: {error_str}"
-                )
+            
+            # Final retry failed or non-file-lock error
+            raise OSError(
+                f"Failed to copy file to cache after {attempt + 1} attempts.\n"
+                f"Source: {file_path}\n"
+                f"Destination: {cached_path}\n"
+                f"Error: {error_str}"
+            )
 
 def get_dynamic_batch_size(duration, model_key):
     """Calculate optimal batch size based on audio duration and model"""
