@@ -327,7 +327,7 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
         ConnectionError: If HuggingFace download fails
         OSError: If disk space or file system issues occur
     """
-    base_delay = 0.2  # 200ms base delay for linear backoff retries
+    base_delay = 0.5  # 500ms base delay - Windows services need time to release handles
     last_error = None
     
     for attempt in range(max_retries):
@@ -341,7 +341,7 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
             
             if is_file_lock and attempt < max_retries - 1:
                 # File lock detected - retry with linear backoff
-                delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
+                delay = base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s
                 print(f"⏳ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 
                 # Force garbage collection and cache cleanup before retry
@@ -428,7 +428,7 @@ def _load_with_retry(restore_path, config, max_retries=3):
         PermissionError: If file lock persists after retries
         OSError: If extraction or loading fails
     """
-    base_delay = 0.2  # 200ms base delay for linear backoff
+    base_delay = 0.5  # 500ms base delay - Windows services need time to release handles
     
     for attempt in range(max_retries):
         try:
@@ -444,7 +444,7 @@ def _load_with_retry(restore_path, config, max_retries=3):
             
             if is_file_lock and attempt < max_retries - 1:
                 # File lock detected - retry with linear backoff
-                delay = base_delay * (attempt + 1)  # 0.2s, 0.4s, 0.6s
+                delay = base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s
                 print(f"   ⚠️  File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
                 
                 # Force garbage collection and cache cleanup before retry
@@ -632,49 +632,13 @@ def load_model(model_name, show_progress=False):
             
             print(f"📦 Loading {config['display_name']} from local file...")
             
-            try:
-                # Use retry logic for file lock handling
-                models_cache[model_name] = _load_with_retry(
-                    restore_path=model_path,
-                    config=config,
-                    max_retries=3
-                )
-            except PermissionError as e:
-                error_str = str(e)
-                if "WinError 32" in error_str or "being used by another process" in error_str:
-                    problem = (
-                        "Windows temp file cleanup failed (WinError 32). This is often "
-                        "caused by antivirus software (especially Windows Defender), "
-                        "cloud sync services (OneDrive, Dropbox, Google Drive), or "
-                        "file indexing services monitoring the temp folder."
-                    )
-                    solution = (
-                        "Troubleshooting steps:\n"
-                        f"1) The cache is now at: {CACHE_DIR}\n"
-                        "2) Add this folder to antivirus exclusions\n"
-                        "3) Pause cloud sync or exclude this folder\n"
-                        "4) Close other applications accessing temp files\n"
-                        "5) Restart your computer and try again"
-                    )
-                    raise PermissionError(_format_model_error(
-                        title="WINDOWS FILE LOCK ERROR!",
-                        model_path=model_path,
-                        display_name=config['display_name'],
-                        problem_msg=problem,
-                        solution_msg=solution,
-                        original_error=e
-                    ))
-                else:
-                    raise
-            except FileNotFoundError as e:
-                raise FileNotFoundError(_format_model_error(
-                    title="FAILED TO LOAD MODEL!",
-                    model_path=model_path,
-                    display_name=config['display_name'],
-                    problem_msg="The .nemo file may be corrupted or incomplete.",
-                    solution_msg="Please recreate it using: python setup_local_models.py",
-                    original_error=e
-                ))
+            # Use retry logic for file lock handling
+            # _load_with_retry provides comprehensive error messages for file locks
+            models_cache[model_name] = _load_with_retry(
+                restore_path=model_path,
+                config=config,
+                max_retries=3
+            )
         
         # ============================================================
         # HUGGINGFACE: Load from HuggingFace only
