@@ -17,3 +17,11 @@ __pycache__/
 *.pyd
 .Python
 *.so
+
+# NeMo ASR model cache directories (created by transcribe_ui.py)
+# These contain downloaded models and temp files, not project source code
+model_cache/
+
+# Local model files (large binary files that should be downloaded via setup script)
+# Keep the directory structure but ignore the actual model files
+local_models/*.nemo
