@@ -855,7 +855,6 @@ def load_model(model_name, show_progress=False):
         
         load_time = time.time() - start_time
         print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
-    
     return models_cache[model_name]
 
 
