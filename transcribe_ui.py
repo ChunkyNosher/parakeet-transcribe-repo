@@ -82,6 +82,19 @@ else:
     print(f"✓ Temp directory verified: {_temp_dir}")
 
 # ============================================================================
+# NOTE: NeMo C++ Backend Limitation
+# ============================================================================
+# Python-level environment variables (TMPDIR, TEMP, TMP) control Python's
+# tempfile module but may not fully control NeMo's C++ backend operations.
+# The PRIMARY fix for manifest file locking is setting num_workers=0 in
+# the transcribe() call, which prevents worker process creation entirely.
+# This is implemented in the _setup_transcribe_config() function.
+# ============================================================================
+print("\n⚠️  NOTE: NeMo uses num_workers=0 to prevent manifest file creation")
+print("   This disables worker processes that can cause Windows file locks")
+print("   See transcribe_ui.py::_setup_transcribe_config() for implementation")
+
+# ============================================================================
 # NOW import libraries (after cache directories are configured)
 # ============================================================================
 
@@ -365,6 +378,27 @@ def setup_gpu_optimizations():
         torch.backends.cudnn.benchmark = True
         print("✅ GPU optimizations enabled (TF32, cuDNN benchmark)")
 
+def _setup_transcribe_config(model, batch_size):
+    """
+    Setup transcribe configuration to prevent manifest file locking.
+    
+    Key fix: num_workers=0 disables multiprocessing worker processes
+    that create temporary manifest files in system temp directories.
+    These files cause Windows file locking errors during GPU inference.
+    
+    Args:
+        model: The loaded ASR model
+        batch_size: Batch size for transcription
+        
+    Returns:
+        Transcribe configuration object with num_workers=0
+    """
+    config = model.get_transcribe_config()
+    config.num_workers = 0  # CRITICAL: Disable worker processes to prevent manifest file creation
+    config.batch_size = batch_size
+    config.drop_last = False
+    return config
+
 def _format_model_error(title, model_path, display_name, problem_msg, solution_msg, original_error=None):
     """Format a model loading error message with consistent styling.
     
@@ -627,7 +661,26 @@ def load_model(model_name, show_progress=False):
         OSError: If download fails due to disk space issues
         PermissionError: If file locks prevent model extraction
     """
-    if model_name not in models_cache:
+    if model_name in models_cache:
+        # Validate cached model before returning
+        cached_model = models_cache[model_name]
+        try:
+            # Quick validation: model should have required methods
+            if not hasattr(cached_model, 'transcribe'):
+                print(f"⚠️  Cached {model_name} appears corrupted (missing transcribe method)")
+                # Remove corrupted cache entry
+                del models_cache[model_name]
+                # Recursively reload
+                return load_model(model_name, show_progress)
+            # Cached model is valid, return it
+            return cached_model
+        except Exception as e:
+            print(f"⚠️  Cached model validation failed: {e}")
+            del models_cache[model_name]
+            # Fall through to reload
+    
+    # Model not in cache or cache was invalid, proceed to load
+    if True:  # Changed condition to maintain indentation
         config = MODEL_CONFIGS[model_name]
         script_dir = get_script_dir()
         loading_method = config.get("loading_method", "huggingface")
@@ -864,10 +917,34 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         try:
             model = load_model(model_key)
         except PermissionError as e:
-            # File lock or permission error - display in Gradio status
+            # File lock or permission error - display in Gradio status with Windows-specific diagnostics
             error_msg = str(e)
-            print(f"GRADIO_ERROR (PermissionError): {error_msg}")
-            return f"### ❌ Model Loading Error\n\n{error_msg}", "", None
+            if "WinError 32" in error_msg or "being used by another process" in error_msg:
+                # Windows-specific file lock
+                detailed_error = (
+                    f"### ❌ Model Loading Failed: Windows File Lock\n\n"
+                    f"{error_msg}\n\n"
+                    f"**Root Cause:** Windows services (antivirus, OneDrive, indexing) are locking model files.\n\n"
+                    f"**Immediate Actions:**\n"
+                    f"1. Pause OneDrive/Dropbox/Google Drive\n"
+                    f"2. Temporarily disable antivirus real-time scanning\n"
+                    f"3. Run as Administrator\n"
+                    f"4. Restart your computer\n\n"
+                    f"**Cache Location:** `{CACHE_DIR}`\n\n"
+                    f"Add this folder to antivirus exclusions if issue persists."
+                )
+            else:
+                # Different permission error
+                detailed_error = (
+                    f"### ❌ Model Loading Error: Permission Denied\n\n"
+                    f"Permission denied. Check:\n"
+                    f"- Run as Administrator\n"
+                    f"- Folder permissions for: `{CACHE_DIR}`\n"
+                    f"- Disk space availability\n\n"
+                    f"**Error Details:** {error_msg}"
+                )
+            print(f"GRADIO_ERROR (PermissionError): {detailed_error}")
+            return detailed_error, "", None
         except ConnectionError as e:
             error_msg = str(e)
             print(f"GRADIO_ERROR (ConnectionError): {error_msg}")
@@ -976,93 +1053,84 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
         
         # ============================================================================
-        # FIX #5: Add Comprehensive Retry Logic for Transcription
+        # FIX #5: Use num_workers=0 to Prevent Manifest File Locking
         # ============================================================================
-        # NeMo's transcribe() method may create temporary manifest.json files
-        # internally during inference. If Windows services lock these files,
-        # we get WinError 32. Add retry logic with exponential backoff.
+        # NeMo's transcribe() method spawns worker processes when num_workers > 0.
+        # These workers create temporary manifest files in the system temp directory
+        # for inter-process communication. Windows antivirus/OneDrive immediately
+        # locks these files, causing WinError 32.
+        # 
+        # Solution: Set num_workers=0 to disable worker processes and force
+        # single-process inference, eliminating the manifest file creation.
         # ============================================================================
+        
+        # Setup transcribe config with num_workers=0 to prevent manifest file locking
+        transcribe_cfg = _setup_transcribe_config(model, batch_size)
         
         # Transcribe with mixed precision (FP16) for GPU acceleration
         inference_start = time.time()
         
-        max_retries = 3
-        base_delay = 0.5  # 500ms base delay
-        
-        for attempt in range(max_retries):
-            try:
-                if torch.cuda.is_available():
-                    # Use mixed precision (FP16) for faster inference on CUDA
-                    with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        result = model.transcribe(
-                            processed_files, 
-                            batch_size=batch_size,
-                            timestamps=include_timestamps
-                        )
-                else:
-                    # CPU fallback - no autocast
+        # Single attempt (no retry needed since manifest locking is prevented)
+        try:
+            if torch.cuda.is_available():
+                # Use mixed precision (FP16) for faster inference on CUDA
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
                     result = model.transcribe(
                         processed_files, 
                         batch_size=batch_size,
-                        timestamps=include_timestamps
+                        timestamps=include_timestamps,
+                        override_config=transcribe_cfg  # Apply config with num_workers=0
                     )
+            else:
+                # CPU fallback - no autocast
+                result = model.transcribe(
+                    processed_files, 
+                    batch_size=batch_size,
+                    timestamps=include_timestamps,
+                    override_config=transcribe_cfg  # Apply config with num_workers=0
+                )
                 
-                # Success! Break out of retry loop
-                break
-                
-            except PermissionError as e:
-                error_str = str(e)
-                is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
-                
-                if is_file_lock and attempt < max_retries - 1:
-                    # File lock detected during transcription - retry with linear backoff
-                    delay = base_delay * (attempt + 1)  # Linear backoff: 0.5s, 1.0s, 1.5s
-                    print(f"⏳ Transcription file lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+        except PermissionError as e:
+            # If error occurs with num_workers=0, it's a real error (not file locking)
+            error_str = str(e)
+            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+            
+            if is_file_lock:
+                return (
+                    f"### ❌ Transcription Failed: File Lock Error\n\n"
+                    f"The transcription process failed due to file locking even with "
+                    f"manifest file creation disabled.\n\n"
+                    f"**Solutions:**\n"
+                    f"1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
+                    f"2. Add cache directory to antivirus exclusions: `{CACHE_DIR}`\n"
+                    f"3. Restart your computer\n"
+                    f"4. Run as Administrator\n\n"
+                    f"**Technical Details:**\n"
+                    f"```\n{error_str}\n```",
+                    "", None
+                )
+            else:
+                # Different PermissionError
+                return (
+                    f"### ❌ Transcription Failed: Permission Error\n\n"
+                    f"A permission error occurred during transcription.\n\n"
+                    f"**Technical Details:**\n"
+                    f"```\n{error_str}\n```",
+                    "", None
+                )
                     
-                    # Force garbage collection before retry
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    time.sleep(delay)
-                    continue
-                
-                elif is_file_lock:
-                    # Final retry failed
-                    return (
-                        f"### ❌ Transcription Failed: File Lock Error\n\n"
-                        f"The transcription process failed due to persistent file locking.\n"
-                        f"This typically happens when Windows services hold file handles open.\n\n"
-                        f"**Tried {max_retries} times** without success.\n\n"
-                        f"**Solutions:**\n"
-                        f"1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
-                        f"2. Add cache directory to antivirus exclusions: `{CACHE_DIR}`\n"
-                        f"3. Restart your computer\n"
-                        f"4. Run as Administrator\n\n"
-                        f"**Technical Details:**\n"
-                        f"```\n{error_str}\n```",
-                        "", None
-                    )
-                else:
-                    # Different PermissionError - re-raise
-                    raise
-                    
-            except Exception as e:
-                # Other exceptions during transcription
-                if attempt < max_retries - 1:
-                    delay = base_delay * (attempt + 1)  # Linear backoff
-                    print(f"⚠️  Transcription error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
-                    print(f"   Retrying in {delay:.1f}s...")
-                    
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    time.sleep(delay)
-                    continue
-                else:
-                    # Final attempt failed - re-raise
-                    raise
+        except Exception as e:
+            # Other exceptions during transcription
+            error_msg = str(e)
+            print(f"❌ Transcription error: {type(e).__name__}: {error_msg}")
+            return (
+                f"### ❌ Transcription Error\n\n"
+                f"An error occurred during transcription.\n\n"
+                f"**Error Type:** {type(e).__name__}\n\n"
+                f"**Technical Details:**\n"
+                f"```\n{error_msg}\n```",
+                "", None
+            )
         
         inference_time = time.time() - inference_start
         total_time = time.time() - start_time
