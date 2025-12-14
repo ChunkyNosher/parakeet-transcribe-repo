@@ -1015,6 +1015,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             for attempt in range(max_duration_retries):
                 try:
                     duration = librosa.get_duration(path=cached_file_path)
+                    gc.collect()
                     break  # Success - exit retry loop
                 except (OSError, PermissionError) as e:
                     if attempt < max_duration_retries - 1:
