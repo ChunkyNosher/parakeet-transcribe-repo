@@ -982,8 +982,6 @@ def load_model(model_name, show_progress=False):
         OSError: If download fails due to disk space issues
         PermissionError: If file locks prevent model extraction
     """
-    global models_cache
-    
     if model_name in models_cache:
         # Validate cached model before returning
         cached_model = models_cache[model_name]
@@ -1037,197 +1035,196 @@ def load_model(model_name, show_progress=False):
                 # Continue loading the new model anyway
     
     # Model not in cache or cache was invalid, proceed to load
-    if True:  # Changed condition to maintain indentation
-        config = MODEL_CONFIGS[model_name]
-        script_dir = get_script_dir()
-        loading_method = config.get("loading_method", "huggingface")
+    config = MODEL_CONFIGS[model_name]
+    script_dir = get_script_dir()
+    loading_method = config.get("loading_method", "huggingface")
+    
+    start_time = time.time()
+    
+    # ============================================================
+    # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
+    # ============================================================
+    if loading_method == "local_or_huggingface":
+        local_path = config.get("local_path")
+        model_path = script_dir / local_path if local_path else None
         
-        start_time = time.time()
-        
-        # ============================================================
-        # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
-        # ============================================================
-        if loading_method == "local_or_huggingface":
-            local_path = config.get("local_path")
-            model_path = script_dir / local_path if local_path else None
-            
-            # Try loading from local .nemo file first
-            if model_path and model_path.exists():
-                print(f"📦 Loading {config['display_name']} from local file...")
-                print(f"   Path: {model_path}")
-                
-                try:
-                    # Use retry logic for file lock handling
-                    models_cache[model_name] = _load_with_retry(
-                        restore_path=model_path,
-                        config=config,
-                        max_retries=3
-                    )
-                    load_time = time.time() - start_time
-                    print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
-                    return models_cache[model_name]
-                    
-                except PermissionError as e:
-                    error_str = str(e)
-                    if "WinError 32" in error_str or "being used by another process" in error_str:
-                        print(f"⚠️  Local file locked, falling back to HuggingFace...")
-                        # Fall through to HuggingFace download
-                    else:
-                        raise
-                        
-                except Exception as e:
-                    # Local file exists but is corrupted or invalid
-                    print(f"⚠️  Local file corrupted or invalid: {e}")
-                    print(f"   Falling back to HuggingFace download...")
-                    # Fall through to HuggingFace download
-            else:
-                # Local file not found - inform user
-                print(f"📦 Loading {config['display_name']} from HuggingFace...")
-                if model_path:
-                    print(f"   Local .nemo file not found: {model_path}")
-                print(f"   To download locally, run: python setup_local_models.py")
-            
-            # Load from HuggingFace (either no local file, or local file failed)
-            hf_model_id = config["hf_model_id"]
-            print(f"   Model ID: {hf_model_id}")
-            print("   (First load downloads model, subsequent loads use cache)")
-            
-            try:
-                models_cache[model_name] = _load_from_huggingface_with_retry(
-                    hf_model_id, config, max_retries=3
-                )
-            except ConnectionError as e:
-                raise ConnectionError(
-                    f"\n{'='*80}\n"
-                    f"❌ NETWORK ERROR LOADING MODEL!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Failed to connect to HuggingFace to download the model.\n\n"
-                    f"Solution: Please check your internet connection and try again.\n"
-                    f"Original error: {str(e)}\n"
-                    f"{'='*80}"
-                )
-            except OSError as e:
-                error_str = str(e).lower()
-                if "no space" in error_str or "disk" in error_str:
-                    raise OSError(
-                        f"\n{'='*80}\n"
-                        f"❌ DISK SPACE ERROR!\n"
-                        f"{'='*80}\n\n"
-                        f"Model: {config['display_name']}\n"
-                        f"Insufficient disk space to download the model.\n\n"
-                        f"Solution: Please free up disk space and try again.\n"
-                        f"Original error: {str(e)}\n"
-                        f"{'='*80}"
-                    )
-                raise
-        
-        # ============================================================
-        # LOCAL: Strictly load from local .nemo file only
-        # ============================================================
-        elif loading_method == "local":
-            model_path = script_dir / config["local_path"]
-            
-            # Check if .nemo file exists
-            if not model_path.exists():
-                raise FileNotFoundError(_format_model_error(
-                    title="MODEL FILE NOT FOUND!",
-                    model_path=model_path,
-                    display_name=config['display_name'],
-                    problem_msg="The .nemo file must be created once using the setup script.",
-                    solution_msg="Please run: python setup_local_models.py"
-                ))
-            
+        # Try loading from local .nemo file first
+        if model_path and model_path.exists():
             print(f"📦 Loading {config['display_name']} from local file...")
-            
-            # Use retry logic for file lock handling
-            # _load_with_retry provides comprehensive error messages for file locks
-            models_cache[model_name] = _load_with_retry(
-                restore_path=model_path,
-                config=config,
-                max_retries=3
-            )
-        
-        # ============================================================
-        # HUGGINGFACE: Load from HuggingFace only
-        # ============================================================
-        else:
-            hf_model_id = config["hf_model_id"]
-            
-            print(f"📦 Loading {config['display_name']} from HuggingFace...")
-            print(f"   Model ID: {hf_model_id}")
-            print("   (First load downloads model, subsequent loads use cache)")
+            print(f"   Path: {model_path}")
             
             try:
-                models_cache[model_name] = _load_from_huggingface_with_retry(
-                    hf_model_id, config, max_retries=3
+                # Use retry logic for file lock handling
+                models_cache[model_name] = _load_with_retry(
+                    restore_path=model_path,
+                    config=config,
+                    max_retries=3
                 )
-            except ConnectionError as e:
-                raise ConnectionError(
-                    f"\n{'='*80}\n"
-                    f"❌ NETWORK ERROR LOADING MODEL!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Failed to connect to HuggingFace to download the model.\n\n"
-                    f"Solution: Please check your internet connection and try again.\n"
-                    f"Original error: {str(e)}\n"
-                    f"{'='*80}"
-                )
-            except OSError as e:
-                error_str = str(e).lower()
-                if "no space" in error_str or "disk" in error_str:
-                    raise OSError(
-                        f"\n{'='*80}\n"
-                        f"❌ DISK SPACE ERROR!\n"
-                        f"{'='*80}\n\n"
-                        f"Model: {config['display_name']}\n"
-                        f"Insufficient disk space to download the model.\n\n"
-                        f"Solution: Please free up disk space and try again.\n"
-                        f"Original error: {str(e)}\n"
-                        f"{'='*80}"
-                    )
+                load_time = time.time() - start_time
+                print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
+                return models_cache[model_name]
+                
+            except PermissionError as e:
+                error_str = str(e)
+                if "WinError 32" in error_str or "being used by another process" in error_str:
+                    print(f"⚠️  Local file locked, falling back to HuggingFace...")
+                    # Fall through to HuggingFace download
+                else:
+                    raise
+                    
+            except Exception as e:
+                # Local file exists but is corrupted or invalid
+                print(f"⚠️  Local file corrupted or invalid: {e}")
+                print(f"   Falling back to HuggingFace download...")
+                # Fall through to HuggingFace download
+        else:
+            # Local file not found - inform user
+            print(f"📦 Loading {config['display_name']} from HuggingFace...")
+            if model_path:
+                print(f"   Local .nemo file not found: {model_path}")
+            print(f"   To download locally, run: python setup_local_models.py")
+        
+        # Load from HuggingFace (either no local file, or local file failed)
+        hf_model_id = config["hf_model_id"]
+        print(f"   Model ID: {hf_model_id}")
+        print("   (First load downloads model, subsequent loads use cache)")
+        
+        try:
+            models_cache[model_name] = _load_from_huggingface_with_retry(
+                hf_model_id, config, max_retries=3
+            )
+        except ConnectionError as e:
+            raise ConnectionError(
+                f"\n{'='*80}\n"
+                f"❌ NETWORK ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"Failed to connect to HuggingFace to download the model.\n\n"
+                f"Solution: Please check your internet connection and try again.\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except OSError as e:
+            error_str = str(e).lower()
+            if "no space" in error_str or "disk" in error_str:
                 raise OSError(
                     f"\n{'='*80}\n"
-                    f"❌ FILE SYSTEM ERROR!\n"
+                    f"❌ DISK SPACE ERROR!\n"
                     f"{'='*80}\n\n"
                     f"Model: {config['display_name']}\n"
-                    f"A file system error occurred while loading the model.\n\n"
-                    f"Solution: Please check file permissions and try again.\n"
-                    f"Cache location: {CACHE_DIR}\n"
+                    f"Insufficient disk space to download the model.\n\n"
+                    f"Solution: Please free up disk space and try again.\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*80}"
                 )
-            except Exception as e:
-                raise RuntimeError(
+            raise
+    
+    # ============================================================
+    # LOCAL: Strictly load from local .nemo file only
+    # ============================================================
+    elif loading_method == "local":
+        model_path = script_dir / config["local_path"]
+        
+        # Check if .nemo file exists
+        if not model_path.exists():
+            raise FileNotFoundError(_format_model_error(
+                title="MODEL FILE NOT FOUND!",
+                model_path=model_path,
+                display_name=config['display_name'],
+                problem_msg="The .nemo file must be created once using the setup script.",
+                solution_msg="Please run: python setup_local_models.py"
+            ))
+        
+        print(f"📦 Loading {config['display_name']} from local file...")
+        
+        # Use retry logic for file lock handling
+        # _load_with_retry provides comprehensive error messages for file locks
+        models_cache[model_name] = _load_with_retry(
+            restore_path=model_path,
+            config=config,
+            max_retries=3
+        )
+    
+    # ============================================================
+    # HUGGINGFACE: Load from HuggingFace only
+    # ============================================================
+    else:
+        hf_model_id = config["hf_model_id"]
+        
+        print(f"📦 Loading {config['display_name']} from HuggingFace...")
+        print(f"   Model ID: {hf_model_id}")
+        print("   (First load downloads model, subsequent loads use cache)")
+        
+        try:
+            models_cache[model_name] = _load_from_huggingface_with_retry(
+                hf_model_id, config, max_retries=3
+            )
+        except ConnectionError as e:
+            raise ConnectionError(
+                f"\n{'='*80}\n"
+                f"❌ NETWORK ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"Failed to connect to HuggingFace to download the model.\n\n"
+                f"Solution: Please check your internet connection and try again.\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except OSError as e:
+            error_str = str(e).lower()
+            if "no space" in error_str or "disk" in error_str:
+                raise OSError(
                     f"\n{'='*80}\n"
-                    f"❌ ERROR LOADING MODEL!\n"
+                    f"❌ DISK SPACE ERROR!\n"
                     f"{'='*80}\n\n"
                     f"Model: {config['display_name']}\n"
-                    f"An unexpected error occurred: {type(e).__name__}\n\n"
-                    f"Solution: Try clearing the cache and retrying.\n"
-                    f"Cache location: {CACHE_DIR}\n"
+                    f"Insufficient disk space to download the model.\n\n"
+                    f"Solution: Please free up disk space and try again.\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*80}"
                 )
-        
-        load_time = time.time() - start_time
-        print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
-        
-        # ====================================================================
-        # Explicit CUDA Placement (Pattern 3: HuggingFace Modernization)
-        # ====================================================================
-        # Ensure model is explicitly moved to CUDA after loading.
-        # While NeMo usually handles this, explicit placement ensures
-        # consistent behavior across different loading methods.
-        # ====================================================================
-        if torch.cuda.is_available():
-            try:
-                models_cache[model_name] = models_cache[model_name].to("cuda")
-                print(f"   ✅ Model moved to CUDA")
-            except Exception as e:
-                print(f"   ⚠️  Could not move model to CUDA: {e}")
-                # Continue with model on CPU
-        
+            raise OSError(
+                f"\n{'='*80}\n"
+                f"❌ FILE SYSTEM ERROR!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"A file system error occurred while loading the model.\n\n"
+                f"Solution: Please check file permissions and try again.\n"
+                f"Cache location: {CACHE_DIR}\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"\n{'='*80}\n"
+                f"❌ ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"An unexpected error occurred: {type(e).__name__}\n\n"
+                f"Solution: Try clearing the cache and retrying.\n"
+                f"Cache location: {CACHE_DIR}\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+    
+    load_time = time.time() - start_time
+    print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
+    
+    # ====================================================================
+    # Explicit CUDA Placement (Pattern 3: HuggingFace Modernization)
+    # ====================================================================
+    # Ensure model is explicitly moved to CUDA after loading.
+    # While NeMo usually handles this, explicit placement ensures
+    # consistent behavior across different loading methods.
+    # ====================================================================
+    if torch.cuda.is_available():
+        try:
+            models_cache[model_name] = models_cache[model_name].to("cuda")
+            print(f"   ✅ Model moved to CUDA")
+        except Exception as e:
+            print(f"   ⚠️  Could not move model to CUDA: {e}")
+            # Continue with model on CPU
+    
     return models_cache[model_name]
 
 
