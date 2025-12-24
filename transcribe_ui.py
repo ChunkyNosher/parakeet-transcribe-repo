@@ -82,24 +82,20 @@ else:
     print(f"✓ Temp directory verified: {_temp_dir}")
 
 # ============================================================================
-# NOTE: Lhotse Dataloader Configuration for Deadlock Prevention
+# NOTE: Direct Method Parameters for Deadlock Prevention
 # ============================================================================
 # NeMo's ASR models use Lhotse dataloaders internally. To prevent deadlocks
-# during transcription (where progress hangs at 0%), we configure the dataloader
-# to use map-based dataset mode (force_map_dataset=True) instead of the default
-# iterable-dataset mode.
+# during transcription (where progress hangs at 0%), we use direct method
+# parameters to model.transcribe() instead of override_config.
 # 
 # Why this matters:
-# - Iterable-dataset mode expects worker process coordination
-# - Setting num_workers=0 without map-dataset mode causes indefinite hangs
-# - Map-dataset mode uses direct memory indexing, no workers needed
-# - This also prevents Windows file-lock issues (WinError 32) from manifest files
-# 
-# See _setup_transcribe_config() function for implementation.
+# - Using override_config can interfere with NeMo's internal initialization
+# - Direct parameters (num_workers=0, batch_size, etc.) are the safe, official approach
+# - This matches the working HuggingFace Spaces implementation
+# - Prevents both deadlocks and Windows file-lock issues
 # ============================================================================
-print("\n✅ Lhotse dataloader configured with force_map_dataset=True")
+print("\n✅ Using direct method parameters for transcription (HuggingFace pattern)")
 print("   This prevents deadlocks and Windows file-lock issues")
-print("   See transcribe_ui.py::_setup_transcribe_config() for implementation")
 
 # ============================================================================
 # NOW import libraries (after cache directories are configured)
@@ -129,6 +125,339 @@ AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac', '.wma'}
 
 # Separator string for output formatting
 SEPARATOR = '=' * 60
+
+# ============================================================================
+# Stage-Specific Error Messages (Pattern 6: HuggingFace Modernization)
+# ============================================================================
+# Provides actionable error messages based on failure stage.
+# Each category has a title and detailed advice for users.
+# ============================================================================
+ERROR_MESSAGES = {
+    'audio_load_failed': {
+        'title': '❌ Could Not Load Audio File',
+        'message': (
+            'The audio file could not be loaded. Please check that:\n'
+            '- The file format is supported (WAV, MP3, FLAC, M4A, OGG, AAC, WMA)\n'
+            '- The file is not corrupted or empty\n'
+            '- You have read permissions for the file'
+        )
+    },
+    'format_unsupported': {
+        'title': '❌ Audio Format Not Supported',
+        'message': (
+            '**Supported Audio Formats:** WAV, MP3, FLAC, M4A, OGG, AAC, WMA\n'
+            '**Supported Video Formats:** MP4, AVI, MKV, MOV, WEBM, FLV, M4V\n'
+            '\nVideo files will have their audio extracted automatically.'
+        )
+    },
+    'duration_invalid': {
+        'title': '❌ Invalid Audio Duration',
+        'message': (
+            'Audio duration must be between 100ms and 24 hours.\n'
+            'Please check if the file is corrupted, silent, or has an unusual format.'
+        )
+    },
+    'audio_silent': {
+        'title': '⚠️ Audio Appears to be Silent',
+        'message': (
+            'The audio file appears to contain very little or no audio signal.\n'
+            'Please check that:\n'
+            '- The audio was recorded properly\n'
+            '- The volume level is not too low\n'
+            '- The correct audio channel was selected during recording'
+        )
+    },
+    'output_validation_failed': {
+        'title': '❌ Transcription Output Invalid',
+        'message': (
+            'The model returned an invalid or empty result.\n'
+            'This can happen when:\n'
+            '- Audio quality is very poor\n'
+            '- Audio contains only noise or music\n'
+            '- Audio language is not supported by the model'
+        )
+    },
+    'batch_partial_failure': {
+        'title': '⚠️ Some Files Failed to Process',
+        'message': (
+            'Some files in the batch could not be transcribed.\n'
+            'Successfully processed files are shown below.\n'
+            'Check the error details for each failed file.'
+        )
+    },
+    'model_load_failed': {
+        'title': '❌ Model Loading Failed',
+        'message': (
+            'The AI model could not be loaded.\n'
+            'Please check that:\n'
+            '- You have enough disk space\n'
+            '- Your internet connection is stable (for first download)\n'
+            '- The cache directory is accessible'
+        )
+    },
+    'transcription_timeout': {
+        'title': '❌ Transcription Timed Out',
+        'message': (
+            'The transcription process took too long and was stopped.\n'
+            'This can happen with very long audio files.\n'
+            'Try splitting the audio into smaller chunks.'
+        )
+    }
+}
+
+
+def format_error_message(error_type, detail=""):
+    """Format a stage-specific error message with optional details.
+    
+    Args:
+        error_type: Key from ERROR_MESSAGES dictionary
+        detail: Additional context or technical details
+        
+    Returns:
+        Formatted markdown error message string
+    """
+    msg = ERROR_MESSAGES.get(error_type, {
+        'title': '❌ Unknown Error',
+        'message': 'An unexpected error occurred.'
+    })
+    
+    result = f"### {msg['title']}\n\n{msg['message']}"
+    
+    if detail:
+        result += f"\n\n**Technical Details:**\n```\n{detail}\n```"
+    
+    return result
+
+
+# ============================================================================
+# Audio Validation Function (Pattern 1: HuggingFace Modernization)
+# ============================================================================
+# Validates and normalizes audio before transcription.
+# - Loads audio with librosa (handles various formats)
+# - Validates duration (100ms - 24h)
+# - Checks audio is not silent (RMS energy check)
+# - Resamples to 16kHz if needed
+# - Converts stereo to mono if needed
+# ============================================================================
+
+def validate_and_normalize_audio(file_path):
+    """Validate and normalize audio file for transcription.
+    
+    This function performs comprehensive audio validation following the
+    HuggingFace Spaces pattern, ensuring consistent preprocessing
+    regardless of input format.
+    
+    Args:
+        file_path: Path to the audio file
+        
+    Returns:
+        Tuple of (success: bool, audio_data: ndarray | None, 
+                  sample_rate: int, error_msg: str, warning_msg: str)
+    """
+    import librosa
+    import numpy as np
+    
+    warning_msg = ""
+    
+    try:
+        # Load audio preserving original sample rate
+        y, sr = librosa.load(file_path, sr=None)
+        
+        # Validate duration (100ms to 24 hours)
+        duration = librosa.get_duration(y=y, sr=sr)
+        
+        if duration < 0.1:  # Less than 100ms
+            return (False, None, 0, 
+                    format_error_message('duration_invalid', 
+                        f"Duration: {duration:.3f}s (minimum: 0.1s)"), "")
+        
+        if duration > 86400:  # More than 24 hours
+            return (False, None, 0,
+                    format_error_message('duration_invalid',
+                        f"Duration: {duration:.1f}s ({duration/3600:.1f} hours, maximum: 24 hours)"), "")
+        
+        # Check for silent audio (RMS energy check)
+        rms = librosa.feature.rms(y=y)
+        if rms.max() < 0.001:  # Very quiet - likely silent
+            return (False, None, 0,
+                    format_error_message('audio_silent',
+                        f"Maximum RMS energy: {rms.max():.6f} (threshold: 0.001)"), "")
+        
+        if rms.max() < 0.01:  # Quiet but not silent - add warning
+            warning_msg = "⚠️ Audio is very quiet - transcription quality may be affected"
+        
+        # Resample to 16kHz if needed (NeMo models expect 16kHz)
+        if sr != 16000:
+            y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+            sr = 16000
+        
+        # Convert to mono if stereo
+        if y.ndim > 1:
+            y = librosa.to_mono(y)
+        
+        return (True, y, sr, "", warning_msg)
+        
+    except Exception as e:
+        error_str = str(e)
+        
+        # Provide specific error messages based on error type
+        if "Audio file" in error_str or "NoBackendError" in error_str:
+            return (False, None, 0,
+                    format_error_message('audio_load_failed', error_str), "")
+        elif "Format" in error_str or "codec" in error_str.lower():
+            return (False, None, 0,
+                    format_error_message('format_unsupported', error_str), "")
+        else:
+            return (False, None, 0,
+                    format_error_message('audio_load_failed', error_str), "")
+
+
+# ============================================================================
+# Transcription Result Validation (Pattern 2: HuggingFace Modernization)
+# ============================================================================
+# Validates transcription result structure BEFORE accessing .text
+# - Checks result is not None
+# - Checks result is a list and not empty
+# - Validates hypothesis has .text attribute
+# - Checks .text is a non-empty string
+# ============================================================================
+
+def validate_transcription_result(result, idx=0):
+    """Validate transcription result before accessing text.
+    
+    Performs comprehensive validation of the model.transcribe() output
+    to prevent AttributeError and other crashes from malformed results.
+    
+    Args:
+        result: Output from model.transcribe()
+        idx: Index of the hypothesis to validate (default: 0)
+        
+    Returns:
+        Tuple of (success: bool, text: str, error_msg: str)
+    """
+    # Check result is not None
+    if result is None:
+        return (False, "", "Result is None - model may have failed silently")
+    
+    # Check result is a list
+    if not isinstance(result, list):
+        return (False, "", f"Result is {type(result).__name__}, expected list")
+    
+    # Check result is not empty
+    if len(result) == 0:
+        return (False, "", "Result is an empty list - no transcription generated")
+    
+    # Check index is valid
+    if idx >= len(result):
+        return (False, "", f"Index {idx} out of range (result has {len(result)} items)")
+    
+    hypothesis = result[idx]
+    
+    # Check hypothesis has text attribute
+    if not hasattr(hypothesis, 'text'):
+        # Try string fallback (some models return plain strings)
+        if isinstance(hypothesis, str):
+            if len(hypothesis) == 0:
+                return (False, "", "Transcription is empty")
+            return (True, hypothesis, "")
+        return (False, "", f"Hypothesis has no .text attribute (type: {type(hypothesis).__name__})")
+    
+    # Check text is a string
+    if not isinstance(hypothesis.text, str):
+        return (False, "", f".text is {type(hypothesis.text).__name__}, expected string")
+    
+    # Check text is not empty
+    if len(hypothesis.text) == 0:
+        return (False, "", "Transcription is empty (0 characters)")
+    
+    return (True, hypothesis.text, "")
+
+
+# ============================================================================
+# Defensive Timestamp Extraction (Pattern 4: HuggingFace Modernization)
+# ============================================================================
+# Extracts timestamps with graceful fallback:
+# 1. Try word-level timestamps
+# 2. Fallback to segment-level timestamps
+# 3. Return empty list if both unavailable
+# ============================================================================
+
+def extract_timestamps(hypothesis, include_timestamps=False):
+    """Extract timestamps with word → segment → none fallback.
+    
+    Safely extracts timestamps from a hypothesis object with multiple
+    fallback strategies to handle different model outputs.
+    
+    Args:
+        hypothesis: The hypothesis object from model.transcribe()
+        include_timestamps: Whether to attempt timestamp extraction
+        
+    Returns:
+        Tuple of (timestamps_list: list, level: str)
+        where level is 'word', 'segment', or 'none'
+    """
+    if not include_timestamps:
+        return ([], 'none')
+    
+    # Try word-level timestamps first
+    try:
+        if hasattr(hypothesis, 'timestamp') and hypothesis.timestamp:
+            if isinstance(hypothesis.timestamp, dict):
+                if 'word' in hypothesis.timestamp:
+                    word_ts = hypothesis.timestamp['word']
+                    if isinstance(word_ts, list) and len(word_ts) > 0:
+                        return (word_ts, 'word')
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Fallback to segment-level timestamps
+    try:
+        if hasattr(hypothesis, 'timestamp') and hypothesis.timestamp:
+            if isinstance(hypothesis.timestamp, dict):
+                if 'segment' in hypothesis.timestamp:
+                    segment_ts = hypothesis.timestamp['segment']
+                    if isinstance(segment_ts, list) and len(segment_ts) > 0:
+                        return (segment_ts, 'segment')
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Fallback to character-level if available
+    try:
+        if hasattr(hypothesis, 'timestamp') and hypothesis.timestamp:
+            if isinstance(hypothesis.timestamp, dict):
+                if 'char' in hypothesis.timestamp:
+                    char_ts = hypothesis.timestamp['char']
+                    if isinstance(char_ts, list) and len(char_ts) > 0:
+                        return (char_ts, 'char')
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # No timestamps available
+    return ([], 'none')
+
+
+def format_timestamp_status(level, include_timestamps):
+    """Format a status message indicating the timestamp level available.
+    
+    Args:
+        level: The timestamp level ('word', 'segment', 'char', or 'none')
+        include_timestamps: Whether timestamps were requested
+        
+    Returns:
+        Status message string
+    """
+    if not include_timestamps:
+        return ""
+    
+    if level == 'word':
+        return "\n✅ **Timestamps:** Word-level available"
+    elif level == 'segment':
+        return "\n⚠️ **Timestamps:** Segment-level (word-level unavailable for this model)"
+    elif level == 'char':
+        return "\n⚠️ **Timestamps:** Character-level (word/segment unavailable)"
+    else:
+        return "\nℹ️ **Timestamps:** Not available for this model"
+
 
 # Model configurations
 # All models use standard ASRModel.from_pretrained() API (no SALM required)
@@ -385,62 +714,6 @@ def setup_gpu_optimizations():
         torch.backends.cudnn.benchmark = True
         print("✅ GPU optimizations enabled (TF32, cuDNN benchmark)")
 
-def _setup_transcribe_config(model, batch_size):
-    """
-    Setup transcribe configuration to prevent Lhotse dataloader deadlocks and
-    maintain Windows file-lock protection.
-    
-    Key fix: Enable force_map_dataset=True to use map-based sampling instead of
-    iterable-dataset sampling. This prevents deadlocks that occur when:
-    - num_workers=0 is set (to prevent Windows manifest file locking)
-    - Lhotse's iterable-dataset mode expects worker coordination that never arrives
-    
-    The map-dataset mode uses direct memory indexing instead of worker processes,
-    eliminating both the deadlock AND the Windows file-lock issues.
-    
-    Technical background:
-    - Lhotse dataloader has two modes: iterable-dataset (default) and map-dataset
-    - Iterable-dataset mode spawns workers and performs synchronization handshakes
-    - When num_workers=0 with iterable-dataset, no workers spawn but main process
-      still waits for signals that never arrive, causing indefinite hang at 0%
-    - Map-dataset mode (force_map_dataset=True) uses direct indexing without workers
-    
-    Args:
-        model: The loaded ASR model
-        batch_size: Batch size for transcription
-        
-    Returns:
-        Transcribe configuration object configured for safe inference
-    """
-    config = model.get_transcribe_config()
-    
-    # Enable map-based dataset mode if available (Lhotse-based dataloaders)
-    # This prevents deadlocks from iterable-dataset worker coordination issues
-    # AND eliminates manifest file creation that causes Windows file locks
-    if hasattr(config, 'force_map_dataset'):
-        config.force_map_dataset = True
-        print("   ✅ Using force_map_dataset=True for deadlock-free inference")
-    else:
-        # Fallback for older NeMo versions without force_map_dataset support
-        # In this case, we set num_workers=0 which may cause the deadlock issue
-        # but is still safer than not setting it (prevents Windows file locks)
-        print("   ⚠️  force_map_dataset not available (older NeMo version)")
-        print("      Falling back to num_workers=0 - may cause deadlock on some systems")
-        if hasattr(config, 'num_workers'):
-            config.num_workers = 0
-    
-    # Set batch size and ensure we don't drop the last batch
-    config.batch_size = batch_size
-    config.drop_last = False
-    
-    # NOTE: When force_map_dataset=True is available and set, we don't override
-    # num_workers - map-dataset mode eliminates worker coordination entirely.
-    # When force_map_dataset is NOT available (older NeMo), we fall back to
-    # num_workers=0 which may cause deadlocks but at least prevents Windows
-    # file-lock errors.
-    
-    return config
-
 def _format_model_error(title, model_path, display_name, problem_msg, solution_msg, original_error=None):
     """Format a model loading error message with consistent styling.
     
@@ -690,6 +963,12 @@ def load_model(model_name, show_progress=False):
     - "huggingface": ONLY load from HuggingFace
     - "local_or_huggingface": Try local first, fallback to HuggingFace
     
+    Includes explicit device management (Pattern 3: HuggingFace Modernization):
+    - When loading a different model, unloads the old model from VRAM
+    - Moves old model to CPU before deletion to free VRAM immediately
+    - Clears CUDA cache and runs garbage collection
+    - Explicitly moves new model to CUDA if available
+    
     Args:
         model_name: Model key from MODEL_CONFIGS (e.g., "parakeet-v3", "canary-1b-v2")
         show_progress: Whether to show loading progress (for startup)
@@ -721,182 +1000,231 @@ def load_model(model_name, show_progress=False):
             del models_cache[model_name]
             # Fall through to reload
     
-    # Model not in cache or cache was invalid, proceed to load
-    if True:  # Changed condition to maintain indentation
-        config = MODEL_CONFIGS[model_name]
-        script_dir = get_script_dir()
-        loading_method = config.get("loading_method", "huggingface")
-        
-        start_time = time.time()
-        
-        # ============================================================
-        # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
-        # ============================================================
-        if loading_method == "local_or_huggingface":
-            local_path = config.get("local_path")
-            model_path = script_dir / local_path if local_path else None
-            
-            # Try loading from local .nemo file first
-            if model_path and model_path.exists():
-                print(f"📦 Loading {config['display_name']} from local file...")
-                print(f"   Path: {model_path}")
+    # ========================================================================
+    # Explicit Device Management (Pattern 3: HuggingFace Modernization)
+    # ========================================================================
+    # Before loading a new model, unload any other models from VRAM to prevent
+    # OOM errors. This is critical when switching between models (e.g., 
+    # Parakeet → Canary) as multiple large models cannot fit in VRAM together.
+    # ========================================================================
+    
+    # Check if other models are cached and unload them
+    models_to_unload = [key for key in models_cache.keys() if key != model_name]
+    
+    if models_to_unload and torch.cuda.is_available():
+        for old_model_key in models_to_unload:
+            try:
+                old_model = models_cache[old_model_key]
+                print(f"🔄 Unloading {old_model_key} to free VRAM for {model_name}...")
                 
-                try:
-                    # Use retry logic for file lock handling
-                    models_cache[model_name] = _load_with_retry(
-                        restore_path=model_path,
-                        config=config,
-                        max_retries=3
-                    )
-                    load_time = time.time() - start_time
-                    print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
-                    return models_cache[model_name]
-                    
-                except PermissionError as e:
-                    error_str = str(e)
-                    if "WinError 32" in error_str or "being used by another process" in error_str:
-                        print(f"⚠️  Local file locked, falling back to HuggingFace...")
-                        # Fall through to HuggingFace download
-                    else:
-                        raise
-                        
-                except Exception as e:
-                    # Local file exists but is corrupted or invalid
-                    print(f"⚠️  Local file corrupted or invalid: {e}")
-                    print(f"   Falling back to HuggingFace download...")
-                    # Fall through to HuggingFace download
-            else:
-                # Local file not found - inform user
-                print(f"📦 Loading {config['display_name']} from HuggingFace...")
-                if model_path:
-                    print(f"   Local .nemo file not found: {model_path}")
-                print(f"   To download locally, run: python setup_local_models.py")
-            
-            # Load from HuggingFace (either no local file, or local file failed)
-            hf_model_id = config["hf_model_id"]
-            print(f"   Model ID: {hf_model_id}")
-            print("   (First load downloads model, subsequent loads use cache)")
-            
-            try:
-                models_cache[model_name] = _load_from_huggingface_with_retry(
-                    hf_model_id, config, max_retries=3
-                )
-            except ConnectionError as e:
-                raise ConnectionError(
-                    f"\n{'='*80}\n"
-                    f"❌ NETWORK ERROR LOADING MODEL!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Failed to connect to HuggingFace to download the model.\n\n"
-                    f"Solution: Please check your internet connection and try again.\n"
-                    f"Original error: {str(e)}\n"
-                    f"{'='*80}"
-                )
-            except OSError as e:
-                error_str = str(e).lower()
-                if "no space" in error_str or "disk" in error_str:
-                    raise OSError(
-                        f"\n{'='*80}\n"
-                        f"❌ DISK SPACE ERROR!\n"
-                        f"{'='*80}\n\n"
-                        f"Model: {config['display_name']}\n"
-                        f"Insufficient disk space to download the model.\n\n"
-                        f"Solution: Please free up disk space and try again.\n"
-                        f"Original error: {str(e)}\n"
-                        f"{'='*80}"
-                    )
-                raise
+                # Move model to CPU first to free VRAM
+                old_model = old_model.to("cpu")
+                
+                # Delete the model reference
+                del models_cache[old_model_key]
+                del old_model
+                
+                # Clear CUDA cache and run garbage collection
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                print(f"   ✅ {old_model_key} unloaded successfully")
+                
+            except Exception as e:
+                print(f"   ⚠️  Failed to unload {old_model_key}: {e}")
+                # Continue loading the new model anyway
+    
+    # Model not in cache or cache was invalid, proceed to load
+    config = MODEL_CONFIGS[model_name]
+    script_dir = get_script_dir()
+    loading_method = config.get("loading_method", "huggingface")
+    
+    start_time = time.time()
+    
+    # ============================================================
+    # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
+    # ============================================================
+    if loading_method == "local_or_huggingface":
+        local_path = config.get("local_path")
+        model_path = script_dir / local_path if local_path else None
         
-        # ============================================================
-        # LOCAL: Strictly load from local .nemo file only
-        # ============================================================
-        elif loading_method == "local":
-            model_path = script_dir / config["local_path"]
-            
-            # Check if .nemo file exists
-            if not model_path.exists():
-                raise FileNotFoundError(_format_model_error(
-                    title="MODEL FILE NOT FOUND!",
-                    model_path=model_path,
-                    display_name=config['display_name'],
-                    problem_msg="The .nemo file must be created once using the setup script.",
-                    solution_msg="Please run: python setup_local_models.py"
-                ))
-            
+        # Try loading from local .nemo file first
+        if model_path and model_path.exists():
             print(f"📦 Loading {config['display_name']} from local file...")
-            
-            # Use retry logic for file lock handling
-            # _load_with_retry provides comprehensive error messages for file locks
-            models_cache[model_name] = _load_with_retry(
-                restore_path=model_path,
-                config=config,
-                max_retries=3
-            )
-        
-        # ============================================================
-        # HUGGINGFACE: Load from HuggingFace only
-        # ============================================================
-        else:
-            hf_model_id = config["hf_model_id"]
-            
-            print(f"📦 Loading {config['display_name']} from HuggingFace...")
-            print(f"   Model ID: {hf_model_id}")
-            print("   (First load downloads model, subsequent loads use cache)")
+            print(f"   Path: {model_path}")
             
             try:
-                models_cache[model_name] = _load_from_huggingface_with_retry(
-                    hf_model_id, config, max_retries=3
+                # Use retry logic for file lock handling
+                models_cache[model_name] = _load_with_retry(
+                    restore_path=model_path,
+                    config=config,
+                    max_retries=3
                 )
-            except ConnectionError as e:
-                raise ConnectionError(
-                    f"\n{'='*80}\n"
-                    f"❌ NETWORK ERROR LOADING MODEL!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Failed to connect to HuggingFace to download the model.\n\n"
-                    f"Solution: Please check your internet connection and try again.\n"
-                    f"Original error: {str(e)}\n"
-                    f"{'='*80}"
-                )
-            except OSError as e:
-                error_str = str(e).lower()
-                if "no space" in error_str or "disk" in error_str:
-                    raise OSError(
-                        f"\n{'='*80}\n"
-                        f"❌ DISK SPACE ERROR!\n"
-                        f"{'='*80}\n\n"
-                        f"Model: {config['display_name']}\n"
-                        f"Insufficient disk space to download the model.\n\n"
-                        f"Solution: Please free up disk space and try again.\n"
-                        f"Original error: {str(e)}\n"
-                        f"{'='*80}"
-                    )
+                load_time = time.time() - start_time
+                print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
+                return models_cache[model_name]
+                
+            except PermissionError as e:
+                error_str = str(e)
+                if "WinError 32" in error_str or "being used by another process" in error_str:
+                    print(f"⚠️  Local file locked, falling back to HuggingFace...")
+                    # Fall through to HuggingFace download
+                else:
+                    raise
+                    
+            except Exception as e:
+                # Local file exists but is corrupted or invalid
+                print(f"⚠️  Local file corrupted or invalid: {e}")
+                print(f"   Falling back to HuggingFace download...")
+                # Fall through to HuggingFace download
+        else:
+            # Local file not found - inform user
+            print(f"📦 Loading {config['display_name']} from HuggingFace...")
+            if model_path:
+                print(f"   Local .nemo file not found: {model_path}")
+            print(f"   To download locally, run: python setup_local_models.py")
+        
+        # Load from HuggingFace (either no local file, or local file failed)
+        hf_model_id = config["hf_model_id"]
+        print(f"   Model ID: {hf_model_id}")
+        print("   (First load downloads model, subsequent loads use cache)")
+        
+        try:
+            models_cache[model_name] = _load_from_huggingface_with_retry(
+                hf_model_id, config, max_retries=3
+            )
+        except ConnectionError as e:
+            raise ConnectionError(
+                f"\n{'='*80}\n"
+                f"❌ NETWORK ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"Failed to connect to HuggingFace to download the model.\n\n"
+                f"Solution: Please check your internet connection and try again.\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except OSError as e:
+            error_str = str(e).lower()
+            if "no space" in error_str or "disk" in error_str:
                 raise OSError(
                     f"\n{'='*80}\n"
-                    f"❌ FILE SYSTEM ERROR!\n"
+                    f"❌ DISK SPACE ERROR!\n"
                     f"{'='*80}\n\n"
                     f"Model: {config['display_name']}\n"
-                    f"A file system error occurred while loading the model.\n\n"
-                    f"Solution: Please check file permissions and try again.\n"
-                    f"Cache location: {CACHE_DIR}\n"
+                    f"Insufficient disk space to download the model.\n\n"
+                    f"Solution: Please free up disk space and try again.\n"
                     f"Original error: {str(e)}\n"
                     f"{'='*80}"
                 )
-            except Exception as e:
-                raise RuntimeError(
-                    f"\n{'='*80}\n"
-                    f"❌ ERROR LOADING MODEL!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"An unexpected error occurred: {type(e).__name__}\n\n"
-                    f"Solution: Try clearing the cache and retrying.\n"
-                    f"Cache location: {CACHE_DIR}\n"
-                    f"Original error: {str(e)}\n"
-                    f"{'='*80}"
-                )
+            raise
+    
+    # ============================================================
+    # LOCAL: Strictly load from local .nemo file only
+    # ============================================================
+    elif loading_method == "local":
+        model_path = script_dir / config["local_path"]
         
-        load_time = time.time() - start_time
-        print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
+        # Check if .nemo file exists
+        if not model_path.exists():
+            raise FileNotFoundError(_format_model_error(
+                title="MODEL FILE NOT FOUND!",
+                model_path=model_path,
+                display_name=config['display_name'],
+                problem_msg="The .nemo file must be created once using the setup script.",
+                solution_msg="Please run: python setup_local_models.py"
+            ))
+        
+        print(f"📦 Loading {config['display_name']} from local file...")
+        
+        # Use retry logic for file lock handling
+        # _load_with_retry provides comprehensive error messages for file locks
+        models_cache[model_name] = _load_with_retry(
+            restore_path=model_path,
+            config=config,
+            max_retries=3
+        )
+    
+    # ============================================================
+    # HUGGINGFACE: Load from HuggingFace only
+    # ============================================================
+    else:
+        hf_model_id = config["hf_model_id"]
+        
+        print(f"📦 Loading {config['display_name']} from HuggingFace...")
+        print(f"   Model ID: {hf_model_id}")
+        print("   (First load downloads model, subsequent loads use cache)")
+        
+        try:
+            models_cache[model_name] = _load_from_huggingface_with_retry(
+                hf_model_id, config, max_retries=3
+            )
+        except ConnectionError as e:
+            raise ConnectionError(
+                f"\n{'='*80}\n"
+                f"❌ NETWORK ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"Failed to connect to HuggingFace to download the model.\n\n"
+                f"Solution: Please check your internet connection and try again.\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except OSError as e:
+            error_str = str(e).lower()
+            if "no space" in error_str or "disk" in error_str:
+                raise OSError(
+                    f"\n{'='*80}\n"
+                    f"❌ DISK SPACE ERROR!\n"
+                    f"{'='*80}\n\n"
+                    f"Model: {config['display_name']}\n"
+                    f"Insufficient disk space to download the model.\n\n"
+                    f"Solution: Please free up disk space and try again.\n"
+                    f"Original error: {str(e)}\n"
+                    f"{'='*80}"
+                )
+            raise OSError(
+                f"\n{'='*80}\n"
+                f"❌ FILE SYSTEM ERROR!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"A file system error occurred while loading the model.\n\n"
+                f"Solution: Please check file permissions and try again.\n"
+                f"Cache location: {CACHE_DIR}\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"\n{'='*80}\n"
+                f"❌ ERROR LOADING MODEL!\n"
+                f"{'='*80}\n\n"
+                f"Model: {config['display_name']}\n"
+                f"An unexpected error occurred: {type(e).__name__}\n\n"
+                f"Solution: Try clearing the cache and retrying.\n"
+                f"Cache location: {CACHE_DIR}\n"
+                f"Original error: {str(e)}\n"
+                f"{'='*80}"
+            )
+    
+    load_time = time.time() - start_time
+    print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
+    
+    # ====================================================================
+    # Explicit CUDA Placement (Pattern 3: HuggingFace Modernization)
+    # ====================================================================
+    # Ensure model is explicitly moved to CUDA after loading.
+    # While NeMo usually handles this, explicit placement ensures
+    # consistent behavior across different loading methods.
+    # ====================================================================
+    if torch.cuda.is_available():
+        try:
+            models_cache[model_name] = models_cache[model_name].to("cuda")
+            print(f"   ✅ Model moved to CUDA")
+        except Exception as e:
+            print(f"   ⚠️  Could not move model to CUDA: {e}")
+            # Continue with model on CPU
+    
     return models_cache[model_name]
 
 
@@ -1095,27 +1423,20 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
         
         # ============================================================================
-        # FIX #5: Lhotse Map-Dataset Mode to Prevent Deadlocks and File Locking
+        # Direct Method Parameters for Transcription (HuggingFace Pattern)
         # ============================================================================
-        # NeMo's Lhotse dataloader has two modes: iterable-dataset and map-dataset.
-        # The iterable-dataset mode (default) expects worker process coordination.
-        # When num_workers=0 is set without map-dataset mode, the dataloader hangs
-        # indefinitely at 0% progress because it waits for worker signals that never
-        # arrive.
-        # 
-        # Solution: Enable force_map_dataset=True in the transcribe config. This:
-        # 1. Uses direct memory indexing instead of worker coordination
-        # 2. Eliminates the deadlock at 0% progress
-        # 3. Prevents manifest file creation that causes Windows file locks
+        # NeMo's official API recommends using direct method parameters instead of
+        # override_config. This approach:
+        # 1. Uses NeMo's optimized internal initialization path
+        # 2. Prevents Lhotse dataloader deadlocks at 0% progress
+        # 3. Matches the working HuggingFace Spaces implementation
+        # 4. num_workers=0 at method level is safe (unlike config override)
         # ============================================================================
-        
-        # Setup transcribe config with force_map_dataset=True for safe inference
-        transcribe_cfg = _setup_transcribe_config(model, batch_size)
         
         # Transcribe with mixed precision (FP16) for GPU acceleration
         inference_start = time.time()
         
-        # Single attempt (no retry needed since manifest locking is prevented)
+        # Single attempt using direct method parameters (no override_config)
         try:
             if torch.cuda.is_available():
                 # Use mixed precision (FP16) for faster inference on CUDA
@@ -1123,16 +1444,18 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     result = model.transcribe(
                         processed_files, 
                         batch_size=batch_size,
-                        timestamps=include_timestamps,
-                        override_config=transcribe_cfg  # Apply config with force_map_dataset=True
+                        num_workers=0,  # Direct parameter - safe for Windows
+                        return_hypotheses=True,  # Required for timestamp access
+                        verbose=True  # Shows progress indicator
                     )
             else:
                 # CPU fallback - no autocast
                 result = model.transcribe(
                     processed_files, 
                     batch_size=batch_size,
-                    timestamps=include_timestamps,
-                    override_config=transcribe_cfg  # Apply config with force_map_dataset=True
+                    num_workers=0,  # Direct parameter - safe for Windows
+                    return_hypotheses=True,  # Required for timestamp access
+                    verbose=True  # Shows progress indicator
                 )
                 
         except PermissionError as e:
@@ -1191,36 +1514,68 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         # Calculate real-time factor
         rtfx = total_duration / inference_time if inference_time > 0 else 0
         
+        # ========================================================================
+        # Output Validation (Pattern 2: HuggingFace Modernization)
+        # ========================================================================
+        # Validate transcription result before accessing .text to prevent
+        # crashes from malformed results.
+        # ========================================================================
+        
         # Build output based on single vs batch processing
         if is_batch:
-            # Batch processing output
+            # ================================================================
+            # Batch processing with per-file validation (Pattern 5)
+            # ================================================================
             all_transcriptions = []
             per_file_stats = []
+            per_file_errors = []
             
             for i, (res, info) in enumerate(zip(result, file_info)):
-                transcription = res.text
-                all_transcriptions.append(transcription)
+                # Validate each result individually
+                success, transcription, error_msg = validate_transcription_result(result, i)
                 
-                file_duration = info["duration"]
-                file_mins = int(file_duration // 60)
-                file_secs = int(file_duration % 60)
-                file_type = "🎬 Video" if info["is_video"] else "🎵 Audio"
-                
-                per_file_stats.append(
-                    f"**{i+1}. {info['name']}** ({file_type})\n"
-                    f"   - Duration: {file_mins}m {file_secs}s\n"
-                    f"   - Words: {len(transcription.split())}"
-                )
+                if success:
+                    all_transcriptions.append(transcription)
+                    
+                    file_duration = info["duration"]
+                    file_mins = int(file_duration // 60)
+                    file_secs = int(file_duration % 60)
+                    file_type = "🎬 Video" if info["is_video"] else "🎵 Audio"
+                    
+                    per_file_stats.append(
+                        f"**{i+1}. {info['name']}** ({file_type})\n"
+                        f"   - Duration: {file_mins}m {file_secs}s\n"
+                        f"   - Words: {len(transcription.split())}"
+                    )
+                else:
+                    # Record error for this file
+                    all_transcriptions.append(f"[Transcription failed: {error_msg}]")
+                    per_file_errors.append(f"**{i+1}. {info['name']}**: {error_msg}")
+                    per_file_stats.append(
+                        f"**{i+1}. {info['name']}** ❌ Failed\n"
+                        f"   - Error: {error_msg}"
+                    )
             
             total_mins = int(total_duration // 60)
             total_secs = int(total_duration % 60)
-            total_words = sum(len(t.split()) for t in all_transcriptions)
+            
+            # Calculate total words only from successful transcriptions
+            successful_transcriptions = [t for t in all_transcriptions if not t.startswith("[Transcription failed:")]
+            total_words = sum(len(t.split()) for t in successful_transcriptions)
+            
+            # Add error summary if any files failed
+            error_summary = ""
+            if per_file_errors:
+                error_summary = (
+                    f"\n\n⚠️ **{len(per_file_errors)} file(s) failed to transcribe:**\n"
+                    + "\n".join(per_file_errors)
+                )
             
             status = f"""
 ### ✅ Batch Transcription Complete!
 
 {video_status}**📊 Overall Statistics:**
-- **Files Processed**: {len(file_list)}
+- **Files Processed**: {len(file_list)} ({len(file_list) - len(per_file_errors)} successful, {len(per_file_errors)} failed)
 - **Model**: {model_choice}
 - **GPU**: {gpu_name}
 - **Total Audio Duration**: {total_mins}m {total_secs}s
@@ -1232,7 +1587,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 - **Total Words**: {total_words}
 
 **📁 Per-File Statistics:**
-{chr(10).join(per_file_stats)}
+{chr(10).join(per_file_stats)}{error_summary}
 
 ---
 """
@@ -1247,30 +1602,55 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             transcription_output = combined_transcription
             
         else:
-            # Single file processing (original behavior)
-            transcription = result[0].text
+            # ================================================================
+            # Single file processing with validation (Pattern 2)
+            # ================================================================
+            
+            # Validate result before accessing
+            success, transcription, error_msg = validate_transcription_result(result, 0)
+            
+            if not success:
+                return (
+                    format_error_message('output_validation_failed', error_msg),
+                    "", None
+                )
+            
             info = file_info[0]
             
             minutes = int(info["duration"] // 60)
             seconds = int(info["duration"] % 60)
             
-            # Format timestamps if requested
+            # ================================================================
+            # Defensive Timestamp Extraction (Pattern 4)
+            # ================================================================
+            # Extract timestamps with word → segment → none fallback
             timestamp_text = ""
-            if include_timestamps and hasattr(result[0], 'timestamp') and result[0].timestamp:
-                # Access timestamp dictionary following official NeMo API pattern
-                word_timestamps = result[0].timestamp.get('word', [])
-                if word_timestamps:
-                    timestamp_text = "\n\n### Word-Level Timestamps (first 50 words):\n\n"
-                    for i, stamp in enumerate(word_timestamps[:50]):
-                        # Each stamp is a dict with 'start', 'end', 'word' or 'segment' keys
+            timestamp_level = 'none'
+            
+            if include_timestamps:
+                timestamps, timestamp_level = extract_timestamps(result[0], include_timestamps)
+                
+                if timestamps and timestamp_level in ('word', 'segment', 'char'):
+                    level_name = "Word-Level" if timestamp_level == 'word' else (
+                        "Segment-Level" if timestamp_level == 'segment' else "Character-Level"
+                    )
+                    timestamp_text = f"\n\n### {level_name} Timestamps (first 50):\n\n"
+                    
+                    for i, stamp in enumerate(timestamps[:50]):
+                        # Each stamp is a dict with 'start', 'end', 'word'/'segment' keys
                         start = stamp.get('start', 0.0)
                         end = stamp.get('end', 0.0)
-                        word = stamp.get('word', stamp.get('segment', ''))
-                        timestamp_text += f"`{start:.2f}s - {end:.2f}s` → **{word}**\n\n"
-                    if len(word_timestamps) > 50:
-                        timestamp_text += f"\n*...and {len(word_timestamps) - 50} more words*"
+                        # Get the text content based on timestamp level
+                        text_content = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
+                        timestamp_text += f"`{start:.2f}s - {end:.2f}s` → **{text_content}**\n\n"
+                    
+                    if len(timestamps) > 50:
+                        timestamp_text += f"\n*...and {len(timestamps) - 50} more*"
             
             file_type_msg = "🎬 Video file detected - audio extracted automatically\n" if info["is_video"] else ""
+            
+            # Add timestamp status indicator (Pattern 7)
+            timestamp_status = format_timestamp_status(timestamp_level, include_timestamps)
             
             status = f"""
 ### ✅ Transcription Complete!
@@ -1286,6 +1666,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 - **Real-Time Factor**: {rtfx:.1f}× (processed {rtfx:.1f}× faster than real-time)
 - **VRAM Used**: {vram_used:.2f} GB
 - **Transcription Length**: {len(transcription)} characters ({len(transcription.split())} words)
+{timestamp_status}
 
 ---
 """
@@ -1325,19 +1706,17 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f.write(f"{SEPARATOR}\n\n")
                     f.write(transcription)
                     
-                    if include_timestamps and hasattr(result[0], 'timestamp') and result[0].timestamp:
-                        # Access timestamp dictionary following official NeMo API pattern
-                        word_timestamps = result[0].timestamp.get('word', [])
-                        if word_timestamps:
-                            f.write(f"\n\n{SEPARATOR}\n")
-                            f.write(f"WORD-LEVEL TIMESTAMPS\n")
-                            f.write(f"{SEPARATOR}\n\n")
-                            for stamp in word_timestamps:
-                                # Each stamp is a dict with 'start', 'end', 'word' or 'segment' keys
-                                start = stamp.get('start', 0.0)
-                                end = stamp.get('end', 0.0)
-                                word = stamp.get('word', stamp.get('segment', ''))
-                                f.write(f"{start:.2f}s - {end:.2f}s: {word}\n")
+                    # Use defensive timestamp extraction (Pattern 4)
+                    if include_timestamps and timestamps and timestamp_level in ('word', 'segment', 'char'):
+                        level_name = timestamp_level.upper() + "-LEVEL"
+                        f.write(f"\n\n{SEPARATOR}\n")
+                        f.write(f"{level_name} TIMESTAMPS\n")
+                        f.write(f"{SEPARATOR}\n\n")
+                        for stamp in timestamps:
+                            start = stamp.get('start', 0.0)
+                            end = stamp.get('end', 0.0)
+                            text_content = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
+                            f.write(f"{start:.2f}s - {end:.2f}s: {text_content}\n")
             
             status += f"\n💾 **Saved to**: `{output_file}`"
         
