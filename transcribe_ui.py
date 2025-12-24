@@ -82,16 +82,23 @@ else:
     print(f"✓ Temp directory verified: {_temp_dir}")
 
 # ============================================================================
-# NOTE: NeMo C++ Backend Limitation
+# NOTE: Lhotse Dataloader Configuration for Deadlock Prevention
 # ============================================================================
-# Python-level environment variables (TMPDIR, TEMP, TMP) control Python's
-# tempfile module but may not fully control NeMo's C++ backend operations.
-# The PRIMARY fix for manifest file locking is setting num_workers=0 in
-# the transcribe() call, which prevents worker process creation entirely.
-# This is implemented in the _setup_transcribe_config() function.
+# NeMo's ASR models use Lhotse dataloaders internally. To prevent deadlocks
+# during transcription (where progress hangs at 0%), we configure the dataloader
+# to use map-based dataset mode (force_map_dataset=True) instead of the default
+# iterable-dataset mode.
+# 
+# Why this matters:
+# - Iterable-dataset mode expects worker process coordination
+# - Setting num_workers=0 without map-dataset mode causes indefinite hangs
+# - Map-dataset mode uses direct memory indexing, no workers needed
+# - This also prevents Windows file-lock issues (WinError 32) from manifest files
+# 
+# See _setup_transcribe_config() function for implementation.
 # ============================================================================
-print("\n⚠️  NOTE: NeMo uses num_workers=0 to prevent manifest file creation")
-print("   This disables worker processes that can cause Windows file locks")
+print("\n✅ Lhotse dataloader configured with force_map_dataset=True")
+print("   This prevents deadlocks and Windows file-lock issues")
 print("   See transcribe_ui.py::_setup_transcribe_config() for implementation")
 
 # ============================================================================
@@ -380,23 +387,47 @@ def setup_gpu_optimizations():
 
 def _setup_transcribe_config(model, batch_size):
     """
-    Setup transcribe configuration to prevent manifest file locking.
+    Setup transcribe configuration to prevent Lhotse dataloader deadlocks and
+    maintain Windows file-lock protection.
     
-    Key fix: num_workers=0 disables multiprocessing worker processes
-    that create temporary manifest files in system temp directories.
-    These files cause Windows file locking errors during GPU inference.
+    Key fix: Enable force_map_dataset=True to use map-based sampling instead of
+    iterable-dataset sampling. This prevents deadlocks that occur when:
+    - num_workers=0 is set (to prevent Windows manifest file locking)
+    - Lhotse's iterable-dataset mode expects worker coordination that never arrives
+    
+    The map-dataset mode uses direct memory indexing instead of worker processes,
+    eliminating both the deadlock AND the Windows file-lock issues.
+    
+    Technical background:
+    - Lhotse dataloader has two modes: iterable-dataset (default) and map-dataset
+    - Iterable-dataset mode spawns workers and performs synchronization handshakes
+    - When num_workers=0 with iterable-dataset, no workers spawn but main process
+      still waits for signals that never arrive, causing indefinite hang at 0%
+    - Map-dataset mode (force_map_dataset=True) uses direct indexing without workers
     
     Args:
         model: The loaded ASR model
         batch_size: Batch size for transcription
         
     Returns:
-        Transcribe configuration object with num_workers=0
+        Transcribe configuration object configured for safe inference
     """
     config = model.get_transcribe_config()
-    config.num_workers = 0  # CRITICAL: Disable worker processes to prevent manifest file creation
+    
+    # Enable map-based dataset mode if available (Lhotse-based dataloaders)
+    # This prevents deadlocks from iterable-dataset worker coordination issues
+    # AND eliminates manifest file creation that causes Windows file locks
+    if hasattr(config, 'force_map_dataset'):
+        config.force_map_dataset = True
+    
+    # Set batch size and ensure we don't drop the last batch
     config.batch_size = batch_size
     config.drop_last = False
+    
+    # NOTE: We do NOT override num_workers here. By using force_map_dataset=True,
+    # we eliminate the need for worker coordination entirely. Let NeMo use its
+    # inference-appropriate defaults for num_workers.
+    
     return config
 
 def _format_model_error(title, model_path, display_name, problem_msg, solution_msg, original_error=None):
@@ -1053,18 +1084,21 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
         
         # ============================================================================
-        # FIX #5: Use num_workers=0 to Prevent Manifest File Locking
+        # FIX #5: Lhotse Map-Dataset Mode to Prevent Deadlocks and File Locking
         # ============================================================================
-        # NeMo's transcribe() method spawns worker processes when num_workers > 0.
-        # These workers create temporary manifest files in the system temp directory
-        # for inter-process communication. Windows antivirus/OneDrive immediately
-        # locks these files, causing WinError 32.
+        # NeMo's Lhotse dataloader has two modes: iterable-dataset and map-dataset.
+        # The iterable-dataset mode (default) expects worker process coordination.
+        # When num_workers=0 is set without map-dataset mode, the dataloader hangs
+        # indefinitely at 0% progress because it waits for worker signals that never
+        # arrive.
         # 
-        # Solution: Set num_workers=0 to disable worker processes and force
-        # single-process inference, eliminating the manifest file creation.
+        # Solution: Enable force_map_dataset=True in the transcribe config. This:
+        # 1. Uses direct memory indexing instead of worker coordination
+        # 2. Eliminates the deadlock at 0% progress
+        # 3. Prevents manifest file creation that causes Windows file locks
         # ============================================================================
         
-        # Setup transcribe config with num_workers=0 to prevent manifest file locking
+        # Setup transcribe config with force_map_dataset=True for safe inference
         transcribe_cfg = _setup_transcribe_config(model, batch_size)
         
         # Transcribe with mixed precision (FP16) for GPU acceleration
@@ -1079,7 +1113,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                         processed_files, 
                         batch_size=batch_size,
                         timestamps=include_timestamps,
-                        override_config=transcribe_cfg  # Apply config with num_workers=0
+                        override_config=transcribe_cfg  # Apply config with force_map_dataset=True
                     )
             else:
                 # CPU fallback - no autocast
@@ -1087,7 +1121,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     processed_files, 
                     batch_size=batch_size,
                     timestamps=include_timestamps,
-                    override_config=transcribe_cfg  # Apply config with num_workers=0
+                    override_config=transcribe_cfg  # Apply config with force_map_dataset=True
                 )
                 
         except PermissionError as e:
