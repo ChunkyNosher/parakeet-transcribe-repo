@@ -419,14 +419,25 @@ def _setup_transcribe_config(model, batch_size):
     # AND eliminates manifest file creation that causes Windows file locks
     if hasattr(config, 'force_map_dataset'):
         config.force_map_dataset = True
+        print("   ✅ Using force_map_dataset=True for deadlock-free inference")
+    else:
+        # Fallback for older NeMo versions without force_map_dataset support
+        # In this case, we set num_workers=0 which may cause the deadlock issue
+        # but is still safer than not setting it (prevents Windows file locks)
+        print("   ⚠️  force_map_dataset not available (older NeMo version)")
+        print("      Falling back to num_workers=0 - may cause deadlock on some systems")
+        if hasattr(config, 'num_workers'):
+            config.num_workers = 0
     
     # Set batch size and ensure we don't drop the last batch
     config.batch_size = batch_size
     config.drop_last = False
     
-    # NOTE: We do NOT override num_workers here. By using force_map_dataset=True,
-    # we eliminate the need for worker coordination entirely. Let NeMo use its
-    # inference-appropriate defaults for num_workers.
+    # NOTE: When force_map_dataset=True is available and set, we don't override
+    # num_workers - map-dataset mode eliminates worker coordination entirely.
+    # When force_map_dataset is NOT available (older NeMo), we fall back to
+    # num_workers=0 which may cause deadlocks but at least prevents Windows
+    # file-lock errors.
     
     return config
 
