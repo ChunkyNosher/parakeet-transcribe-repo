@@ -45,10 +45,20 @@ MODELS_TO_DOWNLOAD = {
         "download_size": "~2.2 GB",
         "saved_size": "~4.5 GB",
         "min_size_gb": 3.0,
-        "description": "English only, 1.5% WER (best accuracy)",
+        "description": "English only, 1.5% WER (best accuracy), no punctuation",
         "recommended": False
     },
     "3": {
+        "model_id": "nvidia/parakeet-tdt_ctc-1.1b",
+        "filename": "parakeet-tdt_ctc-1.1b.nemo",
+        "display_name": "Parakeet-TDT_CTC-1.1B (PnC)",
+        "download_size": "~2.2 GB",
+        "saved_size": "~4.5 GB",
+        "min_size_gb": 3.0,
+        "description": "English only, 1.82% WER, WITH Punctuation & Capitalization",
+        "recommended": False
+    },
+    "4": {
         "model_id": "nvidia/canary-1b",
         "filename": "canary-1b.nemo",
         "display_name": "Canary-1B (Multilingual + Translation)",
@@ -58,7 +68,7 @@ MODELS_TO_DOWNLOAD = {
         "description": "25 languages, speech-to-text translation",
         "recommended": False
     },
-    "4": {
+    "5": {
         "model_id": "nvidia/canary-1b-v2",
         "filename": "canary-1b-v2.nemo",
         "display_name": "Canary-1B v2 (Multilingual + Translation)",
@@ -214,9 +224,9 @@ def download_all_models():
     print("\n" + "="*80)
     print("📦 BATCH DOWNLOAD: ALL MODELS")
     print("="*80)
-    print("\nThis will download all 4 models.")
-    print("Estimated total size: ~16-17 GB")
-    print("Estimated time: 15-45 minutes (depends on connection)")
+    print("\nThis will download all 5 models.")
+    print("Estimated total size: ~19-21 GB")
+    print("Estimated time: 20-50 minutes (depends on connection)")
     
     confirm = input("\nProceed with batch download? (y/n): ").strip().lower()
     if confirm not in ('y', 'yes'):
@@ -256,8 +266,8 @@ def display_menu():
         print(f"     Size: {model['download_size']} → {model['saved_size']}")
         print(f"     {model['description']}\n")
     
-    print("  5. Download ALL models (batch mode)")
-    print("  6. Check what's already downloaded")
+    print("  6. Download ALL models (batch mode)")
+    print("  7. Check what's already downloaded")
     print("  0. Exit\n")
     
     return input("Enter your choice: ").strip()
@@ -284,9 +294,9 @@ def main():
         if choice == "0":
             print("\n👋 Goodbye!")
             break
-        elif choice == "5":
-            download_all_models()
         elif choice == "6":
+            download_all_models()
+        elif choice == "7":
             display_model_status()
         elif choice in MODELS_TO_DOWNLOAD:
             success = download_and_save_model(choice)

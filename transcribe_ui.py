@@ -468,13 +468,14 @@ def apply_inverse_text_normalization(text: str, language: str = "en") -> str:
 
 
 def apply_itn_to_segment(text: str, language: str = "en") -> str:
-    """Apply ITN to a single short segment (sentence/chunk).
+    """Apply ITN to a segment with automatic splitting for long text.
     
-    This is optimized for short segments that don't need splitting.
-    Used during chunk processing to apply ITN immediately after transcription.
+    For chunks from long audio (180s+), the text can exceed ITN's
+    recommended length. This function automatically splits long text
+    and normalizes in batches to avoid the "input too long" warning.
     
     Args:
-        text: Short segment text (typically one sentence or chunk)
+        text: Segment text (may be long from chunked audio transcription)
         language: Language code for ITN (default: "en")
         
     Returns:
@@ -485,10 +486,44 @@ def apply_itn_to_segment(text: str, language: str = "en") -> str:
     if not _is_itn_applicable(normalizer, text):
         return text
     
-    try:
-        return normalizer.normalize(text.strip(), verbose=False)  # type: ignore[union-attr]
-    except Exception:
+    word_count = len(text.split())
+    
+    # If text is short enough, normalize directly
+    if word_count <= 50:
+        try:
+            result = normalizer.normalize(text.strip(), verbose=False)  # type: ignore[union-attr]
+            return result
+        except Exception as e:
+            print(f"   ⚠️ ITN direct normalization failed: {e}")
+            # Fall through to chunked approach
+    
+    # For long text, split into 50-word chunks to avoid "input too long" warning
+    chunks = _split_text_into_word_chunks(text, max_words=50)
+    
+    if len(chunks) <= 1 and word_count <= 50:
+        # Already tried direct, return original
         return text
+    
+    try:
+        # Use normalize_list for batch processing (more efficient)
+        normalized = normalizer.normalize_list(chunks, verbose=False)  # type: ignore[union-attr]
+        result = ' '.join(normalized)
+        print(f"   ✅ ITN applied (chunked: {len(chunks)} chunks, {word_count} words)")
+        return result
+    except Exception as e:
+        print(f"   ⚠️ ITN batch failed ({e}), trying individually")
+        # Individual fallback - normalize each chunk separately
+        results: List[str] = []
+        for chunk in chunks:
+            try:
+                results.append(normalizer.normalize(chunk, verbose=False))  # type: ignore[union-attr]
+            except Exception:
+                results.append(chunk)  # Keep original chunk if normalization fails
+        
+        # Only print success if we actually normalized something
+        if results:
+            print(f"   ✅ ITN applied (individual: {len(chunks)} chunks)")
+        return ' '.join(results)
 
 
 # ============================================================================
@@ -1590,6 +1625,24 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "vram_gb": "4-5",
         "recommended_for": "Multilingual ASR + speech-to-text translation (improved)",
         "additional_features": ["Speech Translation (AST)", "NeMo Forced Aligner timestamps"]
+    },
+    
+    # ========== HYBRID TDT-CTC MODELS (with Punctuation & Capitalization) ==========
+    "parakeet-tdt_ctc-1.1b": {
+        "local_path": "local_models/parakeet-tdt_ctc-1.1b.nemo",  # Unique filename for hybrid PnC model
+        "hf_model_id": "nvidia/parakeet-tdt_ctc-1.1b",
+        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
+        "display_name": "Parakeet-TDT_CTC-1.1B (PnC)",
+        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
+        "architecture": "Hybrid FastConformer-TDT-CTC",
+        "parameters": "1.1B",
+        "languages": 1,  # English only
+        "wer": "1.82%",
+        "rtfx": "~1,000×",  # Slightly slower than pure TDT due to hybrid architecture
+        "vram_gb": "5-6",
+        "recommended_for": "Best English accuracy WITH punctuation & capitalization",
+        "has_punctuation": True,  # Built-in punctuation and capitalization
+        "additional_features": ["Punctuation", "Capitalization", "11h audio in single pass"]
     }
 }
 
@@ -1660,6 +1713,7 @@ def get_model_key_from_choice(choice_text: str) -> str:
     choice_map = {
         "Parakeet-TDT-0.6B v3": "parakeet-v3",
         "Parakeet-TDT-1.1B": "parakeet-1.1b",
+        "Parakeet-TDT_CTC-1.1B": "parakeet-tdt_ctc-1.1b",  # Hybrid PnC model
         "Canary-1B v2": "canary-1b-v2",
         "Canary-1B": "canary-1b",
         # Legacy support
@@ -2240,6 +2294,80 @@ def _move_model_to_cuda(model: Any, model_name: str) -> Any:
         # Continue with model on CPU
     
     return model
+
+
+# ============================================================================
+# VRAM Management: Manual and Auto Unload
+# ============================================================================
+# Global setting for auto-unload after transcription
+auto_unload_after_transcription: bool = False
+
+
+def unload_all_models() -> str:
+    """Unload all cached models to free VRAM.
+    
+    Call this when you're done transcribing and want to reclaim
+    GPU memory for other applications like gaming or video editing.
+    
+    Returns:
+        Status message indicating which models were unloaded and VRAM freed
+    """
+    global models_cache
+    
+    if not models_cache:
+        return "ℹ️ No models currently loaded in memory"
+    
+    unloaded: List[str] = []
+    initial_vram = 0.0
+    final_vram = 0.0
+    
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        initial_vram = torch.cuda.memory_allocated() / 1024**3  # type: ignore[reportUnknownMemberType]
+    
+    for model_key in list(models_cache.keys()):
+        try:
+            print(f"🗑️ Unloading {model_key}...")
+            model = models_cache[model_key]
+            
+            # Move to CPU first to free VRAM immediately
+            model.cpu()
+            
+            # Delete from cache
+            del models_cache[model_key]
+            del model
+            
+            unloaded.append(model_key)
+            print(f"   ✅ {model_key} unloaded")
+            
+        except Exception as e:
+            print(f"   ⚠️ Failed to unload {model_key}: {e}")
+    
+    # Clear CUDA cache and garbage collect
+    gc.collect()
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        torch.cuda.empty_cache()  # type: ignore[reportUnknownMemberType]
+        final_vram = torch.cuda.memory_allocated() / 1024**3  # type: ignore[reportUnknownMemberType]
+    
+    freed = initial_vram - final_vram
+    
+    if unloaded:
+        return f"✅ Unloaded: {', '.join(unloaded)}\n💾 Freed ~{freed:.1f}GB VRAM"
+    return "⚠️ No models were successfully unloaded"
+
+
+def set_auto_unload(enabled: bool) -> str:
+    """Enable or disable auto-unload after transcription.
+    
+    Args:
+        enabled: True to auto-unload after each transcription
+        
+    Returns:
+        Status message
+    """
+    global auto_unload_after_transcription
+    auto_unload_after_transcription = enabled
+    status = "enabled" if enabled else "disabled"
+    return f"Auto-unload {status}"
 
 
 def load_model(model_name: str, show_progress: bool = False) -> Any:
@@ -3344,6 +3472,12 @@ def transcribe_audio(
         print(f"✅ Transcription Complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
         
+        # Auto-unload models if enabled
+        if auto_unload_after_transcription:
+            print("\n🗑️ Auto-unloading models to free VRAM...")
+            unload_result = unload_all_models()
+            print(unload_result)
+        
         logs = log_capture.stop()
         log_file = _save_logs(logs, "transcription")
         return status, transcription_output or "", txt_file, srt_file, csv_file, log_file
@@ -3465,6 +3599,25 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         refresh_btn = gr.Button("🔄 Refresh System Info", size="sm")
         refresh_btn.click(fn=get_system_info, outputs=system_info)
     
+    # VRAM Management section
+    with gr.Accordion("💾 VRAM Management", open=False):
+        gr.Markdown("""
+        **Free GPU Memory**: Unload models when you're done transcribing to free up VRAM for other apps (gaming, video editing, etc.)
+        
+        Models are cached in memory by default for fast subsequent transcriptions.
+        """)
+        with gr.Row():
+            unload_btn = gr.Button("🗑️ Unload All Models (Free VRAM)", size="sm", variant="secondary")
+            auto_unload_checkbox = gr.Checkbox(
+                label="Auto-unload after transcription",
+                value=False,
+                info="Automatically free VRAM after each transcription completes"
+            )
+        unload_status = gr.Markdown("")
+        
+        unload_btn.click(fn=unload_all_models, outputs=unload_status)
+        auto_unload_checkbox.change(fn=set_auto_unload, inputs=auto_unload_checkbox, outputs=unload_status)
+    
     gr.Markdown("---")
     
     # Main interface
@@ -3498,7 +3651,8 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                 choices=[
                     "📊 Parakeet-TDT-0.6B v3 (Multilingual, Default) - 25 languages, auto-detect",
                     "🎯 Parakeet-TDT-1.1B (Maximum Accuracy) - 1.5% WER, English only",
-                    "🌍 Canary-1B v2 (Multilingual + Translation) - 25 languages with AST",
+                    "� Parakeet-TDT_CTC-1.1B (PnC) - 1.82% WER, English with Punctuation & Capitalization",
+                    "�🌍 Canary-1B v2 (Multilingual + Translation) - 25 languages with AST",
                     "🌐 Canary-1B (Multilingual) - 25 languages, standard ASR"
                 ],
                 value="📊 Parakeet-TDT-0.6B v3 (Multilingual, Default) - 25 languages, auto-detect",
