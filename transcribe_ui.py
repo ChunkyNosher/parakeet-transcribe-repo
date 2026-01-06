@@ -518,26 +518,164 @@ def _load_audio_to_numpy(file_path, target_sr=16000):
         raise
 
 
+# ============================================================================
+# Audio Chunking for Long Audio Files (OutOfMemoryError Fix)
+# ============================================================================
+# When passing numpy arrays directly to NeMo's transcribe(), the entire audio
+# is processed at once without internal chunking. For long audio files (e.g.,
+# 30+ minutes), this can cause CUDA OOM errors even on 12GB+ VRAM GPUs.
+#
+# Solution: Split long audio into manageable chunks (30 seconds default),
+# transcribe each chunk separately, and merge the results.
+#
+# The 2-second context overlap ensures words at chunk boundaries are
+# transcribed with proper acoustic context, preventing word cutoff issues.
+# ============================================================================
+
+# Chunking configuration constants
+# These values are safe for 12GB VRAM with 1.1B parameter models
+CHUNK_DURATION_SEC = 30      # Duration of each transcription chunk
+CHUNK_OVERLAP_SEC = 2        # Context overlap on each side of chunk
+LONG_AUDIO_THRESHOLD_SEC = 60  # Audio longer than this triggers chunking
+
+
+def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cuda=True):
+    """Transcribe long audio by processing in chunks to avoid VRAM OOM.
+    
+    This function splits long audio into manageable chunks with overlap,
+    transcribes each chunk separately (clearing VRAM between chunks), and
+    merges the results. This prevents the 91+ GiB allocation errors that
+    occur when passing long audio arrays directly to model.transcribe().
+    
+    Algorithm:
+    1. Split audio into 30-second chunks with 2-second context on each side
+    2. Each chunk's "buffer" is: [2s left context | 30s chunk | 2s right context]
+    3. Transcribe each 34-second buffer separately
+    4. Clear VRAM between chunks with torch.cuda.empty_cache()
+    5. Concatenate transcriptions (context provides word boundary handling)
+    
+    Args:
+        model: Loaded NeMo ASR model
+        audio_array: numpy array of audio samples (16kHz mono)
+        sample_rate: Sample rate in Hz (default 16000)
+        use_cuda: Whether to use CUDA with mixed precision
+    
+    Returns:
+        Full transcription text as string
+    """
+    import gc
+    import numpy as np
+    
+    chunk_samples = int(CHUNK_DURATION_SEC * sample_rate)
+    context_samples = int(CHUNK_OVERLAP_SEC * sample_rate)
+    step_samples = chunk_samples  # Non-overlapping step (context handles overlap)
+    
+    total_samples = len(audio_array)
+    total_duration = total_samples / sample_rate
+    
+    print(f"   ⚡ Chunked transcription: {total_duration:.1f}s audio → {CHUNK_DURATION_SEC}s chunks")
+    
+    transcriptions = []
+    position = 0
+    chunk_num = 0
+    
+    while position < total_samples:
+        chunk_num += 1
+        
+        # Calculate buffer boundaries with context
+        # Buffer = [left_context | main_chunk | right_context]
+        start = max(0, position - context_samples)
+        end = min(total_samples, position + chunk_samples + context_samples)
+        
+        # Extract buffer (includes left and right context for word boundaries)
+        buffer = audio_array[start:end]
+        
+        chunk_start_time = position / sample_rate
+        chunk_end_time = min((position + chunk_samples) / sample_rate, total_duration)
+        
+        print(f"   📍 Chunk {chunk_num}: {chunk_start_time:.1f}s - {chunk_end_time:.1f}s ({len(buffer)/sample_rate:.1f}s with context)")
+        
+        # Clear VRAM before each chunk to prevent accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        try:
+            # Transcribe this chunk
+            if use_cuda and torch.cuda.is_available():
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    result = model.transcribe(
+                        audio=[buffer],
+                        batch_size=1,  # Single chunk at a time for memory safety
+                        return_hypotheses=True,
+                        verbose=False
+                    )
+            else:
+                result = model.transcribe(
+                    audio=[buffer],
+                    batch_size=1,
+                    return_hypotheses=True,
+                    verbose=False
+                )
+            
+            # Extract text from result
+            if result and len(result) > 0:
+                if hasattr(result[0], 'text'):
+                    chunk_text = result[0].text
+                elif isinstance(result[0], str):
+                    chunk_text = result[0]
+                else:
+                    chunk_text = str(result[0])
+                
+                if chunk_text.strip():
+                    transcriptions.append(chunk_text.strip())
+                    
+        except Exception as e:
+            print(f"   ⚠️ Chunk {chunk_num} failed: {type(e).__name__}: {e}")
+            # Continue with next chunk rather than failing entirely
+        
+        # Move to next chunk position
+        position += step_samples
+        
+        # Force memory cleanup after each chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+    
+    print(f"   ✅ Processed {chunk_num} chunks")
+    
+    # Merge transcriptions with space separator
+    full_transcription = ' '.join(transcriptions)
+    
+    # Clean up multiple spaces that may occur at chunk boundaries
+    while '  ' in full_transcription:
+        full_transcription = full_transcription.replace('  ', ' ')
+    
+    return full_transcription.strip()
+
+
 def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3):
-    """Transcribe using tensor-based input to bypass manifest.json creation.
+    """Transcribe using tensor-based input with chunking for long audio.
     
-    CRITICAL FIX: This function now loads audio into numpy arrays and passes
-    them directly to model.transcribe(). This completely bypasses NeMo's
-    Lhotse dataloader and prevents manifest.json file creation.
+    CRITICAL FIXES:
+    1. Loads audio into numpy arrays to bypass NeMo's Lhotse dataloader
+       (prevents manifest.json file locking issues on Windows - WinError 32)
+    2. Chunks long audio (>60s) to prevent CUDA OOM errors
+       (NeMo processes entire numpy array at once without internal chunking)
     
-    The num_workers parameter to transcribe() does NOT override the model's
-    internal config (which has num_workers=2 from training). The ONLY reliable
-    fix is to bypass the file-based dataloader entirely.
+    For audio longer than 60 seconds, the audio is automatically split into
+    30-second chunks with 2-second context overlap and transcribed separately
+    to stay within VRAM limits.
     
     Args:
         model: Loaded NeMo ASR model
         files: List of audio file paths to transcribe
-        batch_size: Batch size for transcription (used for numpy batching)
+        batch_size: Batch size for transcription (used for short audio batching)
         use_cuda: Whether to use CUDA with mixed precision
         max_retries: Maximum retry attempts for any errors
         
     Returns:
-        Transcription result from model.transcribe()
+        Transcription result from model.transcribe() or list of Hypothesis-like objects
         
     Raises:
         Exception: For transcription errors
@@ -550,15 +688,75 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
     # Load all audio files into numpy arrays FIRST
     # This completely bypasses NeMo's file-based dataloader
     print(f"   📂 Loading {len(files)} audio file(s) into memory...")
-    audio_arrays = []
+    audio_data = []  # List of (audio_array, duration_sec) tuples
+    
     for file_path in files:
         try:
-            audio_np, _ = _load_audio_to_numpy(file_path, target_sr=16000)
-            audio_arrays.append(audio_np)
+            audio_np, sr = _load_audio_to_numpy(file_path, target_sr=16000)
+            duration_sec = len(audio_np) / sr
+            audio_data.append((audio_np, duration_sec))
+            print(f"      • {Path(file_path).name}: {duration_sec:.1f}s")
         except Exception as e:
             print(f"   ❌ Failed to load audio: {file_path}")
             raise
     
+    # Check if any audio needs chunking (longer than threshold)
+    needs_chunking = any(duration > LONG_AUDIO_THRESHOLD_SEC for _, duration in audio_data)
+    
+    if needs_chunking:
+        # ====================================================================
+        # CHUNKED TRANSCRIPTION PATH (for long audio)
+        # ====================================================================
+        # Process each file individually, using chunking for long files
+        # This prevents OOM errors by never loading too much into VRAM at once
+        # ====================================================================
+        print(f"   ⚡ Long audio detected (>{LONG_AUDIO_THRESHOLD_SEC}s) - using chunked transcription")
+        
+        results = []
+        for i, (audio_np, duration) in enumerate(audio_data):
+            if duration > LONG_AUDIO_THRESHOLD_SEC:
+                # Use chunked transcription for long audio
+                text = _transcribe_long_audio_chunked(
+                    model, audio_np, sample_rate=16000, use_cuda=use_cuda
+                )
+                # Wrap in Hypothesis-like object for API compatibility
+                class _Hypothesis:
+                    def __init__(self, text):
+                        self.text = text
+                results.append(_Hypothesis(text))
+            else:
+                # Short audio within this batch - transcribe normally
+                if use_cuda and torch.cuda.is_available():
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        result = model.transcribe(
+                            audio=[audio_np],
+                            batch_size=1,
+                            return_hypotheses=True,
+                            verbose=True
+                        )
+                else:
+                    result = model.transcribe(
+                        audio=[audio_np],
+                        batch_size=1,
+                        return_hypotheses=True,
+                        verbose=True
+                    )
+                if result:
+                    results.extend(result)
+                
+                # Clean up between files
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+        
+        return results
+    
+    # ========================================================================
+    # STANDARD TRANSCRIPTION PATH (for short audio)
+    # ========================================================================
+    # All audio files are short enough to process together in one batch
+    # ========================================================================
+    audio_arrays = [audio for audio, _ in audio_data]
     print(f"   ✅ Audio loaded into memory, starting transcription...")
     
     for attempt in range(max_retries):
