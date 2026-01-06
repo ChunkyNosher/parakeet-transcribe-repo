@@ -126,9 +126,393 @@ import time
 import gc
 import shutil
 import hashlib
+import io
+import re
+import logging
+from datetime import datetime
+
+# ============================================================================
+# Log Capture Setup - Capture all logs for downloadable output
+# ============================================================================
+# Create a StringIO buffer to capture log messages during transcription
+# This allows users to download logs for debugging and review
+# ============================================================================
+
+class LogCapture:
+    """Captures stdout/stderr and logging output for download."""
+    
+    def __init__(self):
+        self.log_buffer = io.StringIO()
+        self.original_stdout = None
+        self.original_stderr = None
+        self.handler = None
+        
+    def start(self):
+        """Start capturing logs."""
+        import sys
+        self.log_buffer = io.StringIO()  # Reset buffer
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        
+        # Create a TeeWriter that writes to both original stream and buffer
+        class TeeWriter:
+            def __init__(self, original, buffer):
+                self.original = original
+                self.buffer = buffer
+            def write(self, text):
+                self.original.write(text)
+                self.buffer.write(text)
+            def flush(self):
+                self.original.flush()
+                
+        sys.stdout = TeeWriter(self.original_stdout, self.log_buffer)
+        sys.stderr = TeeWriter(self.original_stderr, self.log_buffer)
+        
+        # Also capture logging module output
+        self.handler = logging.StreamHandler(self.log_buffer)
+        self.handler.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(self.handler)
+        
+    def stop(self):
+        """Stop capturing logs and return captured content."""
+        import sys
+        if self.original_stdout:
+            sys.stdout = self.original_stdout
+        if self.original_stderr:
+            sys.stderr = self.original_stderr
+        if self.handler:
+            logging.getLogger().removeHandler(self.handler)
+        return self.log_buffer.getvalue()
+    
+    def get_logs(self):
+        """Get current captured logs without stopping."""
+        return self.log_buffer.getvalue()
+
+# Global log capture instance
+log_capture = LogCapture()
 
 # Global model cache to avoid reloading
 models_cache = {}
+
+# ============================================================================
+# ITN (Inverse Text Normalization) Support
+# ============================================================================
+# Converts spoken numbers to digits: "twenty twenty two" → "2022"
+# Uses nemo_text_processing if available, with graceful fallback
+# ============================================================================
+
+# Try to import ITN - will be None if not installed
+ITN_NORMALIZER = None
+ITN_AVAILABLE = False
+
+try:
+    from nemo_text_processing.inverse_text_normalization import InverseNormalizer
+    # Initialize ITN for English (lazy - will init on first use)
+    ITN_AVAILABLE = True
+    print("✅ ITN (Inverse Text Normalization) available - numbers will be converted to digits")
+except ImportError:
+    print("ℹ️  ITN not installed - numbers will remain as words")
+    print("   To enable: pip install nemo_text_processing")
+
+
+def _get_itn_normalizer(language="en"):
+    """Get or create ITN normalizer (lazy initialization).
+    
+    Lazy initialization prevents slow startup when ITN is available
+    but user may not always need it.
+    
+    Args:
+        language: Language code (default: "en" for English)
+        
+    Returns:
+        InverseNormalizer instance or None if unavailable
+    """
+    global ITN_NORMALIZER
+    
+    if not ITN_AVAILABLE:
+        return None
+        
+    if ITN_NORMALIZER is None:
+        try:
+            from nemo_text_processing.inverse_text_normalization import InverseNormalizer
+            print(f"   🔧 Initializing ITN normalizer for '{language}'...")
+            ITN_NORMALIZER = InverseNormalizer(lang=language, cache_dir=str(CACHE_DIR / "itn"))
+            print(f"   ✅ ITN normalizer ready")
+        except Exception as e:
+            print(f"   ⚠️ Failed to initialize ITN: {e}")
+            return None
+            
+    return ITN_NORMALIZER
+
+
+def apply_inverse_text_normalization(text, language="en"):
+    """Apply Inverse Text Normalization to convert spoken numbers to digits.
+    
+    Converts:
+    - "twenty twenty two" → "2022"
+    - "one hundred dollars" → "$100"
+    - "five point five percent" → "5.5%"
+    
+    For long text, splits into sentences first to avoid the "input too long" warning
+    from nemo_text_processing, then normalizes each sentence and joins with single space.
+    
+    Args:
+        text: Input transcription text
+        language: Language code for ITN (default: "en")
+        
+    Returns:
+        Text with numbers converted to digits, or original text if ITN unavailable
+    """
+    normalizer = _get_itn_normalizer(language)
+    
+    if normalizer is None:
+        return text
+    
+    if not text or not text.strip():
+        return text
+        
+    try:
+        # Split long text into sentences to avoid "input too long" warning
+        # The normalizer's split_text_into_sentences() handles this properly
+        sentences = normalizer.split_text_into_sentences(text)
+        
+        if not sentences:
+            return text
+        
+        # Normalize each sentence separately
+        normalized_sentences = normalizer.normalize_list(sentences, verbose=False)
+        
+        # Join with single space
+        return ' '.join(normalized_sentences)
+    except Exception as e:
+        print(f"   ⚠️ ITN normalization failed: {e}")
+        # Fallback: try normalizing as single text (may show warning but still work)
+        try:
+            return normalizer.normalize(text, verbose=False)
+        except:
+            return text
+
+
+# ============================================================================
+# SRT/CSV/TXT Output Format Conversion Utilities
+# ============================================================================
+# Converts transcription with timestamps into various output formats:
+# - SRT: SubRip subtitle format (for video subtitles)
+# - CSV: Comma-separated values (for spreadsheets/analysis)
+# - TXT: Plain text with timestamps (human-readable)
+# ============================================================================
+
+def _format_srt_timestamp(seconds):
+    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm).
+    
+    Args:
+        seconds: Time in seconds (float)
+        
+    Returns:
+        Formatted timestamp string "HH:MM:SS,mmm"
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    milliseconds = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+def _group_words_into_segments(timestamps, words_per_segment=8, max_duration=5.0):
+    """Group word-level timestamps into subtitle segments.
+    
+    SRT subtitles work best with phrase-length segments rather than
+    individual words. This groups words into readable chunks.
+    
+    Args:
+        timestamps: List of word timestamp dicts with 'start', 'end', 'word' keys
+        words_per_segment: Target words per subtitle segment (default: 8)
+        max_duration: Maximum segment duration in seconds (default: 5.0)
+        
+    Returns:
+        List of segment dicts with 'start', 'end', 'text' keys
+    """
+    if not timestamps:
+        return []
+        
+    segments = []
+    current_segment = {
+        'start': timestamps[0].get('start', 0.0),
+        'end': timestamps[0].get('end', 0.0),
+        'words': []
+    }
+    
+    for stamp in timestamps:
+        word = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
+        start = stamp.get('start', 0.0)
+        end = stamp.get('end', 0.0)
+        
+        # Check if we should start a new segment
+        segment_duration = end - current_segment['start']
+        word_count = len(current_segment['words'])
+        
+        if word_count >= words_per_segment or segment_duration > max_duration:
+            # Finalize current segment
+            if current_segment['words']:
+                current_segment['text'] = ' '.join(current_segment['words'])
+                segments.append({
+                    'start': current_segment['start'],
+                    'end': current_segment['end'],
+                    'text': current_segment['text']
+                })
+            # Start new segment
+            current_segment = {
+                'start': start,
+                'end': end,
+                'words': [word]
+            }
+        else:
+            # Add word to current segment
+            current_segment['words'].append(word)
+            current_segment['end'] = end
+    
+    # Don't forget the last segment
+    if current_segment['words']:
+        current_segment['text'] = ' '.join(current_segment['words'])
+        segments.append({
+            'start': current_segment['start'],
+            'end': current_segment['end'],
+            'text': current_segment['text']
+        })
+    
+    return segments
+
+
+def format_as_srt(transcription, timestamps, timestamp_level='word'):
+    """Format transcription as SRT subtitle file content.
+    
+    Args:
+        transcription: Full transcription text (used if no timestamps)
+        timestamps: List of timestamp dicts from extract_timestamps()
+        timestamp_level: 'word', 'segment', or 'none'
+        
+    Returns:
+        SRT formatted string
+    """
+    if not timestamps or timestamp_level == 'none':
+        # No timestamps - create single subtitle for entire transcription
+        # Estimate duration from text length (roughly 150 words per minute)
+        word_count = len(transcription.split())
+        estimated_duration = max(5.0, word_count / 2.5)  # ~150 words/min = 2.5 words/sec
+        
+        return (
+            f"1\n"
+            f"00:00:00,000 --> {_format_srt_timestamp(estimated_duration)}\n"
+            f"{transcription}\n"
+        )
+    
+    # Group words into readable subtitle segments
+    if timestamp_level == 'word':
+        segments = _group_words_into_segments(timestamps)
+    else:
+        # Segment-level timestamps are already grouped
+        segments = []
+        for stamp in timestamps:
+            text = stamp.get('segment', stamp.get('word', stamp.get('char', '')))
+            segments.append({
+                'start': stamp.get('start', 0.0),
+                'end': stamp.get('end', 0.0),
+                'text': text
+            })
+    
+    # Build SRT content
+    srt_lines = []
+    for i, seg in enumerate(segments, 1):
+        start_ts = _format_srt_timestamp(seg['start'])
+        end_ts = _format_srt_timestamp(seg['end'])
+        srt_lines.append(f"{i}")
+        srt_lines.append(f"{start_ts} --> {end_ts}")
+        srt_lines.append(seg['text'])
+        srt_lines.append("")  # Blank line between entries
+    
+    return '\n'.join(srt_lines)
+
+
+def format_as_csv(transcription, timestamps, timestamp_level='word'):
+    """Format transcription as CSV content.
+    
+    CSV columns: start_time, end_time, duration, text
+    
+    Args:
+        transcription: Full transcription text (used if no timestamps)
+        timestamps: List of timestamp dicts from extract_timestamps()
+        timestamp_level: 'word', 'segment', or 'none'
+        
+    Returns:
+        CSV formatted string with header row
+    """
+    csv_lines = ["start_time,end_time,duration,text"]
+    
+    if not timestamps or timestamp_level == 'none':
+        # No timestamps - create single row for entire transcription
+        word_count = len(transcription.split())
+        estimated_duration = max(5.0, word_count / 2.5)
+        
+        # Escape quotes in text for CSV
+        escaped_text = transcription.replace('"', '""')
+        csv_lines.append(f'0.000,{estimated_duration:.3f},{estimated_duration:.3f},"{escaped_text}"')
+        return '\n'.join(csv_lines)
+    
+    # Output each timestamp entry
+    for stamp in timestamps:
+        start = stamp.get('start', 0.0)
+        end = stamp.get('end', 0.0)
+        duration = end - start
+        text = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
+        
+        # Escape quotes in text for CSV
+        escaped_text = text.replace('"', '""')
+        csv_lines.append(f'{start:.3f},{end:.3f},{duration:.3f},"{escaped_text}"')
+    
+    return '\n'.join(csv_lines)
+
+
+def format_as_txt_with_timestamps(transcription, timestamps, timestamp_level='word'):
+    """Format transcription as plain text with inline timestamps.
+    
+    Format: [HH:MM:SS] text text text [HH:MM:SS] text text...
+    
+    Args:
+        transcription: Full transcription text (used if no timestamps)
+        timestamps: List of timestamp dicts from extract_timestamps()
+        timestamp_level: 'word', 'segment', or 'none'
+        
+    Returns:
+        Plain text with timestamps
+    """
+    if not timestamps or timestamp_level == 'none':
+        return f"[00:00:00] {transcription}"
+    
+    # Group into segments for readability
+    if timestamp_level == 'word':
+        segments = _group_words_into_segments(timestamps, words_per_segment=12, max_duration=8.0)
+    else:
+        segments = []
+        for stamp in timestamps:
+            text = stamp.get('segment', stamp.get('word', stamp.get('char', '')))
+            segments.append({
+                'start': stamp.get('start', 0.0),
+                'text': text
+            })
+    
+    # Build text with timestamps
+    txt_lines = []
+    for seg in segments:
+        # Convert to HH:MM:SS format
+        seconds = seg['start']
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        timestamp = f"[{hours:02d}:{minutes:02d}:{secs:02d}]"
+        txt_lines.append(f"{timestamp} {seg['text']}")
+    
+    return '\n'.join(txt_lines)
+
 
 # Create cache subdirectory for Gradio uploads
 # This prevents manifest.json file locking issues during NeMo inference
@@ -525,21 +909,27 @@ def _load_audio_to_numpy(file_path, target_sr=16000):
 # is processed at once without internal chunking. For long audio files (e.g.,
 # 30+ minutes), this can cause CUDA OOM errors even on 12GB+ VRAM GPUs.
 #
-# Solution: Split long audio into manageable chunks (30 seconds default),
+# Solution: Split long audio into manageable chunks (60 seconds default),
 # transcribe each chunk separately, and merge the results.
 #
 # The 2-second context overlap ensures words at chunk boundaries are
 # transcribed with proper acoustic context, preventing word cutoff issues.
 # ============================================================================
 
-# Chunking configuration constants
-# These values are safe for 12GB VRAM with 1.1B parameter models
-CHUNK_DURATION_SEC = 30      # Duration of each transcription chunk
-CHUNK_OVERLAP_SEC = 2        # Context overlap on each side of chunk
-LONG_AUDIO_THRESHOLD_SEC = 60  # Audio longer than this triggers chunking
+# Chunking configuration constants (defaults - can be overridden via UI)
+# Increased to 60s to better utilize available VRAM (6-7GB typical usage)
+DEFAULT_CHUNK_DURATION_SEC = 60   # Duration of each transcription chunk
+CHUNK_OVERLAP_SEC = 2             # Context overlap on each side of chunk
+DEFAULT_LONG_AUDIO_THRESHOLD_SEC = 90  # Audio longer than this triggers chunking
+
+# Runtime configuration (can be changed via Gradio UI)
+# These are module-level so they can be modified by the UI
+chunk_duration_sec = DEFAULT_CHUNK_DURATION_SEC
+long_audio_threshold_sec = DEFAULT_LONG_AUDIO_THRESHOLD_SEC
 
 
-def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cuda=True):
+def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cuda=True,
+                                    chunk_size_override=None):
     """Transcribe long audio by processing in chunks to avoid VRAM OOM.
     
     This function splits long audio into manageable chunks with overlap,
@@ -548,9 +938,9 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
     occur when passing long audio arrays directly to model.transcribe().
     
     Algorithm:
-    1. Split audio into 30-second chunks with 2-second context on each side
-    2. Each chunk's "buffer" is: [2s left context | 30s chunk | 2s right context]
-    3. Transcribe each 34-second buffer separately
+    1. Split audio into 60-second chunks with 2-second context on each side
+    2. Each chunk's "buffer" is: [2s left context | 60s chunk | 2s right context]
+    3. Transcribe each 64-second buffer separately
     4. Clear VRAM between chunks with torch.cuda.empty_cache()
     5. Concatenate transcriptions (context provides word boundary handling)
     
@@ -559,23 +949,29 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
         audio_array: numpy array of audio samples (16kHz mono)
         sample_rate: Sample rate in Hz (default 16000)
         use_cuda: Whether to use CUDA with mixed precision
+        chunk_size_override: Override chunk duration in seconds (None = use global setting)
     
     Returns:
-        Full transcription text as string
+        Tuple of (full_transcription_text, chunk_timestamps) where chunk_timestamps
+        is a list of (start_time, end_time, text) tuples for reconstructing timestamps
     """
     import gc
     import numpy as np
     
-    chunk_samples = int(CHUNK_DURATION_SEC * sample_rate)
+    # Use override if provided, otherwise use global setting
+    effective_chunk_duration = chunk_size_override if chunk_size_override else chunk_duration_sec
+    
+    chunk_samples = int(effective_chunk_duration * sample_rate)
     context_samples = int(CHUNK_OVERLAP_SEC * sample_rate)
     step_samples = chunk_samples  # Non-overlapping step (context handles overlap)
     
     total_samples = len(audio_array)
     total_duration = total_samples / sample_rate
     
-    print(f"   ⚡ Chunked transcription: {total_duration:.1f}s audio → {CHUNK_DURATION_SEC}s chunks")
+    print(f"   ⚡ Chunked transcription: {total_duration:.1f}s audio → {effective_chunk_duration}s chunks")
     
     transcriptions = []
+    chunk_timestamps = []  # Store (start_time, end_time, text) for each chunk
     position = 0
     chunk_num = 0
     
@@ -629,6 +1025,12 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
                 
                 if chunk_text.strip():
                     transcriptions.append(chunk_text.strip())
+                    # Store chunk timing for timestamp reconstruction
+                    chunk_timestamps.append({
+                        'start': chunk_start_time,
+                        'end': chunk_end_time,
+                        'text': chunk_text.strip()
+                    })
                     
         except Exception as e:
             print(f"   ⚠️ Chunk {chunk_num} failed: {type(e).__name__}: {e}")
@@ -651,20 +1053,21 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
     while '  ' in full_transcription:
         full_transcription = full_transcription.replace('  ', ' ')
     
-    return full_transcription.strip()
+    return full_transcription.strip(), chunk_timestamps
 
 
-def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3):
+def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3,
+                           chunk_size_override=None):
     """Transcribe using tensor-based input with chunking for long audio.
     
     CRITICAL FIXES:
     1. Loads audio into numpy arrays to bypass NeMo's Lhotse dataloader
        (prevents manifest.json file locking issues on Windows - WinError 32)
-    2. Chunks long audio (>60s) to prevent CUDA OOM errors
+    2. Chunks long audio (>90s) to prevent CUDA OOM errors
        (NeMo processes entire numpy array at once without internal chunking)
     
-    For audio longer than 60 seconds, the audio is automatically split into
-    30-second chunks with 2-second context overlap and transcribed separately
+    For audio longer than the threshold, the audio is automatically split into
+    chunks with 2-second context overlap and transcribed separately
     to stay within VRAM limits.
     
     Args:
@@ -673,17 +1076,24 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
         batch_size: Batch size for transcription (used for short audio batching)
         use_cuda: Whether to use CUDA with mixed precision
         max_retries: Maximum retry attempts for any errors
+        chunk_size_override: Override chunk duration in seconds (None = use global setting)
         
     Returns:
-        Transcription result from model.transcribe() or list of Hypothesis-like objects
+        Tuple of (results, chunk_timestamps_map) where:
+        - results: Transcription result from model.transcribe() or list of Hypothesis-like objects
+        - chunk_timestamps_map: Dict mapping file index to chunk timestamps (for SRT/CSV export)
         
     Raises:
         Exception: For transcription errors
     """
     import gc
     
+    # Use global threshold or calculate based on chunk size
+    effective_threshold = long_audio_threshold_sec
+    
     base_delay = 0.5  # 500ms base delay
     last_error = None
+    chunk_timestamps_map = {}  # Maps file index to chunk timestamps
     
     # Load all audio files into numpy arrays FIRST
     # This completely bypasses NeMo's file-based dataloader
@@ -701,7 +1111,7 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
             raise
     
     # Check if any audio needs chunking (longer than threshold)
-    needs_chunking = any(duration > LONG_AUDIO_THRESHOLD_SEC for _, duration in audio_data)
+    needs_chunking = any(duration > effective_threshold for _, duration in audio_data)
     
     if needs_chunking:
         # ====================================================================
@@ -710,20 +1120,24 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
         # Process each file individually, using chunking for long files
         # This prevents OOM errors by never loading too much into VRAM at once
         # ====================================================================
-        print(f"   ⚡ Long audio detected (>{LONG_AUDIO_THRESHOLD_SEC}s) - using chunked transcription")
+        print(f"   ⚡ Long audio detected (>{effective_threshold}s) - using chunked transcription")
         
         results = []
         for i, (audio_np, duration) in enumerate(audio_data):
-            if duration > LONG_AUDIO_THRESHOLD_SEC:
+            if duration > effective_threshold:
                 # Use chunked transcription for long audio
-                text = _transcribe_long_audio_chunked(
-                    model, audio_np, sample_rate=16000, use_cuda=use_cuda
+                text, chunk_ts = _transcribe_long_audio_chunked(
+                    model, audio_np, sample_rate=16000, use_cuda=use_cuda,
+                    chunk_size_override=chunk_size_override
                 )
+                # Store chunk timestamps for this file
+                chunk_timestamps_map[i] = chunk_ts
                 # Wrap in Hypothesis-like object for API compatibility
                 class _Hypothesis:
-                    def __init__(self, text):
+                    def __init__(self, text, chunk_timestamps=None):
                         self.text = text
-                results.append(_Hypothesis(text))
+                        self.chunk_timestamps = chunk_timestamps  # Store for later use
+                results.append(_Hypothesis(text, chunk_ts))
             else:
                 # Short audio within this batch - transcribe normally
                 if use_cuda and torch.cuda.is_available():
@@ -749,7 +1163,7 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
                     torch.cuda.empty_cache()
                 gc.collect()
         
-        return results
+        return results, chunk_timestamps_map
     
     # ========================================================================
     # STANDARD TRANSCRIPTION PATH (for short audio)
@@ -781,8 +1195,8 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
                     verbose=True
                 )
             
-            # Success!
-            return result
+            # Success! Return result with empty chunk_timestamps_map (short audio)
+            return result, chunk_timestamps_map
             
         except PermissionError as e:
             last_error = e
@@ -1663,26 +2077,67 @@ def load_model(model_name, show_progress=False):
     return models_cache[model_name]
 
 
+def _save_logs(logs, prefix="transcription"):
+    """Save captured logs to a file for download.
+    
+    Args:
+        logs: Log content string
+        prefix: Filename prefix (e.g., "transcription", "error")
+        
+    Returns:
+        Path to saved log file, or None if save failed
+    """
+    if not logs:
+        return None
+        
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = f"{prefix}_log_{timestamp}.txt"
+        
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(f"Transcription Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(logs)
+            
+        return log_file
+    except Exception as e:
+        print(f"⚠️ Failed to save log file: {e}")
+        return None
 
 
-def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps):
+def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps,
+                     output_format="txt", apply_itn=True, chunk_size=120, batch_size=1):
     """
     Main transcription function with batch processing, video support, and GPU optimization
     
     Args:
         audio_files: Path to uploaded audio/video file OR list of paths for batch processing
-        model_choice: "Parakeet-TDT-0.6B v2 (Fast)" or "Canary-Qwen-2.5B (Accurate)"
-        save_to_file: Boolean - whether to save .txt file
+        model_choice: Model selection from radio button
+        save_to_file: Boolean - whether to save output file
         include_timestamps: Boolean - whether to generate timestamps
+        output_format: Output format - "txt", "srt", or "csv" (primary format for UI display)
+        apply_itn: Boolean - whether to apply Inverse Text Normalization (numbers as digits)
+        chunk_size: Chunk size in seconds for long audio (30-300)
+        batch_size: Batch size for processing (1-8, higher uses more VRAM)
     
     Returns:
-        status_message: HTML formatted status
-        transcription_text: The actual transcription(s)
-        download_file: Path to saved file (if save_to_file=True)
+        Tuple of (status_message, transcription_text, txt_file, srt_file, csv_file, log_file)
     """
     
+    # Start capturing logs
+    log_capture.start()
+    print(f"\n{'='*60}")
+    print(f"🎙️ Transcription Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+    
+    # Update global chunk settings
+    global chunk_duration_sec, long_audio_threshold_sec
+    chunk_duration_sec = chunk_size
+    long_audio_threshold_sec = chunk_size + 30  # Threshold slightly above chunk size
+    
     if audio_files is None:
-        return "⚠️ Please upload an audio or video file first", "", None
+        logs = log_capture.stop()
+        return "⚠️ Please upload an audio or video file first", "", None, None, None, None
     
     try:
         import librosa
@@ -1691,7 +2146,8 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         # Gradio gr.File with file_count="multiple" returns list of file objects
         # Each file object has a .name attribute with the path
         if audio_files is None or (isinstance(audio_files, list) and len(audio_files) == 0):
-            return "⚠️ Please upload an audio or video file first", "", None
+            logs = log_capture.stop()
+            return "⚠️ Please upload an audio or video file first", "", None, None, None, None
         
         # Convert file objects to paths
         if isinstance(audio_files, str):
@@ -1711,6 +2167,14 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         
         is_batch = len(file_list) > 1
         
+        # Log settings
+        print(f"📁 Files: {len(file_list)}")
+        print(f"📊 Model: {model_choice}")
+        print(f"📝 Output format: {output_format.upper()}")
+        print(f"🔢 ITN (numbers to digits): {'Enabled' if apply_itn else 'Disabled'}")
+        print(f"⏱️ Timestamps: {'Enabled' if include_timestamps else 'Disabled'}")
+        print(f"📦 Chunk size: {chunk_size}s")
+        
         # Determine which model to use - extract key from choice text
         model_key = get_model_key_from_choice(model_choice)
         
@@ -1724,6 +2188,8 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         except PermissionError as e:
             # File lock or permission error - display in Gradio status with Windows-specific diagnostics
             error_msg = str(e)
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
             if "WinError 32" in error_msg or "being used by another process" in error_msg:
                 # Windows-specific file lock
                 detailed_error = (
@@ -1749,23 +2215,31 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f"**Error Details:** {error_msg}"
                 )
             print(f"GRADIO_ERROR (PermissionError): {detailed_error}")
-            return detailed_error, "", None
+            return detailed_error, "", None, None, None, log_file
         except ConnectionError as e:
             error_msg = str(e)
             print(f"GRADIO_ERROR (ConnectionError): {error_msg}")
-            return f"### ❌ Network Error\n\n{error_msg}", "", None
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
+            return f"### ❌ Network Error\n\n{error_msg}", "", None, None, None, log_file
         except FileNotFoundError as e:
             error_msg = str(e)
             print(f"GRADIO_ERROR (FileNotFoundError): {error_msg}")
-            return f"### ❌ File Not Found\n\n{error_msg}", "", None
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
+            return f"### ❌ File Not Found\n\n{error_msg}", "", None, None, None, log_file
         except OSError as e:
             error_msg = str(e)
             print(f"GRADIO_ERROR (OSError): {error_msg}")
-            return f"### ❌ File System Error\n\n{error_msg}", "", None
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
+            return f"### ❌ File System Error\n\n{error_msg}", "", None, None, None, log_file
         except RuntimeError as e:
             error_msg = str(e)
             print(f"GRADIO_ERROR (RuntimeError): {error_msg}")
-            return f"### ❌ Runtime Error\n\n{error_msg}", "", None
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
+            return f"### ❌ Runtime Error\n\n{error_msg}", "", None, None, None, log_file
         except Exception as e:
             error_msg = (
                 f"{'='*80}\n"
@@ -1777,7 +2251,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 f"{'='*80}"
             )
             print(f"GRADIO_ERROR (Unexpected): {error_msg}")
-            return f"### ❌ Unexpected Error\n\n{error_msg}", "", None
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
+            return f"### ❌ Unexpected Error\n\n{error_msg}", "", None, None, None, log_file
         
         load_time = time.time() - start_time
         
@@ -1802,7 +2278,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 cached_file_path = copy_gradio_file_to_cache(file_path)
                 print(f"📁 Using cached file: {os.path.basename(cached_file_path)}")
             except OSError as e:
-                return f"❌ Failed to copy uploaded file to cache.\n\nError: {str(e)}", "", None
+                logs = log_capture.stop()
+                log_file = _save_logs(logs, "error")
+                return f"❌ Failed to copy uploaded file to cache.\n\nError: {str(e)}", "", None, None, None, log_file
             
             file_ext = os.path.splitext(cached_file_path)[1].lower()
             is_video = file_ext in VIDEO_EXTENSIONS
@@ -1832,12 +2310,16 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     else:
                         # Final retry failed - handle based on file type
                         if is_video:
-                            return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
+                            logs = log_capture.stop()
+                            log_file = _save_logs(logs, "error")
+                            return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None, None, None, log_file
                         raise
                 except Exception as e:
                     # Other errors (e.g., video has no audio track)
                     if is_video:
-                        return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None
+                        logs = log_capture.stop()
+                        log_file = _save_logs(logs, "error")
+                        return f"❌ Video file '{os.path.basename(cached_file_path)}' appears to have no audio track or cannot be processed.\n\nError: {str(e)}", "", None, None, None, log_file
                     raise
             
             total_duration += duration
@@ -1875,18 +2357,21 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         inference_start = time.time()
         
         try:
-            result = _transcribe_with_retry(
+            result, chunk_timestamps_map = _transcribe_with_retry(
                 model=model,
                 files=processed_files,
                 batch_size=batch_size,
                 use_cuda=torch.cuda.is_available(),
-                max_retries=3
+                max_retries=3,
+                chunk_size_override=chunk_size
             )
                 
         except PermissionError as e:
             # All retries exhausted - show user-friendly error
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
             
             if is_file_lock:
                 return (
@@ -1899,7 +2384,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f"4. Run as Administrator\n\n"
                     f"**Technical Details:**\n"
                     f"```\n{error_str}\n```",
-                    "", None
+                    "", None, log_file
                 )
             else:
                 # Different PermissionError
@@ -1908,20 +2393,22 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f"A permission error occurred during transcription.\n\n"
                     f"**Technical Details:**\n"
                     f"```\n{error_str}\n```",
-                    "", None
+                    "", None, log_file
                 )
                     
         except Exception as e:
             # Other exceptions during transcription
             error_msg = str(e)
             print(f"❌ Transcription error: {type(e).__name__}: {error_msg}")
+            logs = log_capture.stop()
+            log_file = _save_logs(logs, "error")
             return (
                 f"### ❌ Transcription Error\n\n"
                 f"An error occurred during transcription.\n\n"
                 f"**Error Type:** {type(e).__name__}\n\n"
                 f"**Technical Details:**\n"
                 f"```\n{error_msg}\n```",
-                "", None
+                "", None, log_file
             )
         
         inference_time = time.time() - inference_start
@@ -1938,6 +2425,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         # Calculate real-time factor
         rtfx = total_duration / inference_time if inference_time > 0 else 0
         
+        print(f"\n✅ Transcription complete!")
+        print(f"   Duration: {total_duration:.1f}s audio in {inference_time:.1f}s ({rtfx:.1f}× real-time)")
+        
         # ========================================================================
         # Output Validation (Pattern 2: HuggingFace Modernization)
         # ========================================================================
@@ -1951,6 +2441,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             # Batch processing with per-file validation (Pattern 5)
             # ================================================================
             all_transcriptions = []
+            all_timestamps = []  # Store timestamps for each file
             per_file_stats = []
             per_file_errors = []
             
@@ -1959,7 +2450,19 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 success, transcription, error_msg = validate_transcription_result(result, i)
                 
                 if success:
+                    # Apply ITN if enabled
+                    if apply_itn:
+                        transcription = apply_inverse_text_normalization(transcription)
+                    
                     all_transcriptions.append(transcription)
+                    
+                    # Get timestamps - use chunk timestamps if available, else model timestamps
+                    if i in chunk_timestamps_map:
+                        timestamps = chunk_timestamps_map[i]
+                        timestamp_level = 'segment'  # Chunk timestamps are segment-level
+                    else:
+                        timestamps, timestamp_level = extract_timestamps(res, include_timestamps)
+                    all_timestamps.append((timestamps, timestamp_level))
                     
                     file_duration = info["duration"]
                     file_mins = int(file_duration // 60)
@@ -1974,6 +2477,7 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 else:
                     # Record error for this file
                     all_transcriptions.append(f"[Transcription failed: {error_msg}]")
+                    all_timestamps.append(([], 'none'))
                     per_file_errors.append(f"**{i+1}. {info['name']}**: {error_msg}")
                     per_file_stats.append(
                         f"**{i+1}. {info['name']}** ❌ Failed\n"
@@ -1995,6 +2499,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     + "\n".join(per_file_errors)
                 )
             
+            # ITN status
+            itn_status = "- **ITN (Numbers to Digits)**: " + ("✅ Applied" if apply_itn and ITN_AVAILABLE else ("⚠️ Not installed" if apply_itn else "Disabled"))
+            
             status = f"""
 ### ✅ Batch Transcription Complete!
 
@@ -2005,10 +2512,11 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 - **Total Audio Duration**: {total_mins}m {total_secs}s
 - **Processing Time**: {total_time:.2f} seconds
 - **Inference Time**: {inference_time:.2f} seconds
-- **Batch Size Used**: {batch_size}
+- **Chunk Size**: {chunk_size}s
 - **Real-Time Factor**: {rtfx:.1f}× (processed {rtfx:.1f}× faster than real-time)
 - **VRAM Used**: {vram_used:.2f} GB
 - **Total Words**: {total_words}
+{itn_status}
 
 **📁 Per-File Statistics:**
 {chr(10).join(per_file_stats)}{error_summary}
@@ -2024,6 +2532,8 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                 combined_transcription += trans + "\n"
             
             transcription_output = combined_transcription
+            timestamps = []  # Will be populated later for single-file
+            timestamp_level = 'none'
             
         else:
             # ================================================================
@@ -2034,10 +2544,17 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             success, transcription, error_msg = validate_transcription_result(result, 0)
             
             if not success:
+                logs = log_capture.stop()
+                log_file = _save_logs(logs, "error")
                 return (
                     format_error_message('output_validation_failed', error_msg),
-                    "", None
+                    "", None, log_file
                 )
+            
+            # Apply ITN if enabled
+            if apply_itn:
+                print(f"   🔢 Applying Inverse Text Normalization...")
+                transcription = apply_inverse_text_normalization(transcription)
             
             info = file_info[0]
             
@@ -2045,36 +2562,44 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             seconds = int(info["duration"] % 60)
             
             # ================================================================
-            # Defensive Timestamp Extraction (Pattern 4)
+            # Timestamp Extraction - Use chunk timestamps if available
             # ================================================================
-            # Extract timestamps with word → segment → none fallback
             timestamp_text = ""
             timestamp_level = 'none'
+            timestamps = []
             
-            if include_timestamps:
+            # Check if we have chunk timestamps (from long audio chunking)
+            if 0 in chunk_timestamps_map and chunk_timestamps_map[0]:
+                timestamps = chunk_timestamps_map[0]
+                timestamp_level = 'segment'  # Chunk timestamps are segment-level
+                print(f"   ⏱️ Using chunk-based timestamps ({len(timestamps)} segments)")
+            elif include_timestamps:
                 timestamps, timestamp_level = extract_timestamps(result[0], include_timestamps)
+            
+            if timestamps and timestamp_level in ('word', 'segment', 'char'):
+                level_name = "Word-Level" if timestamp_level == 'word' else (
+                    "Segment-Level" if timestamp_level == 'segment' else "Character-Level"
+                )
+                timestamp_text = f"\n\n### {level_name} Timestamps (first 50):\n\n"
                 
-                if timestamps and timestamp_level in ('word', 'segment', 'char'):
-                    level_name = "Word-Level" if timestamp_level == 'word' else (
-                        "Segment-Level" if timestamp_level == 'segment' else "Character-Level"
-                    )
-                    timestamp_text = f"\n\n### {level_name} Timestamps (first 50):\n\n"
-                    
-                    for i, stamp in enumerate(timestamps[:50]):
-                        # Each stamp is a dict with 'start', 'end', 'word'/'segment' keys
-                        start = stamp.get('start', 0.0)
-                        end = stamp.get('end', 0.0)
-                        # Get the text content based on timestamp level
-                        text_content = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
-                        timestamp_text += f"`{start:.2f}s - {end:.2f}s` → **{text_content}**\n\n"
-                    
-                    if len(timestamps) > 50:
-                        timestamp_text += f"\n*...and {len(timestamps) - 50} more*"
+                for i, stamp in enumerate(timestamps[:50]):
+                    # Each stamp is a dict with 'start', 'end', 'word'/'segment'/'text' keys
+                    start = stamp.get('start', 0.0)
+                    end = stamp.get('end', 0.0)
+                    # Get the text content based on timestamp level
+                    text_content = stamp.get('text', stamp.get('word', stamp.get('segment', stamp.get('char', ''))))
+                    timestamp_text += f"`{start:.2f}s - {end:.2f}s` → **{text_content}**\n\n"
+                
+                if len(timestamps) > 50:
+                    timestamp_text += f"\n*...and {len(timestamps) - 50} more*"
             
             file_type_msg = "🎬 Video file detected - audio extracted automatically\n" if info["is_video"] else ""
             
             # Add timestamp status indicator (Pattern 7)
             timestamp_status = format_timestamp_status(timestamp_level, include_timestamps)
+            
+            # ITN status
+            itn_status = "- **ITN (Numbers to Digits)**: " + ("✅ Applied" if apply_itn and ITN_AVAILABLE else ("⚠️ Not installed" if apply_itn else "Disabled"))
             
             status = f"""
 ### ✅ Transcription Complete!
@@ -2086,38 +2611,54 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 - **Processing Time**: {total_time:.2f} seconds
 - **Inference Time**: {inference_time:.2f} seconds
 - **Model Load Time**: {load_time:.2f} seconds
-- **Batch Size Used**: {batch_size}
+- **Chunk Size**: {chunk_size}s
 - **Real-Time Factor**: {rtfx:.1f}× (processed {rtfx:.1f}× faster than real-time)
 - **VRAM Used**: {vram_used:.2f} GB
 - **Transcription Length**: {len(transcription)} characters ({len(transcription.split())} words)
+{itn_status}
 {timestamp_status}
 
 ---
 """
-            transcription_output = transcription + timestamp_text
-        
-        # Save to file if requested
-        output_file = None
-        if save_to_file:
-            if is_batch:
-                output_file = f"batch_transcription_{len(file_list)}_files.txt"
+            # Format transcription output for UI display with timestamps
+            if timestamps and include_timestamps:
+                transcription_output = format_as_txt_with_timestamps(transcription, timestamps, timestamp_level)
             else:
-                base_name = os.path.splitext(os.path.basename(file_list[0]))[0]
-                output_file = f"{base_name}_transcription.txt"
+                transcription_output = transcription
+        
+        # Generate all 3 file formats for download
+        txt_file = None
+        srt_file = None  
+        csv_file = None
+        
+        if save_to_file:
+            base_name = os.path.splitext(os.path.basename(file_list[0]))[0]
             
-            with open(output_file, "w", encoding="utf-8") as f:
+            if is_batch:
+                base_filename = f"batch_transcription_{len(file_list)}_files"
+            else:
+                base_filename = f"{base_name}_transcription"
+            
+            # Generate TXT file
+            txt_file = f"{base_filename}.txt"
+            with open(txt_file, "w", encoding="utf-8") as f:
                 if is_batch:
                     f.write(f"Batch Transcription - {len(file_list)} files\n")
                     f.write(f"Model: {model_choice}\n")
                     f.write(f"Total Duration: {int(total_duration // 60)}m {int(total_duration % 60)}s\n")
                     f.write(f"Processing Time: {total_time:.2f}s\n")
+                    f.write(f"ITN Applied: {'Yes' if apply_itn and ITN_AVAILABLE else 'No'}\n")
                     f.write(f"\n{SEPARATOR}\n")
                     
                     for i, (info, trans) in enumerate(zip(file_info, all_transcriptions)):
                         f.write(f"\nFILE {i+1}: {info['name']}\n")
                         f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
                         f.write(f"{SEPARATOR}\n\n")
-                        f.write(trans)
+                        ts, ts_level = all_timestamps[i] if i < len(all_timestamps) else ([], 'none')
+                        if ts and include_timestamps:
+                            f.write(format_as_txt_with_timestamps(trans, ts, ts_level))
+                        else:
+                            f.write(trans)
                         f.write("\n")
                 else:
                     info = file_info[0]
@@ -2125,26 +2666,73 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
                     f.write(f"Model: {model_choice}\n")
                     f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
                     f.write(f"Processing Time: {total_time:.2f}s\n")
+                    f.write(f"ITN Applied: {'Yes' if apply_itn and ITN_AVAILABLE else 'No'}\n")
                     f.write(f"\n{SEPARATOR}\n")
                     f.write(f"TRANSCRIPTION\n")
                     f.write(f"{SEPARATOR}\n\n")
-                    f.write(transcription)
                     
-                    # Use defensive timestamp extraction (Pattern 4)
-                    if include_timestamps and timestamps and timestamp_level in ('word', 'segment', 'char'):
-                        level_name = timestamp_level.upper() + "-LEVEL"
-                        f.write(f"\n\n{SEPARATOR}\n")
-                        f.write(f"{level_name} TIMESTAMPS\n")
-                        f.write(f"{SEPARATOR}\n\n")
-                        for stamp in timestamps:
-                            start = stamp.get('start', 0.0)
-                            end = stamp.get('end', 0.0)
-                            text_content = stamp.get('word', stamp.get('segment', stamp.get('char', '')))
-                            f.write(f"{start:.2f}s - {end:.2f}s: {text_content}\n")
+                    if timestamps and include_timestamps:
+                        f.write(format_as_txt_with_timestamps(transcription, timestamps, timestamp_level))
+                    else:
+                        f.write(transcription)
             
-            status += f"\n💾 **Saved to**: `{output_file}`"
+            # Generate SRT file
+            srt_file = f"{base_filename}.srt"
+            with open(srt_file, "w", encoding="utf-8") as f:
+                if is_batch:
+                    srt_index = 1
+                    for i, (info, trans) in enumerate(zip(file_info, all_transcriptions)):
+                        if not trans.startswith("[Transcription failed:"):
+                            ts, ts_level = all_timestamps[i] if i < len(all_timestamps) else ([], 'none')
+                            file_srt = format_as_srt(trans, ts, ts_level)
+                            f.write(f"{srt_index}\n")
+                            f.write(f"00:00:00,000 --> 00:00:02,000\n")
+                            f.write(f"[FILE: {info['name']}]\n\n")
+                            srt_index += 1
+                            for line in file_srt.split('\n\n'):
+                                if line.strip():
+                                    parts = line.split('\n', 1)
+                                    if len(parts) >= 2:
+                                        f.write(f"{srt_index}\n{parts[1]}\n\n")
+                                        srt_index += 1
+                else:
+                    f.write(format_as_srt(transcription, timestamps, timestamp_level))
+            
+            # Generate CSV file
+            csv_file = f"{base_filename}.csv"
+            with open(csv_file, "w", encoding="utf-8") as f:
+                if is_batch:
+                    f.write("file,start_time,end_time,duration,text\n")
+                    for i, (info, trans) in enumerate(zip(file_info, all_transcriptions)):
+                        if not trans.startswith("[Transcription failed:"):
+                            ts, ts_level = all_timestamps[i] if i < len(all_timestamps) else ([], 'none')
+                            if ts:
+                                for stamp in ts:
+                                    start = stamp.get('start', 0.0)
+                                    end = stamp.get('end', 0.0)
+                                    duration = end - start
+                                    text = stamp.get('text', stamp.get('word', stamp.get('segment', '')))
+                                    escaped = text.replace('"', '""')
+                                    escaped_name = info['name'].replace('"', '""')
+                                    f.write(f'"{escaped_name}",{start:.3f},{end:.3f},{duration:.3f},"{escaped}"\n')
+                            else:
+                                escaped = trans.replace('"', '""')
+                                escaped_name = info['name'].replace('"', '""')
+                                f.write(f'"{escaped_name}",0.000,{info["duration"]:.3f},{info["duration"]:.3f},"{escaped}"\n')
+                else:
+                    f.write(format_as_csv(transcription, timestamps, timestamp_level))
+            
+            status += f"\n💾 **Files saved**: `{base_filename}.[txt/srt/csv]`"
         
-        return status, transcription_output, output_file
+        # Save logs and return
+        print(f"\n{'='*60}")
+        print(f"✅ Transcription Complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+        
+        logs = log_capture.stop()
+        log_file = _save_logs(logs, "transcription")
+        
+        return status, transcription_output, txt_file, srt_file, csv_file, log_file
         
     except Exception as e:
         # Get actual VRAM info for error message
@@ -2170,7 +2758,9 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
 
 If the error persists, please check the console output for more details.
 """
-        return error_msg, "", None
+        logs = log_capture.stop()
+        log_file = _save_logs(logs, "error")
+        return error_msg, "", None, None, None, log_file
 
 def get_system_info():
     """Display system information"""
@@ -2303,9 +2893,16 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             )
             
             save_checkbox = gr.Checkbox(
-                label="💾 Save transcription to .txt file",
+                label="💾 Save transcription to file",
                 value=True,
-                info="Creates a text file in the same directory"
+                info="Creates a file in the current directory"
+            )
+            
+            output_format = gr.Dropdown(
+                choices=["txt", "srt", "csv"],
+                value="txt",
+                label="📄 Output Format",
+                info="TXT (plain text), SRT (subtitles), CSV (spreadsheet)"
             )
             
             timestamp_checkbox = gr.Checkbox(
@@ -2313,6 +2910,44 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                 value=False,
                 info="Shows when each word was spoken"
             )
+            
+            itn_checkbox = gr.Checkbox(
+                label="🔢 Convert numbers to digits (ITN)",
+                value=True,
+                info="Converts 'twenty twenty two' → '2022' (requires nemo_text_processing)"
+            )
+            
+            with gr.Accordion("⚙️ Advanced Settings", open=False):
+                chunk_size_slider = gr.Slider(
+                    minimum=30,
+                    maximum=300,
+                    value=120,
+                    step=10,
+                    label="🎛️ Chunk Size (seconds)",
+                    info="Larger = faster but more VRAM. 120-180s recommended for 12GB VRAM. Reduce if OOM errors."
+                )
+                
+                batch_size_slider = gr.Slider(
+                    minimum=1,
+                    maximum=8,
+                    value=1,
+                    step=1,
+                    label="📦 Batch Size",
+                    info="Higher = more VRAM usage. Increase to utilize more VRAM (try 2-4 for 12GB)."
+                )
+                
+                gr.Markdown(f"""
+                **VRAM Optimization Tips**:
+                - **Chunk Size**: Larger chunks process faster but use more VRAM
+                  - 60-90s: Safe for 8GB VRAM
+                  - 120-180s: Good for 12GB VRAM  
+                  - 200-300s: For 16GB+ VRAM
+                - **Batch Size**: How many chunks to process at once
+                  - 1: Safest, lowest VRAM
+                  - 2-4: Better GPU utilization for 12GB+
+                
+                **ITN Status**: {'✅ Available' if ITN_AVAILABLE else '❌ Not installed (run: pip install nemo_text_processing)'}
+                """)
             
             transcribe_btn = gr.Button(
                 "🚀 Start Transcription",
@@ -2373,8 +3008,24 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                 show_label=True
             )
             
-            file_output = gr.File(
-                label="📥 Download Transcription File",
+            gr.Markdown("### 📥 Download Files")
+            
+            with gr.Row():
+                txt_file_output = gr.File(
+                    label="📄 TXT (Plain Text)",
+                    visible=True
+                )
+                srt_file_output = gr.File(
+                    label="🎬 SRT (Subtitles)",
+                    visible=True
+                )
+                csv_file_output = gr.File(
+                    label="📊 CSV (Spreadsheet)",
+                    visible=True
+                )
+            
+            log_file_output = gr.File(
+                label="📋 Download Processing Logs",
                 visible=True
             )
     
@@ -2426,8 +3077,9 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     # Connect button - queue=True ensures proper callback execution
     transcribe_btn.click(
         fn=transcribe_audio,
-        inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox],
-        outputs=[status_output, transcription_output, file_output],
+        inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox, 
+                output_format, itn_checkbox, chunk_size_slider, batch_size_slider],
+        outputs=[status_output, transcription_output, txt_file_output, srt_file_output, csv_file_output, log_file_output],
         queue=False
     )
 
