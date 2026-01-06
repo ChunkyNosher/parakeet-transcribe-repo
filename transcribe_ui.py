@@ -459,6 +459,110 @@ def format_timestamp_status(level, include_timestamps):
         return "\nℹ️ **Timestamps:** Not available for this model"
 
 
+# ============================================================================
+# Transcription Helper with Retry Logic (WinError 32 Fix)
+# ============================================================================
+# NeMo's Lhotse dataloader creates manifest.json files during inference that
+# Windows services (antivirus, indexing, cloud sync) can lock, causing errors.
+#
+# The fix uses direct parameters to model.transcribe():
+# 1. num_workers=0: Disables multiprocessing worker coordination
+# 2. batch_size: NeMo handles internal batching optimally
+# 3. Retry logic with linear backoff for transient file locks
+#
+# Based on NeMo official API: model.transcribe(audio, batch_size, num_workers=0)
+# Reference: https://github.com/nvidia/nemo/blob/main/docs/source/asr/results.md
+# ============================================================================
+
+def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3):
+    """Transcribe with retry logic for Windows file lock handling.
+    
+    Uses NeMo's official transcribe() API with direct parameters:
+    - batch_size: Controls how many files are batched together
+    - num_workers=0: Disables multiprocessing to prevent file locks
+    - return_hypotheses=True: Returns hypothesis objects with .text attribute
+    
+    Includes retry logic with linear backoff for transient Windows file locks
+    that may occur during NeMo's internal manifest.json creation.
+    
+    Args:
+        model: Loaded NeMo ASR model
+        files: List of audio file paths to transcribe
+        batch_size: Batch size for transcription
+        use_cuda: Whether to use CUDA with mixed precision
+        max_retries: Maximum retry attempts for file lock errors
+        
+    Returns:
+        Transcription result from model.transcribe()
+        
+    Raises:
+        PermissionError: If file lock persists after all retries
+        Exception: For other transcription errors
+    """
+    import gc
+    
+    base_delay = 0.5  # 500ms base delay
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Use NeMo's official transcribe() API with direct parameters
+            # Key Windows-safe settings:
+            # - num_workers=0: Prevents multiprocessing file coordination issues
+            # - batch_size: NeMo handles optimal internal batching
+            if use_cuda and torch.cuda.is_available():
+                # Use mixed precision (FP16) for faster inference on CUDA
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    result = model.transcribe(
+                        audio=files,
+                        batch_size=batch_size,
+                        num_workers=0,  # CRITICAL: Prevents manifest.json worker coordination
+                        return_hypotheses=True,  # Required for .text access
+                        verbose=True  # Shows progress indicator
+                    )
+            else:
+                # CPU fallback - no autocast
+                result = model.transcribe(
+                    audio=files,
+                    batch_size=batch_size,
+                    num_workers=0,  # CRITICAL: Prevents manifest.json worker coordination
+                    return_hypotheses=True,  # Required for .text access
+                    verbose=True  # Shows progress indicator
+                )
+            
+            # Success!
+            return result
+            
+        except PermissionError as e:
+            last_error = e
+            error_str = str(e)
+            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
+            
+            if is_file_lock and attempt < max_retries - 1:
+                delay = base_delay * (attempt + 1)
+                print(f"   ⚠️ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+                
+                # Force garbage collection to release file handles
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                time.sleep(delay)
+                continue
+            else:
+                # Final attempt failed or non-file-lock error
+                raise
+                
+        except Exception as e:
+            # Non-permission errors - don't retry
+            raise
+    
+    # All retries exhausted
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Transcription failed after {max_retries} attempts")
+
+
 # Model configurations
 # All models use standard ASRModel.from_pretrained() API (no SALM required)
 # Parakeet models: Can load from local .nemo file OR HuggingFace
@@ -1424,51 +1528,39 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
             video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
         
         # ============================================================================
-        # Direct Method Parameters for Transcription (HuggingFace Pattern)
+        # Transcription with Retry Logic (WinError 32 Fix)
         # ============================================================================
-        # NeMo's official API recommends using direct method parameters instead of
-        # override_config. This approach:
-        # 1. Uses NeMo's optimized internal initialization path
-        # 2. Prevents Lhotse dataloader deadlocks at 0% progress
-        # 3. Matches the working HuggingFace Spaces implementation
-        # 4. num_workers=0 at method level is safe (unlike config override)
+        # Uses _transcribe_with_retry() which:
+        # 1. Uses num_workers=0 to disable multiprocessing (prevents manifest.json locking)
+        # 2. Uses NeMo's official transcribe() API with direct parameters
+        # 3. Has retry logic with linear backoff for transient file locks
+        # 4. Runs garbage collection between retries to release handles
+        #
+        # This fixes the WinError 32 "file being used by another process" error
+        # that occurs when Windows services lock manifest.json files.
         # ============================================================================
         
-        # Transcribe with mixed precision (FP16) for GPU acceleration
+        # Transcribe with retry wrapper (handles file locks gracefully)
         inference_start = time.time()
         
-        # Single attempt using direct method parameters (no override_config)
         try:
-            if torch.cuda.is_available():
-                # Use mixed precision (FP16) for faster inference on CUDA
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    result = model.transcribe(
-                        processed_files, 
-                        batch_size=batch_size,
-                        num_workers=0,  # Direct parameter - safe for Windows
-                        return_hypotheses=True,  # Required for timestamp access
-                        verbose=True  # Shows progress indicator
-                    )
-            else:
-                # CPU fallback - no autocast
-                result = model.transcribe(
-                    processed_files, 
-                    batch_size=batch_size,
-                    num_workers=0,  # Direct parameter - safe for Windows
-                    return_hypotheses=True,  # Required for timestamp access
-                    verbose=True  # Shows progress indicator
-                )
+            result = _transcribe_with_retry(
+                model=model,
+                files=processed_files,
+                batch_size=batch_size,
+                use_cuda=torch.cuda.is_available(),
+                max_retries=3
+            )
                 
         except PermissionError as e:
-            # If error occurs with num_workers=0, it's a real error (not file locking)
+            # All retries exhausted - show user-friendly error
             error_str = str(e)
             is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
             
             if is_file_lock:
                 return (
                     f"### ❌ Transcription Failed: File Lock Error\n\n"
-                    f"The transcription process failed due to file locking even with "
-                    f"manifest file creation disabled.\n\n"
+                    f"The transcription process failed due to file locking after 3 retry attempts.\n\n"
                     f"**Solutions:**\n"
                     f"1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
                     f"2. Add cache directory to antivirus exclusions: `{CACHE_DIR}`\n"
