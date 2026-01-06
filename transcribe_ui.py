@@ -130,6 +130,84 @@ import io
 import re
 import logging
 from datetime import datetime
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any, Union, TextIO
+
+
+# ============================================================================
+# Data Classes for Reducing Function Argument Counts
+# ============================================================================
+# These dataclasses encapsulate related parameters to reduce function signatures
+# from 10-15 arguments to 2-4, improving readability and maintainability.
+# ============================================================================
+
+@dataclass
+class TranscriptionStats:
+    """Statistics about a transcription run."""
+    model_choice: str
+    gpu_name: str
+    total_duration: float  # Audio duration in seconds
+    total_time: float      # Total processing time
+    inference_time: float  # Model inference time only
+    load_time: float       # Model load time
+    chunk_size: int        # Chunk size used
+    rtfx: float           # Real-time factor
+    vram_used: float      # VRAM in GB
+    apply_itn: bool       # Whether ITN was applied
+
+
+@dataclass 
+class TranscriptionContext:
+    """Context for a transcription operation."""
+    transcription: str
+    timestamps: List[Dict[str, Any]]
+    timestamp_level: str  # 'word', 'segment', 'char', or 'none'
+    file_info: List[Dict[str, Any]]  # List of {name, duration, is_video}
+
+
+@dataclass
+class BatchTranscriptionContext:
+    """Context for batch transcription operations."""
+    all_transcriptions: List[str]
+    all_timestamps: List[Tuple[List[Dict[str, Any]], str]]  # List of (timestamps, level)
+    file_info: List[Dict[str, Any]]
+    per_file_stats: List[str]
+    per_file_errors: List[str]
+
+
+@dataclass
+class OutputFilesConfig:
+    """Configuration for output file generation."""
+    file_list: List[str]
+    file_info: List[Dict[str, Any]]
+    is_batch: bool
+    include_timestamps: bool
+    model_choice: str
+    total_duration: float
+    total_time: float
+    apply_itn: bool
+    # Single-file specific (optional for batch)
+    transcription: Optional[str] = None
+    timestamps: Optional[List[Dict[str, Any]]] = None
+    timestamp_level: str = 'none'
+    # Batch-file specific (optional for single)
+    all_transcriptions: Optional[List[str]] = None
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]] = None
+
+
+@dataclass
+class ResultProcessingContext:
+    """Context for processing transcription results (reduces argument passing)."""
+    stats: TranscriptionStats
+    file_list: List[str]
+    file_info: List[Dict[str, Any]]
+    include_timestamps: bool
+    video_status: str = ""
+    load_time: float = 0.0
+    # Batch-specific (optional for single)
+    all_transcriptions: Optional[List[str]] = None
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]] = None
+
 
 # ============================================================================
 # Log Capture Setup - Capture all logs for downloadable output
@@ -147,7 +225,7 @@ class LogCapture:
         self.original_stderr = None
         self.handler = None
         
-    def start(self):
+    def start(self) -> None:
         """Start capturing logs."""
         import sys
         self.log_buffer = io.StringIO()  # Reset buffer
@@ -156,24 +234,24 @@ class LogCapture:
         
         # Create a TeeWriter that writes to both original stream and buffer
         class TeeWriter:
-            def __init__(self, original, buffer):
+            def __init__(self, original: Any, buffer: io.StringIO) -> None:
                 self.original = original
                 self.buffer = buffer
-            def write(self, text):
+            def write(self, text: str) -> None:
                 self.original.write(text)
                 self.buffer.write(text)
-            def flush(self):
+            def flush(self) -> None:
                 self.original.flush()
                 
-        sys.stdout = TeeWriter(self.original_stdout, self.log_buffer)
-        sys.stderr = TeeWriter(self.original_stderr, self.log_buffer)
+        sys.stdout = TeeWriter(self.original_stdout, self.log_buffer)  # type: ignore[assignment]
+        sys.stderr = TeeWriter(self.original_stderr, self.log_buffer)  # type: ignore[assignment]
         
         # Also capture logging module output
         self.handler = logging.StreamHandler(self.log_buffer)
         self.handler.setLevel(logging.DEBUG)
         logging.getLogger().addHandler(self.handler)
         
-    def stop(self):
+    def stop(self) -> str:
         """Stop capturing logs and return captured content."""
         import sys
         if self.original_stdout:
@@ -184,7 +262,7 @@ class LogCapture:
             logging.getLogger().removeHandler(self.handler)
         return self.log_buffer.getvalue()
     
-    def get_logs(self):
+    def get_logs(self) -> str:
         """Get current captured logs without stopping."""
         return self.log_buffer.getvalue()
 
@@ -192,7 +270,7 @@ class LogCapture:
 log_capture = LogCapture()
 
 # Global model cache to avoid reloading
-models_cache = {}
+models_cache: Dict[str, Any] = {}
 
 # ============================================================================
 # ITN (Inverse Text Normalization) Support
@@ -202,20 +280,20 @@ models_cache = {}
 # ============================================================================
 
 # Try to import ITN - will be None if not installed
-ITN_NORMALIZER = None
-ITN_AVAILABLE = False
+ITN_NORMALIZER: Optional[Any] = None
+ITN_AVAILABLE: bool = False
 
 try:
     from nemo_text_processing.inverse_text_normalization import InverseNormalizer
     # Initialize ITN for English (lazy - will init on first use)
-    ITN_AVAILABLE = True
+    ITN_AVAILABLE = True  # type: ignore[misc]
     print("✅ ITN (Inverse Text Normalization) available - numbers will be converted to digits")
 except ImportError:
     print("ℹ️  ITN not installed - numbers will remain as words")
     print("   To enable: pip install nemo_text_processing")
 
 
-def _get_itn_normalizer(language="en"):
+def _get_itn_normalizer(language: str = "en") -> Optional[Any]:
     """Get or create ITN normalizer (lazy initialization).
     
     Lazy initialization prevents slow startup when ITN is available
@@ -236,16 +314,120 @@ def _get_itn_normalizer(language="en"):
         try:
             from nemo_text_processing.inverse_text_normalization import InverseNormalizer
             print(f"   🔧 Initializing ITN normalizer for '{language}'...")
-            ITN_NORMALIZER = InverseNormalizer(lang=language, cache_dir=str(CACHE_DIR / "itn"))
+            ITN_NORMALIZER = InverseNormalizer(lang=language, cache_dir=str(CACHE_DIR / "itn"))  # type: ignore[misc]
             print(f"   ✅ ITN normalizer ready")
         except Exception as e:
             print(f"   ⚠️ Failed to initialize ITN: {e}")
             return None
             
-    return ITN_NORMALIZER
+    return ITN_NORMALIZER  # type: ignore[reportReturnType]
 
 
-def apply_inverse_text_normalization(text, language="en"):
+def _split_text_into_word_chunks(text: str, max_words: int = 50) -> List[str]:
+    """Split text into chunks of max_words for ITN processing.
+    
+    Args:
+        text: Input text to split
+        max_words: Maximum words per chunk
+        
+    Returns:
+        List of text chunks, or [text] if text is empty
+    """
+    words = text.split()
+    chunks: List[str] = []
+    for i in range(0, len(words), max_words):
+        chunk = ' '.join(words[i:i + max_words])
+        if chunk:
+            chunks.append(chunk)
+    return chunks if chunks else [text]
+
+
+def _normalize_chunks_with_fallback(normalizer: Any, chunks: List[str]) -> List[str]:
+    """Normalize a list of text chunks using batch or individual fallback.
+    
+    Args:
+        normalizer: ITN normalizer instance
+        chunks: List of text chunks to normalize
+        
+    Returns:
+        List of normalized text chunks
+    """
+    try:
+        return normalizer.normalize_list(chunks, verbose=False)
+    except Exception:
+        # Individual normalization fallback
+        results: List[str] = []
+        for chunk in chunks:
+            try:
+                results.append(normalizer.normalize(chunk, verbose=False))
+            except Exception:
+                results.append(chunk)  # Keep original if all fails
+        return results
+
+
+def _try_itn_sentence_splitting(normalizer: Any, text: str) -> Tuple[bool, str, str]:
+    """Try ITN using built-in sentence splitting.
+    
+    Returns:
+        Tuple of (success: bool, result: str, message: str)
+    """
+    try:
+        sentences = normalizer.split_text_into_sentences(text)
+        if sentences and len(sentences) > 0:
+            normalized = _normalize_chunks_with_fallback(normalizer, sentences)
+            return True, ' '.join(normalized), f"sentence splitting: {len(sentences)} sentences"
+    except Exception as e:
+        print(f"   ℹ️ ITN sentence splitting failed: {e}")
+    return False, text, ""
+
+
+def _try_itn_regex_splitting(normalizer: Any, text: str) -> Tuple[bool, str, str]:
+    """Try ITN using regex-based sentence splitting on .!?
+    
+    Returns:
+        Tuple of (success: bool, result: str, message: str)
+    """
+    import re
+    try:
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if sentences and len(sentences) > 1:
+            normalized = _normalize_chunks_with_fallback(normalizer, sentences)
+            return True, ' '.join(normalized), f"regex splitting: {len(sentences)} sentences"
+    except Exception as e:
+        print(f"   ℹ️ ITN regex splitting failed: {e}")
+    return False, text, ""
+
+
+def _try_itn_chunk_splitting(normalizer: Any, text: str) -> Tuple[bool, str, str]:
+    """Try ITN using fixed-size word chunks.
+    
+    Returns:
+        Tuple of (success: bool, result: str, message: str)
+    """
+    try:
+        chunks = _split_text_into_word_chunks(text, max_words=50)
+        if len(chunks) > 1:
+            normalized = _normalize_chunks_with_fallback(normalizer, chunks)
+            return True, ' '.join(normalized), f"chunk splitting: {len(chunks)} chunks"
+        else:
+            result = normalizer.normalize(text, verbose=False)
+            return True, result, "single text"
+    except Exception as e:
+        print(f"   ⚠️ ITN normalization failed completely: {e}")
+    return False, text, ""
+
+
+def _is_itn_applicable(normalizer: Any, text: str) -> bool:
+    """Check if ITN can be applied to text.
+    
+    Returns:
+        True if normalizer exists and text is non-empty
+    """
+    return normalizer is not None and bool(text) and bool(text.strip())
+
+
+def apply_inverse_text_normalization(text: str, language: str = "en") -> str:
     """Apply Inverse Text Normalization to convert spoken numbers to digits.
     
     Converts:
@@ -264,85 +446,48 @@ def apply_inverse_text_normalization(text, language="en"):
     Returns:
         Text with numbers converted to digits, or original text if ITN unavailable
     """
-    import re
-    
     normalizer = _get_itn_normalizer(language)
     
-    if normalizer is None:
+    if not _is_itn_applicable(normalizer, text):
         return text
     
-    if not text or not text.strip():
+    # Try strategies in order: sentence splitting → regex splitting → chunk splitting
+    strategies = [
+        _try_itn_sentence_splitting,
+        _try_itn_regex_splitting,
+        _try_itn_chunk_splitting,
+    ]
+    
+    for strategy in strategies:
+        success, result, message = strategy(normalizer, text)
+        if success:
+            print(f"   ✅ ITN applied ({message})")
+            return result
+    
+    return text
+
+
+def apply_itn_to_segment(text: str, language: str = "en") -> str:
+    """Apply ITN to a single short segment (sentence/chunk).
+    
+    This is optimized for short segments that don't need splitting.
+    Used during chunk processing to apply ITN immediately after transcription.
+    
+    Args:
+        text: Short segment text (typically one sentence or chunk)
+        language: Language code for ITN (default: "en")
+        
+    Returns:
+        Text with numbers converted to digits, or original if ITN unavailable/fails
+    """
+    normalizer = _get_itn_normalizer(language)
+    
+    if not _is_itn_applicable(normalizer, text):
         return text
     
-    def _split_into_chunks(text, max_words=50):
-        """Fallback: Split text into chunks of max_words for ITN processing."""
-        words = text.split()
-        chunks = []
-        for i in range(0, len(words), max_words):
-            chunk = ' '.join(words[i:i + max_words])
-            if chunk:
-                chunks.append(chunk)
-        return chunks if chunks else [text]
-    
-    def _normalize_chunks(chunks):
-        """Normalize a list of text chunks, handling errors gracefully."""
-        try:
-            return normalizer.normalize_list(chunks, verbose=False)
-        except Exception:
-            # Individual normalization fallback
-            results = []
-            for chunk in chunks:
-                try:
-                    results.append(normalizer.normalize(chunk, verbose=False))
-                except Exception:
-                    results.append(chunk)  # Keep original if all fails
-            return results
-        
     try:
-        # Strategy 1: Try built-in sentence splitting
-        sentences = normalizer.split_text_into_sentences(text)
-        
-        if sentences and len(sentences) > 0:
-            # Success - normalize each sentence
-            normalized = _normalize_chunks(sentences)
-            result = ' '.join(normalized)
-            print(f"   ✅ ITN applied (sentence splitting: {len(sentences)} sentences)")
-            return result
-            
-    except Exception as e:
-        print(f"   ℹ️ ITN sentence splitting failed: {e}")
-    
-    try:
-        # Strategy 2: Regex-based sentence splitting on .!?
-        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-        sentences = [s.strip() for s in sentences if s.strip()]
-        
-        if sentences and len(sentences) > 1:
-            normalized = _normalize_chunks(sentences)
-            result = ' '.join(normalized)
-            print(f"   ✅ ITN applied (regex splitting: {len(sentences)} sentences)")
-            return result
-            
-    except Exception as e:
-        print(f"   ℹ️ ITN regex splitting failed: {e}")
-    
-    try:
-        # Strategy 3: Split into fixed-size word chunks
-        chunks = _split_into_chunks(text, max_words=50)
-        
-        if len(chunks) > 1:
-            normalized = _normalize_chunks(chunks)
-            result = ' '.join(normalized)
-            print(f"   ✅ ITN applied (chunk splitting: {len(chunks)} chunks)")
-            return result
-        else:
-            # Single chunk - normalize directly
-            result = normalizer.normalize(text, verbose=False)
-            print(f"   ✅ ITN applied (single text)")
-            return result
-            
-    except Exception as e:
-        print(f"   ⚠️ ITN normalization failed completely: {e}")
+        return normalizer.normalize(text.strip(), verbose=False)  # type: ignore[union-attr]
+    except Exception:
         return text
 
 
@@ -355,7 +500,7 @@ def apply_inverse_text_normalization(text, language="en"):
 # - TXT: Plain text with timestamps (human-readable)
 # ============================================================================
 
-def _format_srt_timestamp(seconds):
+def _format_srt_timestamp(seconds: float) -> str:
     """Convert seconds to SRT timestamp format (HH:MM:SS,mmm).
     
     Args:
@@ -371,15 +516,58 @@ def _format_srt_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
 
 
-def _group_words_into_segments(timestamps, words_per_segment=8, max_duration=5.0):
-    """Group word-level timestamps into subtitle segments.
-    
-    SRT subtitles work best with phrase-length segments rather than
-    individual words. This groups words into readable chunks.
+def _ends_with_sentence_punctuation(word: str) -> bool:
+    """Check if word ends with sentence-ending punctuation."""
+    if not word:
+        return False
+    return word.rstrip().endswith(('.', '?', '!', '...', '。', '？', '！'))
+
+
+def _get_word_text_from_timestamp(stamp: Dict[str, Any]) -> str:
+    """Extract word text from timestamp dict."""
+    return stamp.get('text', stamp.get('word', stamp.get('segment', stamp.get('char', ''))))
+
+
+def _should_end_segment(word: str, segment_duration: float, word_count: int, has_punctuation: bool, words_per_segment: int, max_duration: float) -> bool:
+    """Determine if current segment should be ended.
     
     Args:
-        timestamps: List of word timestamp dicts with 'start', 'end', 'word' keys
-        words_per_segment: Target words per subtitle segment (default: 8)
+        word: Current word text
+        segment_duration: Duration of current segment
+        word_count: Number of words in current segment
+        has_punctuation: Whether source has punctuation for sentence detection
+        words_per_segment: Target words per segment (fallback)
+        max_duration: Maximum segment duration
+        
+    Returns:
+        True if segment should be ended
+    """
+    ends_sentence = _ends_with_sentence_punctuation(word)
+    return (
+        (has_punctuation and ends_sentence) or
+        segment_duration > max_duration or
+        (not has_punctuation and word_count >= words_per_segment)
+    )
+
+
+def _finalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
+    """Finalize a segment by joining words and returning clean dict."""
+    return {
+        'start': segment['start'],
+        'end': segment['end'],
+        'text': ' '.join(segment['words'])
+    }
+
+
+def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segment: int = 8, max_duration: float = 5.0) -> List[Dict[str, Any]]:
+    """Group word-level timestamps into subtitle segments using sentence boundaries.
+    
+    First attempts to detect sentence boundaries by punctuation marks (. ? !).
+    Falls back to grouping by word count/duration if no punctuation is detected.
+    
+    Args:
+        timestamps: List of word timestamp dicts with 'start', 'end', 'word'/'text' keys
+        words_per_segment: Target words per subtitle segment (default: 8, used as fallback)
         max_duration: Maximum segment duration in seconds (default: 5.0)
         
     Returns:
@@ -387,56 +575,38 @@ def _group_words_into_segments(timestamps, words_per_segment=8, max_duration=5.0
     """
     if not timestamps:
         return []
-        
-    segments = []
-    current_segment = {
-        'start': timestamps[0].get('start', 0.0),
-        'end': timestamps[0].get('end', 0.0),
-        'words': []
-    }
+    
+    # Check if source has punctuation for sentence detection
+    has_punctuation = any(
+        _ends_with_sentence_punctuation(_get_word_text_from_timestamp(ts)) 
+        for ts in timestamps
+    )
+    
+    segments: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {'start': timestamps[0].get('start', 0.0), 'end': 0.0, 'words': []}
     
     for stamp in timestamps:
-        word = stamp.get('text', stamp.get('word', stamp.get('segment', stamp.get('char', ''))))
-        start = stamp.get('start', 0.0)
+        word = _get_word_text_from_timestamp(stamp)
         end = stamp.get('end', 0.0)
         
-        # Check if we should start a new segment
-        segment_duration = end - current_segment['start']
-        word_count = len(current_segment['words'])
+        current['words'].append(word)
+        current['end'] = end
         
-        if word_count >= words_per_segment or segment_duration > max_duration:
-            # Finalize current segment
-            if current_segment['words']:
-                current_segment['text'] = ' '.join(current_segment['words'])
-                segments.append({
-                    'start': current_segment['start'],
-                    'end': current_segment['end'],
-                    'text': current_segment['text']
-                })
-            # Start new segment
-            current_segment = {
-                'start': start,
-                'end': end,
-                'words': [word]
-            }
-        else:
-            # Add word to current segment
-            current_segment['words'].append(word)
-            current_segment['end'] = end
+        segment_duration = end - current['start']
+        if _should_end_segment(word, segment_duration, len(current['words']), 
+                               has_punctuation, words_per_segment, max_duration):
+            if current['words']:
+                segments.append(_finalize_segment(current))
+                current = {'start': end, 'end': end, 'words': []}
     
-    # Don't forget the last segment
-    if current_segment['words']:
-        current_segment['text'] = ' '.join(current_segment['words'])
-        segments.append({
-            'start': current_segment['start'],
-            'end': current_segment['end'],
-            'text': current_segment['text']
-        })
+    # Finalize last segment
+    if current['words']:
+        segments.append(_finalize_segment(current))
     
     return segments
 
 
-def format_as_srt(transcription, timestamps, timestamp_level='word'):
+def format_as_srt(transcription: str, timestamps: List[Dict[str, Any]], timestamp_level: str = 'word') -> str:
     """Format transcription as SRT subtitle file content.
     
     Args:
@@ -464,7 +634,7 @@ def format_as_srt(transcription, timestamps, timestamp_level='word'):
         segments = _group_words_into_segments(timestamps)
     else:
         # Segment-level timestamps are already grouped
-        segments = []
+        segments: List[Dict[str, Any]] = []
         for stamp in timestamps:
             text = stamp.get('text', stamp.get('segment', stamp.get('word', stamp.get('char', ''))))
             segments.append({
@@ -474,7 +644,7 @@ def format_as_srt(transcription, timestamps, timestamp_level='word'):
             })
     
     # Build SRT content
-    srt_lines = []
+    srt_lines: List[str] = []
     for i, seg in enumerate(segments, 1):
         start_ts = _format_srt_timestamp(seg['start'])
         end_ts = _format_srt_timestamp(seg['end'])
@@ -486,7 +656,7 @@ def format_as_srt(transcription, timestamps, timestamp_level='word'):
     return '\n'.join(srt_lines)
 
 
-def format_as_csv(transcription, timestamps, timestamp_level='word'):
+def format_as_csv(transcription: str, timestamps: List[Dict[str, Any]], timestamp_level: str = 'word') -> str:
     """Format transcription as CSV content.
     
     CSV columns: start_time, end_time, duration, text
@@ -499,7 +669,7 @@ def format_as_csv(transcription, timestamps, timestamp_level='word'):
     Returns:
         CSV formatted string with header row
     """
-    csv_lines = ["start_time,end_time,duration,text"]
+    csv_lines: List[str] = ["start_time,end_time,duration,text"]
     
     if not timestamps or timestamp_level == 'none':
         # No timestamps - create single row for entire transcription
@@ -525,7 +695,7 @@ def format_as_csv(transcription, timestamps, timestamp_level='word'):
     return '\n'.join(csv_lines)
 
 
-def format_as_txt_with_timestamps(transcription, timestamps, timestamp_level='word'):
+def format_as_txt_with_timestamps(transcription: str, timestamps: List[Dict[str, Any]], timestamp_level: str = 'word') -> str:
     """Format transcription as plain text with inline timestamps.
     
     Format: [HH:MM:SS] text text text [HH:MM:SS] text text...
@@ -545,7 +715,7 @@ def format_as_txt_with_timestamps(transcription, timestamps, timestamp_level='wo
     if timestamp_level == 'word':
         segments = _group_words_into_segments(timestamps, words_per_segment=12, max_duration=8.0)
     else:
-        segments = []
+        segments: List[Dict[str, Any]] = []
         for stamp in timestamps:
             text = stamp.get('text', stamp.get('segment', stamp.get('word', stamp.get('char', ''))))
             segments.append({
@@ -554,7 +724,7 @@ def format_as_txt_with_timestamps(transcription, timestamps, timestamp_level='wo
             })
     
     # Build text with timestamps
-    txt_lines = []
+    txt_lines: List[str] = []
     for seg in segments:
         # Convert to HH:MM:SS format
         seconds = seg['start']
@@ -661,7 +831,7 @@ ERROR_MESSAGES = {
 }
 
 
-def format_error_message(error_type, detail=""):
+def format_error_message(error_type: str, detail: str = "") -> str:
     """Format a stage-specific error message with optional details.
     
     Args:
@@ -695,7 +865,45 @@ def format_error_message(error_type, detail=""):
 # - Converts stereo to mono if needed
 # ============================================================================
 
-def validate_and_normalize_audio(file_path):
+def _validate_audio_duration(duration: float) -> Optional[str]:
+    """Validate audio duration is within acceptable range.
+    
+    Returns:
+        Error message if invalid, None if valid
+    """
+    if duration < 0.1:  # Less than 100ms
+        return format_error_message('duration_invalid', 
+            f"Duration: {duration:.3f}s (minimum: 0.1s)")
+    if duration > 86400:  # More than 24 hours
+        return format_error_message('duration_invalid',
+            f"Duration: {duration:.1f}s ({duration/3600:.1f} hours, maximum: 24 hours)")
+    return None
+
+
+def _validate_audio_energy(rms_max: float) -> Tuple[bool, str, str]:
+    """Validate audio energy level from RMS.
+    
+    Returns:
+        Tuple of (is_valid, error_msg, warning_msg)
+    """
+    if rms_max < 0.001:  # Very quiet - likely silent
+        error = format_error_message('audio_silent',
+            f"Maximum RMS energy: {rms_max:.6f} (threshold: 0.001)")
+        return False, error, ""
+    warning = "⚠️ Audio is very quiet - transcription quality may be affected" if rms_max < 0.01 else ""
+    return True, "", warning
+
+
+def _classify_audio_load_error(error_str: str) -> str:
+    """Classify audio load error and return appropriate error message."""
+    if "Audio file" in error_str or "NoBackendError" in error_str:
+        return format_error_message('audio_load_failed', error_str)
+    if "Format" in error_str or "codec" in error_str.lower():
+        return format_error_message('format_unsupported', error_str)
+    return format_error_message('audio_load_failed', error_str)
+
+
+def validate_and_normalize_audio(file_path: str) -> Tuple[bool, Any, int, str, str]:
     """Validate and normalize audio file for transcription.
     
     This function performs comprehensive audio validation following the
@@ -712,59 +920,35 @@ def validate_and_normalize_audio(file_path):
     import librosa
     import numpy as np
     
-    warning_msg = ""
-    
     try:
         # Load audio preserving original sample rate
-        y, sr = librosa.load(file_path, sr=None)
+        y, sr = librosa.load(file_path, sr=None)  # type: ignore[reportUnknownMemberType]
         
         # Validate duration (100ms to 24 hours)
-        duration = librosa.get_duration(y=y, sr=sr)
-        
-        if duration < 0.1:  # Less than 100ms
-            return (False, None, 0, 
-                    format_error_message('duration_invalid', 
-                        f"Duration: {duration:.3f}s (minimum: 0.1s)"), "")
-        
-        if duration > 86400:  # More than 24 hours
-            return (False, None, 0,
-                    format_error_message('duration_invalid',
-                        f"Duration: {duration:.1f}s ({duration/3600:.1f} hours, maximum: 24 hours)"), "")
+        duration: float = librosa.get_duration(y=y, sr=sr)  # type: ignore[reportUnknownMemberType]
+        duration_error = _validate_audio_duration(duration)
+        if duration_error:
+            return (False, None, 0, duration_error, "")
         
         # Check for silent audio (RMS energy check)
-        rms = librosa.feature.rms(y=y)
-        if rms.max() < 0.001:  # Very quiet - likely silent
-            return (False, None, 0,
-                    format_error_message('audio_silent',
-                        f"Maximum RMS energy: {rms.max():.6f} (threshold: 0.001)"), "")
-        
-        if rms.max() < 0.01:  # Quiet but not silent - add warning
-            warning_msg = "⚠️ Audio is very quiet - transcription quality may be affected"
+        rms: Any = librosa.feature.rms(y=y)  # type: ignore[reportUnknownMemberType]
+        is_valid, energy_error, warning_msg = _validate_audio_energy(rms.max())  # type: ignore[reportUnknownArgumentType]
+        if not is_valid:
+            return (False, None, 0, energy_error, "")
         
         # Resample to 16kHz if needed (NeMo models expect 16kHz)
         if sr != 16000:
-            y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+            y = librosa.resample(y, orig_sr=sr, target_sr=16000)  # type: ignore[reportUnknownMemberType]
             sr = 16000
         
         # Convert to mono if stereo
-        if y.ndim > 1:
-            y = librosa.to_mono(y)
+        if y.ndim > 1:  # type: ignore[reportUnknownMemberType]
+            y = librosa.to_mono(y)  # type: ignore[reportUnknownMemberType]
         
-        return (True, y, sr, "", warning_msg)
+        return (True, y, sr, "", warning_msg)  # type: ignore[reportReturnType]
         
     except Exception as e:
-        error_str = str(e)
-        
-        # Provide specific error messages based on error type
-        if "Audio file" in error_str or "NoBackendError" in error_str:
-            return (False, None, 0,
-                    format_error_message('audio_load_failed', error_str), "")
-        elif "Format" in error_str or "codec" in error_str.lower():
-            return (False, None, 0,
-                    format_error_message('format_unsupported', error_str), "")
-        else:
-            return (False, None, 0,
-                    format_error_message('audio_load_failed', error_str), "")
+        return (False, None, 0, _classify_audio_load_error(str(e)), "")
 
 
 # ============================================================================
@@ -777,11 +961,48 @@ def validate_and_normalize_audio(file_path):
 # - Checks .text is a non-empty string
 # ============================================================================
 
-def validate_transcription_result(result, idx=0):
-    """Validate transcription result before accessing text.
+def _validate_result_structure(result: Any, idx: int) -> Tuple[bool, str]:
+    """Validate basic result structure.
     
-    Performs comprehensive validation of the model.transcribe() output
-    to prevent AttributeError and other crashes from malformed results.
+    Returns:
+        Tuple of (valid: bool, error_msg: str)
+    """
+    if result is None:
+        return False, "Result is None - model may have failed silently"
+    if not isinstance(result, list):
+        return False, f"Result is {type(result).__name__}, expected list"
+    if len(result) == 0:  # type: ignore[reportUnknownArgumentType]
+        return False, "Result is an empty list - no transcription generated"
+    if idx >= len(result):  # type: ignore[reportUnknownArgumentType]
+        return False, f"Index {idx} out of range (result has {len(result)} items)"  # type: ignore[reportUnknownArgumentType]
+    return True, ""
+
+
+def _extract_text_from_hypothesis(hypothesis: Any) -> Tuple[bool, str, str]:
+    """Extract text from hypothesis object or string.
+    
+    Returns:
+        Tuple of (success: bool, text: str, error_msg: str)
+    """
+    # Try string fallback (some models return plain strings)
+    if isinstance(hypothesis, str):
+        return (len(hypothesis) > 0, hypothesis, "" if hypothesis else "Transcription is empty")
+    
+    # Check hypothesis has text attribute
+    if not hasattr(hypothesis, 'text'):
+        return False, "", f"Hypothesis has no .text attribute (type: {type(hypothesis).__name__})"
+    
+    # Validate text type and content
+    if not isinstance(hypothesis.text, str):
+        return False, "", f".text is {type(hypothesis.text).__name__}, expected string"
+    if len(hypothesis.text) == 0:
+        return False, "", "Transcription is empty (0 characters)"
+    
+    return True, hypothesis.text, ""
+
+
+def validate_transcription_result(result: Any, idx: int = 0) -> Tuple[bool, str, str]:
+    """Validate transcription result before accessing text.
     
     Args:
         result: Output from model.transcribe()
@@ -790,42 +1011,11 @@ def validate_transcription_result(result, idx=0):
     Returns:
         Tuple of (success: bool, text: str, error_msg: str)
     """
-    # Check result is not None
-    if result is None:
-        return (False, "", "Result is None - model may have failed silently")
+    valid, error_msg = _validate_result_structure(result, idx)
+    if not valid:
+        return False, "", error_msg
     
-    # Check result is a list
-    if not isinstance(result, list):
-        return (False, "", f"Result is {type(result).__name__}, expected list")
-    
-    # Check result is not empty
-    if len(result) == 0:
-        return (False, "", "Result is an empty list - no transcription generated")
-    
-    # Check index is valid
-    if idx >= len(result):
-        return (False, "", f"Index {idx} out of range (result has {len(result)} items)")
-    
-    hypothesis = result[idx]
-    
-    # Check hypothesis has text attribute
-    if not hasattr(hypothesis, 'text'):
-        # Try string fallback (some models return plain strings)
-        if isinstance(hypothesis, str):
-            if len(hypothesis) == 0:
-                return (False, "", "Transcription is empty")
-            return (True, hypothesis, "")
-        return (False, "", f"Hypothesis has no .text attribute (type: {type(hypothesis).__name__})")
-    
-    # Check text is a string
-    if not isinstance(hypothesis.text, str):
-        return (False, "", f".text is {type(hypothesis.text).__name__}, expected string")
-    
-    # Check text is not empty
-    if len(hypothesis.text) == 0:
-        return (False, "", "Transcription is empty (0 characters)")
-    
-    return (True, hypothesis.text, "")
+    return _extract_text_from_hypothesis(result[idx])
 
 
 # ============================================================================
@@ -837,7 +1027,7 @@ def validate_transcription_result(result, idx=0):
 # 3. Return empty list if both unavailable
 # ============================================================================
 
-def _try_get_timestamp_level(hypothesis, level_key):
+def _try_get_timestamp_level(hypothesis: Any, level_key: str) -> Optional[List[Dict[str, Any]]]:
     """Try to extract timestamps at a specific level from hypothesis.
     
     Args:
@@ -851,15 +1041,15 @@ def _try_get_timestamp_level(hypothesis, level_key):
         ts_dict = getattr(hypothesis, 'timestamp', None)
         if not ts_dict or not isinstance(ts_dict, dict):
             return None
-        timestamps = ts_dict.get(level_key)
-        if isinstance(timestamps, list) and len(timestamps) > 0:
-            return timestamps
+        timestamps = ts_dict.get(level_key)  # type: ignore[reportUnknownMemberType]
+        if isinstance(timestamps, list) and len(timestamps) > 0:  # type: ignore[reportUnknownArgumentType]
+            return timestamps  # type: ignore[reportReturnType]
     except (AttributeError, KeyError, TypeError):
         pass
     return None
 
 
-def extract_timestamps(hypothesis, include_timestamps=False):
+def extract_timestamps(hypothesis: Any, include_timestamps: bool = False) -> Tuple[List[Dict[str, Any]], str]:
     """Extract timestamps with word → segment → char → none fallback.
     
     Args:
@@ -882,7 +1072,7 @@ def extract_timestamps(hypothesis, include_timestamps=False):
     return ([], 'none')
 
 
-def format_timestamp_status(level, include_timestamps):
+def format_timestamp_status(level: str, include_timestamps: bool) -> str:
     """Format a status message indicating the timestamp level available.
     
     Args:
@@ -921,7 +1111,7 @@ def format_timestamp_status(level, include_timestamps):
 # "Inference on Numpy Audio Array" section shows this is officially supported
 # ============================================================================
 
-def _load_audio_to_numpy(file_path, target_sr=16000):
+def _load_audio_to_numpy(file_path: str, target_sr: int = 16000) -> Tuple[Any, int]:
     """Load audio file to numpy array for tensor-based transcription.
     
     This bypasses NeMo's file-based dataloader by loading audio directly
@@ -939,8 +1129,8 @@ def _load_audio_to_numpy(file_path, target_sr=16000):
     
     try:
         # Load with librosa - handles various formats and resamples
-        audio, sr = librosa.load(file_path, sr=target_sr, mono=True)
-        return audio, sr
+        audio, sr = librosa.load(file_path, sr=target_sr, mono=True)  # type: ignore[reportUnknownMemberType]
+        return audio, sr  # type: ignore[reportReturnType]
     except Exception as e:
         print(f"   ⚠️ Failed to load {file_path}: {e}")
         raise
@@ -972,15 +1162,15 @@ chunk_duration_sec = DEFAULT_CHUNK_DURATION_SEC
 long_audio_threshold_sec = DEFAULT_LONG_AUDIO_THRESHOLD_SEC
 
 
-def _clear_vram():
+def _clear_vram() -> None:
     """Clear CUDA VRAM and run garbage collection."""
     import gc
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        torch.cuda.empty_cache()  # type: ignore[reportUnknownMemberType]
     gc.collect()
 
 
-def _transcribe_single_buffer(model, buffer, use_cuda):
+def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
     """Transcribe a single audio buffer.
     
     Args:
@@ -991,20 +1181,21 @@ def _transcribe_single_buffer(model, buffer, use_cuda):
     Returns:
         Result from model.transcribe()
     """
-    transcribe_kwargs = {
+    transcribe_kwargs: Dict[str, Any] = {
         'audio': [buffer],
         'batch_size': 1,  # Single chunk at a time for memory safety
         'return_hypotheses': True,
+        'timestamps': True,  # Enable timestamp extraction for word/segment boundaries
         'verbose': False
     }
     
-    if use_cuda and torch.cuda.is_available():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+    if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
             return model.transcribe(**transcribe_kwargs)
     return model.transcribe(**transcribe_kwargs)
 
 
-def _extract_hypothesis_text(hypothesis):
+def _extract_hypothesis_text(hypothesis: Any) -> str:
     """Extract text from a hypothesis object.
     
     Args:
@@ -1020,7 +1211,7 @@ def _extract_hypothesis_text(hypothesis):
     return str(hypothesis)
 
 
-def _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chunk_start_time):
+def _adjust_chunk_timestamps(chunk_word_ts: List[Dict[str, Any]], ts_level: str, left_context_duration: float, chunk_start_time: float) -> List[Dict[str, Any]]:
     """Adjust raw timestamps from a chunk to absolute positions.
     
     Args:
@@ -1032,15 +1223,15 @@ def _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chu
     Returns:
         List of adjusted timestamp dicts
     """
-    adjusted_timestamps = []
+    adjusted_timestamps: List[Dict[str, Any]] = []
     
     for ts in chunk_word_ts:
-        adjusted_ts = {
+        adjusted_ts: Dict[str, Any] = {
             'start': max(0.0, ts.get('start', 0.0) - left_context_duration + chunk_start_time),
             'end': ts.get('end', 0.0) - left_context_duration + chunk_start_time,
         }
         # Ensure end >= start
-        adjusted_ts['end'] = max(adjusted_ts['start'], adjusted_ts['end'])
+        adjusted_ts['end'] = max(float(adjusted_ts['start']), float(adjusted_ts['end']))
         
         # Copy text field with correct key
         for key in ('word', 'segment', 'char', 'text'):
@@ -1052,8 +1243,51 @@ def _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chu
     return adjusted_timestamps
 
 
-def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cuda=True,
-                                    chunk_size_override=None):
+def _create_chunk_fallback_timestamp(chunk_start_time: float, chunk_end_time: float, chunk_text: str) -> Dict[str, Any]:
+    """Create a fallback chunk-level timestamp."""
+    return {
+        'start': chunk_start_time,
+        'end': chunk_end_time,
+        'text': chunk_text
+    }
+
+
+def _process_single_chunk(model: Any, buffer: Any, use_cuda: bool, apply_itn_per_chunk: bool,
+                          chunk_start_time: float, chunk_end_time: float,
+                          left_context_duration: float) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Process a single audio chunk and return transcription and timestamps.
+    
+    Returns:
+        Tuple of (chunk_text or None, chunk_timestamps list)
+    """
+    result = _transcribe_single_buffer(model, buffer, use_cuda)
+    
+    if not result or len(result) == 0:
+        return None, []
+    
+    hypothesis = result[0]
+    chunk_text = _extract_hypothesis_text(hypothesis).strip()
+    
+    if not chunk_text:
+        return None, []
+    
+    # Apply ITN to this chunk immediately (before text gets too long)
+    if apply_itn_per_chunk:
+        chunk_text = apply_itn_to_segment(chunk_text)
+    
+    # Extract and adjust timestamps
+    chunk_word_ts, ts_level = extract_timestamps(hypothesis, include_timestamps=True)
+    
+    if chunk_word_ts and ts_level in ('word', 'segment', 'char'):
+        adjusted = _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chunk_start_time)
+        return chunk_text, adjusted
+    else:
+        # Fallback: chunk-level timestamp
+        return chunk_text, [_create_chunk_fallback_timestamp(chunk_start_time, chunk_end_time, chunk_text)]
+
+
+def _transcribe_long_audio_chunked(model: Any, audio_array: Any, sample_rate: int = 16000, use_cuda: bool = True,
+                                    chunk_size_override: Optional[int] = None, apply_itn_per_chunk: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
     """Transcribe long audio by processing in chunks to avoid VRAM OOM.
     
     This function splits long audio into manageable chunks with overlap,
@@ -1066,6 +1300,7 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
         sample_rate: Sample rate in Hz (default 16000)
         use_cuda: Whether to use CUDA with mixed precision
         chunk_size_override: Override chunk duration in seconds (None = use global setting)
+        apply_itn_per_chunk: Whether to apply ITN to each chunk immediately (avoids long text issues)
     
     Returns:
         Tuple of (full_transcription_text, chunk_timestamps)
@@ -1081,8 +1316,8 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
     
     print(f"   ⚡ Chunked transcription: {total_duration:.1f}s audio → {effective_chunk_duration}s chunks")
     
-    transcriptions = []
-    chunk_timestamps = []
+    transcriptions: List[str] = []
+    chunk_timestamps: List[Dict[str, Any]] = []
     position = 0
     chunk_num = 0
     
@@ -1096,42 +1331,20 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
         
         chunk_start_time = position / sample_rate
         chunk_end_time = min((position + chunk_samples) / sample_rate, total_duration)
+        left_context_duration = (position - start) / sample_rate if position > start else 0
         
         print(f"   📍 Chunk {chunk_num}: {chunk_start_time:.1f}s - {chunk_end_time:.1f}s ({len(buffer)/sample_rate:.1f}s with context)")
         
         _clear_vram()
         
         try:
-            result = _transcribe_single_buffer(model, buffer, use_cuda)
-            
-            if not result or len(result) == 0:
-                position += step_samples
-                continue
-            
-            hypothesis = result[0]
-            chunk_text = _extract_hypothesis_text(hypothesis).strip()
-            
-            if not chunk_text:
-                position += step_samples
-                continue
-            
-            transcriptions.append(chunk_text)
-            
-            # Extract and adjust timestamps
-            left_context_duration = (position - start) / sample_rate if position > start else 0
-            chunk_word_ts, ts_level = extract_timestamps(hypothesis, include_timestamps=True)
-            
-            if chunk_word_ts and ts_level in ('word', 'segment', 'char'):
-                adjusted = _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chunk_start_time)
-                chunk_timestamps.extend(adjusted)
-            else:
-                # Fallback: chunk-level timestamp
-                chunk_timestamps.append({
-                    'start': chunk_start_time,
-                    'end': chunk_end_time,
-                    'text': chunk_text
-                })
-                
+            chunk_text, ts_list = _process_single_chunk(
+                model, buffer, use_cuda, apply_itn_per_chunk,
+                chunk_start_time, chunk_end_time, left_context_duration
+            )
+            if chunk_text:
+                transcriptions.append(chunk_text)
+                chunk_timestamps.extend(ts_list)
         except Exception as e:
             print(f"   ⚠️ Chunk {chunk_num} failed: {type(e).__name__}: {e}")
         
@@ -1148,7 +1361,7 @@ def _transcribe_long_audio_chunked(model, audio_array, sample_rate=16000, use_cu
     return full_transcription.strip(), chunk_timestamps
 
 
-def _load_audio_files_to_memory(files):
+def _load_audio_files_to_memory(files: List[str]) -> List[Tuple[Any, float]]:
     """Load audio files into numpy arrays.
     
     Args:
@@ -1161,7 +1374,7 @@ def _load_audio_files_to_memory(files):
         Exception: If any file fails to load
     """
     print(f"   📂 Loading {len(files)} audio file(s) into memory...")
-    audio_data = []
+    audio_data: List[Tuple[Any, float]] = []
     
     for file_path in files:
         try:
@@ -1176,7 +1389,8 @@ def _load_audio_files_to_memory(files):
     return audio_data
 
 
-def _transcribe_chunked_files(model, audio_data, use_cuda, chunk_size_override, threshold):
+def _transcribe_chunked_files(model: Any, audio_data: List[Tuple[Any, float]], use_cuda: bool, chunk_size_override: Optional[int], threshold: float,
+                               apply_itn_per_chunk: bool = False) -> Tuple[List[Any], Dict[int, List[Dict[str, Any]]]]:
     """Process files using chunked transcription for long audio.
     
     Args:
@@ -1185,27 +1399,29 @@ def _transcribe_chunked_files(model, audio_data, use_cuda, chunk_size_override, 
         use_cuda: Whether to use CUDA
         chunk_size_override: Override chunk duration
         threshold: Duration threshold for chunking
+        apply_itn_per_chunk: Whether to apply ITN immediately after each chunk
         
     Returns:
         Tuple of (results, chunk_timestamps_map)
     """
     print(f"   ⚡ Long audio detected (>{threshold}s) - using chunked transcription")
     
-    results = []
-    chunk_timestamps_map = {}
+    results: List[Any] = []
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]] = {}
     
     for i, (audio_np, duration) in enumerate(audio_data):
         if duration > threshold:
             # Use chunked transcription for long audio
             text, chunk_ts = _transcribe_long_audio_chunked(
                 model, audio_np, sample_rate=16000, use_cuda=use_cuda,
-                chunk_size_override=chunk_size_override
+                chunk_size_override=chunk_size_override,
+                apply_itn_per_chunk=apply_itn_per_chunk
             )
             chunk_timestamps_map[i] = chunk_ts
             
             # Wrap in Hypothesis-like object for API compatibility
             class _Hypothesis:
-                def __init__(self, t, ts):
+                def __init__(self, t: str, ts: List[Dict[str, Any]]) -> None:
                     self.text = t
                     self.chunk_timestamps = ts
             results.append(_Hypothesis(text, chunk_ts))
@@ -1219,72 +1435,52 @@ def _transcribe_chunked_files(model, audio_data, use_cuda, chunk_size_override, 
     return results, chunk_timestamps_map
 
 
-def _transcribe_short_audio_batch(model, audio_arrays, batch_size, use_cuda, max_retries, base_delay):
-    """Transcribe batch of short audio files with retry logic.
+def _execute_transcription(model: Any, transcribe_kwargs: Dict[str, Any], use_cuda: bool) -> Any:
+    """Execute model transcription with optional CUDA mixed precision.
     
     Args:
-        model: Loaded NeMo ASR model
-        audio_arrays: List of numpy audio arrays
-        batch_size: Batch size for transcription
+        model: NeMo ASR model
+        transcribe_kwargs: Dict of kwargs for model.transcribe()
         use_cuda: Whether to use CUDA
-        max_retries: Maximum retry attempts
-        base_delay: Base delay between retries
         
     Returns:
-        Transcription result from model.transcribe()
-        
-    Raises:
-        Exception: If transcription fails after all retries
+        Transcription result
     """
-    import gc
-    
+    if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
+            return model.transcribe(**transcribe_kwargs)
+    return model.transcribe(**transcribe_kwargs)
+
+
+def _transcribe_short_audio_batch(model: Any, audio_arrays: List[Any], batch_size: int, use_cuda: bool, max_retries: int, base_delay: float) -> Any:
+    """Transcribe batch of short audio files with retry logic."""
     print(f"   ✅ Audio loaded into memory, starting transcription...")
-    last_error = None
+    
+    transcribe_kwargs: Dict[str, Any] = {
+        'audio': audio_arrays,
+        'batch_size': batch_size,
+        'return_hypotheses': True,
+        'timestamps': True,
+        'verbose': True
+    }
     
     for attempt in range(max_retries):
         try:
-            transcribe_kwargs = {
-                'audio': audio_arrays,
-                'batch_size': batch_size,
-                'return_hypotheses': True,
-                'verbose': True
-            }
-            
-            if use_cuda and torch.cuda.is_available():
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    return model.transcribe(**transcribe_kwargs)
-            return model.transcribe(**transcribe_kwargs)
-            
-        except PermissionError as e:
-            last_error = e
-            error_str = str(e)
-            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
-            
-            if is_file_lock and attempt < max_retries - 1:
-                delay = base_delay * (attempt + 1)
-                print(f"   ⚠️ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
-                _clear_vram()
-                time.sleep(delay)
-                continue
-            raise
-                
-        except Exception as e:
-            if attempt < max_retries - 1:
-                last_error = e
-                delay = base_delay * (attempt + 1)
-                print(f"   ⚠️ Transcription error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
-                _clear_vram()
-                time.sleep(delay)
+            return _execute_transcription(model, transcribe_kwargs, use_cuda)
+        except (PermissionError, Exception) as e:
+            # Clear VRAM on any error
+            _clear_vram()
+            # Check if we should retry (file lock errors OR transient failures)
+            should_retry = _is_file_lock_error(str(e)) or not isinstance(e, PermissionError)
+            if should_retry and _handle_retry_delay(attempt, base_delay, max_retries):
                 continue
             raise
     
-    if last_error:
-        raise last_error
     raise RuntimeError(f"Transcription failed after {max_retries} attempts")
 
 
-def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3,
-                           chunk_size_override=None):
+def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cuda: bool = True, max_retries: int = 3,
+                           chunk_size_override: Optional[int] = None, apply_itn: bool = False) -> Tuple[Any, Dict[int, List[Dict[str, Any]]]]:
     """Transcribe using tensor-based input with chunking for long audio.
     
     Loads audio into numpy arrays to bypass NeMo's Lhotse dataloader,
@@ -1297,6 +1493,7 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
         use_cuda: Whether to use CUDA with mixed precision
         max_retries: Maximum retry attempts
         chunk_size_override: Override chunk duration (None = use global setting)
+        apply_itn: Whether to apply ITN (will be applied per-chunk for long audio)
         
     Returns:
         Tuple of (results, chunk_timestamps_map)
@@ -1309,7 +1506,8 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
     
     if needs_chunking:
         return _transcribe_chunked_files(
-            model, audio_data, use_cuda, chunk_size_override, effective_threshold
+            model, audio_data, use_cuda, chunk_size_override, effective_threshold,
+            apply_itn_per_chunk=apply_itn  # Apply ITN per chunk to avoid long text issues
         )
     
     # Standard path for short audio
@@ -1329,7 +1527,7 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
 #   - "local": ONLY load from local .nemo file (fails if missing)
 #   - "huggingface": ONLY load from HuggingFace
 #   - "local_or_huggingface": Try local first, fallback to HuggingFace
-MODEL_CONFIGS = {
+MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ========== PARAKEET MODELS ==========
     "parakeet-v3": {
         "local_path": "local_models/parakeet-0.6b-v3.nemo",  # Unique filename
@@ -1408,7 +1606,7 @@ MODEL_CONFIGS = {
 # NOT override these - we must modify model.cfg directly using OmegaConf.
 # ============================================================================
 
-def _override_model_dataloader_config(model):
+def _override_model_dataloader_config(model: Any) -> None:
     """Override model's internal dataloader config to prevent file locking.
     
     This modifies model.cfg to set num_workers=0 in all dataloader configs.
@@ -1425,10 +1623,10 @@ def _override_model_dataloader_config(model):
         from omegaconf import OmegaConf
         
         # Disable struct mode to allow modifications
-        OmegaConf.set_struct(model.cfg, False)
+        OmegaConf.set_struct(model.cfg, False)  # type: ignore[reportUnknownMemberType]
         
         # Override num_workers in all dataloader configs
-        modified = []
+        modified: List[str] = []
         for ds_name in ['train_ds', 'validation_ds', 'test_ds']:
             if hasattr(model.cfg, ds_name):
                 ds_cfg = getattr(model.cfg, ds_name)
@@ -1438,7 +1636,7 @@ def _override_model_dataloader_config(model):
                     modified.append(f"{ds_name}: {old_value} -> 0")
         
         # Re-enable struct mode
-        OmegaConf.set_struct(model.cfg, True)
+        OmegaConf.set_struct(model.cfg, True)  # type: ignore[reportUnknownMemberType]
         
         if modified:
             print(f"   ✅ Overrode dataloader num_workers: {', '.join(modified)}")
@@ -1450,7 +1648,7 @@ def _override_model_dataloader_config(model):
         print(f"   ⚠️  Could not override model config (non-fatal): {e}")
 
 
-def get_model_key_from_choice(choice_text):
+def get_model_key_from_choice(choice_text: str) -> str:
     """Extract model key from radio button choice text
     
     Args:
@@ -1480,18 +1678,36 @@ def get_model_key_from_choice(choice_text):
     # Default to parakeet-v3 if no match
     return "parakeet-v3"
 
-def get_script_dir():
+def get_script_dir() -> Path:
     """Get the directory where the script is located"""
     return Path(__file__).parent.absolute()
 
-def validate_local_models():
+def _check_model_local_availability(script_dir: Path, model_key: str, config: Dict[str, Any]) -> Tuple[bool, str]:
+    """Check if a model is available locally or needs HuggingFace download.
+    
+    Returns:
+        Tuple of (is_local: bool, message: str)
     """
-    Display local model setup status and provide informational messages.
+    local_path = config.get("local_path")
+    display_name = config['display_name']
+    hf_id = config['hf_model_id']
+    
+    if not local_path:
+        return False, f"   📥 {display_name}: HuggingFace only ({hf_id})"
+    
+    full_path = script_dir / local_path
+    if full_path.exists():
+        size_mb = full_path.stat().st_size / (1024 * 1024)
+        return True, f"   ✅ {display_name}: {full_path.name} ({size_mb:.1f} MB)"
+    
+    return False, f"   📥 {display_name}: Will download from HuggingFace ({hf_id})"
+
+
+def validate_local_models() -> None:
+    """Display local model setup status and provide informational messages.
     
     With "local_or_huggingface" loading method, local .nemo files are OPTIONAL.
     Models will automatically download from HuggingFace if local files are missing.
-    
-    This function is informational only and does not block startup.
     """
     script_dir = get_script_dir()
     local_models_dir = script_dir / "local_models"
@@ -1500,7 +1716,6 @@ def validate_local_models():
     print("📦 Model Availability Check")
     print("="*80)
     
-    # Check if local_models directory exists
     if not local_models_dir.exists():
         print(f"\n📁 Local models directory not found: {local_models_dir}")
         print("   This is OK - models will download from HuggingFace on first use.")
@@ -1509,20 +1724,12 @@ def validate_local_models():
         print(f"\n📁 Local models directory: {local_models_dir}")
     
     # Check each model's local availability
-    local_found = []
-    hf_fallback = []
+    local_found: List[str] = []
+    hf_fallback: List[str] = []
     
     for model_key, config in MODEL_CONFIGS.items():
-        local_path = config.get("local_path")
-        if local_path:
-            full_path = script_dir / local_path
-            if full_path.exists():
-                size_mb = full_path.stat().st_size / (1024 * 1024)
-                local_found.append(f"   ✅ {config['display_name']}: {full_path.name} ({size_mb:.1f} MB)")
-            else:
-                hf_fallback.append(f"   📥 {config['display_name']}: Will download from HuggingFace ({config['hf_model_id']})")
-        else:
-            hf_fallback.append(f"   📥 {config['display_name']}: HuggingFace only ({config['hf_model_id']})")
+        is_local, msg = _check_model_local_availability(script_dir, model_key, config)
+        (local_found if is_local else hf_fallback).append(msg)
     
     if local_found:
         print("\n📦 Local .nemo files found (instant loading):")
@@ -1537,77 +1744,56 @@ def validate_local_models():
     print("\n💡 Tip: Run 'python setup_local_models.py' to download all models locally")
     print("="*80 + "\n")
 
-def copy_gradio_file_to_cache(file_path, max_retries=6):
+
+def _try_file_copy(source_path: Path, dest_path: Path) -> bool:
+    """Attempt to copy file and verify success.
+    
+    Returns:
+        True if copy succeeded and verified, False if failed
+    """
+    shutil.copy2(source_path, dest_path)
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        return True
+    # Invalid copy - clean up
+    if dest_path.exists():
+        dest_path.unlink()
+    return False
+
+
+def copy_gradio_file_to_cache(file_path: str, max_retries: int = 6) -> str:
     """Copy Gradio uploaded file to cache directory to prevent manifest.json file locking.
-    
-    Gradio uploads files to its own temp directory. When NeMo reads these files,
-    it may create manifest.json in that location or in system temp, which can
-    cause WinError 32 (file in use) issues on Windows.
-    
-    This function copies uploaded files from Gradio's temp to our controlled
-    cache directory BEFORE passing to NeMo, ensuring all NeMo operations
-    (including internal manifest creation) happen in our cache location.
     
     Args:
         file_path: Path to Gradio uploaded file
-        max_retries: Maximum retry attempts for file copy (default: 6 for Windows antivirus)
+        max_retries: Maximum retry attempts for file copy
         
     Returns:
         Path to file in cache directory
-        
-    Raises:
-        OSError: If file copy fails after all retries
     """
-    file_path = Path(file_path)
+    file_path_obj = Path(file_path)
     
-    # Generate unique filename using hash of original path + filename
-    # This prevents collisions from multiple uploads of same filename
-    # SHA-256 is used for secure, collision-resistant filename generation
-    path_hash = hashlib.sha256(str(file_path).encode()).hexdigest()[:16]
-    cached_filename = f"{path_hash}_{file_path.name}"
-    cached_path = _gradio_cache_dir / cached_filename
+    # Generate unique filename using hash of original path
+    path_hash = hashlib.sha256(str(file_path_obj).encode()).hexdigest()[:16]
+    cached_path = _gradio_cache_dir / f"{path_hash}_{file_path_obj.name}"
     
-    # If file already cached, return immediately
+    # Return immediately if already cached
     if cached_path.exists():
         return str(cached_path)
     
-    # Copy with retry logic for Windows file locks
-    # Use linear backoff to accommodate antivirus scanning (500ms-4000ms)
-    base_delay = 0.5  # 500ms base delay
-    
+    # Copy with retry logic
+    base_delay = 0.5
     for attempt in range(max_retries):
         try:
-            shutil.copy2(file_path, cached_path)
-            
-            # Validate file was actually written and is readable
-            if cached_path.exists() and cached_path.stat().st_size > 0:
+            if _try_file_copy(file_path_obj, cached_path):
                 return str(cached_path)
-            else:
-                # File exists but is empty or invalid - treat as failure
-                if cached_path.exists():
-                    cached_path.unlink()  # Remove invalid file
-                raise OSError(f"File copy succeeded but file is empty or invalid: {cached_path}")
-            
         except (OSError, PermissionError) as e:
-            error_str = str(e)
-            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
-            
-            if is_file_lock and attempt < max_retries - 1:
-                # Linear backoff: 0.5s, 1.0s, 1.5s, 2.0s, 2.5s, 3.0s = 10.5s total
-                delay = base_delay * (attempt + 1)
-                print(f"   ⚠️  File copy lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
-                time.sleep(delay)
+            if _is_file_lock_error(str(e)) and _handle_retry_delay(attempt, base_delay, max_retries):
                 continue
-            
-            # Final retry failed or non-file-lock error
-            raise OSError(
-                f"Failed to copy file to cache after {attempt + 1} attempts.\n"
-                f"Source: {file_path}\n"
-                f"Destination: {cached_path}\n"
-                f"Error: {error_str}"
-            )
+            raise OSError(f"Failed to copy file to cache: {file_path_obj} -> {cached_path}. Error: {e}")
+    
+    raise OSError(f"File copy failed after {max_retries} attempts: {file_path_obj}")
 
-def get_dynamic_batch_size(duration, model_key):
+def get_dynamic_batch_size(duration: float, model_key: str) -> int:
     """Calculate optimal batch size based on audio duration and model
     
     DEPRECATED: This function is no longer used. NeMo's transcribe() method
@@ -1620,17 +1806,17 @@ def get_dynamic_batch_size(duration, model_key):
     # Return NeMo's default batch_size for file batching
     return 4
 
-def setup_gpu_optimizations():
+def setup_gpu_optimizations() -> None:
     """Enable GPU optimizations for better performance"""
-    if torch.cuda.is_available():
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
         # Enable TF32 for matrix multiplication (Ampere+ GPUs)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[reportUnknownMemberType]
+        torch.backends.cudnn.allow_tf32 = True  # type: ignore[reportUnknownMemberType]
         # Enable cuDNN benchmark for faster convolutions
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = True  # type: ignore[reportUnknownMemberType]
         print("✅ GPU optimizations enabled (TF32, cuDNN benchmark)")
 
-def _format_model_error(title, model_path, display_name, problem_msg, solution_msg, original_error=None):
+def _format_model_error(title: str, model_path: str, display_name: str, problem_msg: str, solution_msg: str, original_error: Optional[Exception] = None) -> str:
     """Format a model loading error message with consistent styling.
     
     Args:
@@ -1668,7 +1854,7 @@ def _format_model_error(title, model_path, display_name, problem_msg, solution_m
     return "\n".join(error_lines)
 
 
-def _format_network_error(display_name, error):
+def _format_network_error(display_name: str, error: Exception) -> str:
     """Format a network error message for HuggingFace download failures."""
     return (
         f"\n{'='*80}\n"
@@ -1682,7 +1868,7 @@ def _format_network_error(display_name, error):
     )
 
 
-def _format_disk_space_error(display_name, error):
+def _format_disk_space_error(display_name: str, error: Exception) -> str:
     """Format a disk space error message."""
     return (
         f"\n{'='*80}\n"
@@ -1696,7 +1882,7 @@ def _format_disk_space_error(display_name, error):
     )
 
 
-def _format_filesystem_error(display_name, error):
+def _format_filesystem_error(display_name: str, error: Exception) -> str:
     """Format a file system error message."""
     return (
         f"\n{'='*80}\n"
@@ -1711,7 +1897,7 @@ def _format_filesystem_error(display_name, error):
     )
 
 
-def _handle_huggingface_os_error(error, display_name):
+def _handle_huggingface_os_error(error: OSError, display_name: str) -> None:
     """Handle OSError from HuggingFace loading - raise appropriate error type.
     
     Args:
@@ -1727,7 +1913,99 @@ def _handle_huggingface_os_error(error, display_name):
     raise OSError(_format_filesystem_error(display_name, error))
 
 
-def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
+def _format_file_lock_error(display_name: str, model_source: str, max_retries: int) -> str:
+    """Format a file lock error message with diagnostics and solutions.
+    
+    Args:
+        display_name: Human-readable model name
+        model_source: Path or HuggingFace ID of the model
+        max_retries: Number of retries attempted
+        
+    Returns:
+        Formatted error message string
+    """
+    return (
+        f"\n{'='*80}\n"
+        f"❌ FILE LOCK ERROR (PERSISTED AFTER {max_retries} RETRIES)\n"
+        f"{'='*80}\n\n"
+        f"Model: {display_name}\n"
+        f"Source: {model_source}\n\n"
+        f"The model extraction cannot complete due to persistent file locks.\n"
+        f"This typically happens when Windows services hold file handles open.\n\n"
+        f"🔒 Likely Causes:\n"
+        f"  1. Windows Defender or antivirus scanning temp files\n"
+        f"  2. OneDrive, Google Drive, or Dropbox syncing the cache folder\n"
+        f"  3. Windows Search or Windows Indexing Service\n"
+        f"  4. Another Python process accessing the same models\n\n"
+        f"💡 Solutions (in order of likelihood to work):\n"
+        f"  1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
+        f"  2. Add cache directory to antivirus exclusions:\n"
+        f"     {CACHE_DIR}\n"
+        f"  3. Restart your computer\n"
+        f"  4. Run as Administrator\n"
+        f"  5. Disable Windows Search indexing for:\n"
+        f"     {CACHE_DIR}\n\n"
+        f"⚙️ Cache Location:\n"
+        f"  {CACHE_DIR}\n\n"
+        f"If this persists, try manually deleting the cache directory.\n"
+        f"{'='*80}"
+    )
+
+
+def _format_permission_error(display_name: str, error_str: str) -> str:
+    """Format a permission error message (non-file-lock).
+    
+    Args:
+        display_name: Human-readable model name
+        error_str: Original error message string
+        
+    Returns:
+        Formatted error message string
+    """
+    return (
+        f"\n{'='*80}\n"
+        f"❌ PERMISSION ERROR!\n"
+        f"{'='*80}\n\n"
+        f"Model: {display_name}\n"
+        f"Error: {error_str}\n\n"
+        f"The process does not have permission to access the cache directory.\n"
+        f"Try running as Administrator or checking directory permissions.\n"
+        f"Cache location: {CACHE_DIR}\n"
+        f"{'='*80}"
+    )
+
+
+def _is_file_lock_error(error_str: str) -> bool:
+    """Check if error string indicates a Windows file lock issue."""
+    return "WinError 32" in error_str or "being used by another process" in error_str
+
+
+def _handle_retry_delay(attempt: int, base_delay: float, max_retries: int) -> bool:
+    """Handle retry delay logic with garbage collection.
+    
+    Args:
+        attempt: Current attempt number (0-indexed)
+        base_delay: Base delay in seconds
+        max_retries: Maximum number of retries
+        
+    Returns:
+        True if should retry, False if all retries exhausted
+    """
+    if attempt >= max_retries - 1:
+        return False
+    
+    delay = base_delay * (attempt + 1)
+    print(f"   ⚠️  Retry (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
+    
+    gc.collect()
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        torch.cuda.empty_cache()  # type: ignore[reportUnknownMemberType]
+    
+    time.sleep(delay)
+    return True
+
+
+def _load_from_huggingface_with_retry(hf_model_id: str, config: Dict[str, Any], max_retries: int = 3) -> Any:
     """Load model from HuggingFace with retry logic for Windows file lock issues.
     
     Uses linear backoff delays (0.5s, 1.0s, 1.5s) to allow Windows services
@@ -1746,94 +2024,29 @@ def _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3):
         ConnectionError: If HuggingFace download fails
         OSError: If disk space or file system issues occur
     """
-    base_delay = 0.5  # 500ms base delay - Windows services need time to release handles
-    last_error = None
+    base_delay = 0.5
+    display_name = config['display_name']
     
     for attempt in range(max_retries):
         try:
-            return nemo_asr.models.ASRModel.from_pretrained(hf_model_id)
+            return nemo_asr.models.ASRModel.from_pretrained(hf_model_id)  # type: ignore[reportUnknownMemberType, reportReturnType]
             
         except PermissionError as e:
-            last_error = e
             error_str = str(e)
-            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
-            
-            if is_file_lock and attempt < max_retries - 1:
-                # File lock detected - retry with linear backoff
-                delay = base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s
-                print(f"⏳ File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
-                
-                # Force garbage collection and cache cleanup before retry
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                time.sleep(delay)
-                continue
-            
-            elif is_file_lock:
-                # Final retry failed - provide detailed diagnostics
-                raise PermissionError(
-                    f"\n{'='*80}\n"
-                    f"❌ FILE LOCK ERROR (PERSISTED AFTER {max_retries} RETRIES)\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"HuggingFace ID: {hf_model_id}\n\n"
-                    f"The model extraction cannot complete due to persistent file locks.\n"
-                    f"This typically happens when Windows services hold file handles open.\n\n"
-                    f"🔒 Likely Causes:\n"
-                    f"  1. Windows Defender or antivirus scanning temp files\n"
-                    f"  2. OneDrive, Google Drive, or Dropbox syncing the cache folder\n"
-                    f"  3. Windows Search or Windows Indexing Service\n"
-                    f"  4. Another Python process accessing the same models\n\n"
-                    f"💡 Solutions (in order of likelihood to work):\n"
-                    f"  1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
-                    f"  2. Add cache directory to antivirus exclusions:\n"
-                    f"     {CACHE_DIR}\n"
-                    f"  3. Restart your computer\n"
-                    f"  4. Run as Administrator\n"
-                    f"  5. Disable Windows Search indexing\n\n"
-                    f"⚙️ Cache Location:\n"
-                    f"  {CACHE_DIR}\n\n"
-                    f"If this persists, try manually deleting the cache directory.\n"
-                    f"{'='*80}"
-                )
-            else:
-                # Different PermissionError (not file lock) - re-raise immediately
-                raise PermissionError(
-                    f"\n{'='*80}\n"
-                    f"❌ PERMISSION ERROR!\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Error: {error_str}\n\n"
-                    f"The process does not have permission to access the cache directory.\n"
-                    f"Try running as Administrator or checking directory permissions.\n"
-                    f"Cache location: {CACHE_DIR}\n"
-                    f"{'='*80}"
-                )
+            if _is_file_lock_error(error_str):
+                if _handle_retry_delay(attempt, base_delay, max_retries):
+                    continue
+                raise PermissionError(_format_file_lock_error(display_name, hf_model_id, max_retries))
+            raise PermissionError(_format_permission_error(display_name, error_str))
     
-    # This is reached if all attempts fail without raising an exception
-    # (should not happen with current logic, but provides safety)
-    if last_error:
-        raise last_error
     raise RuntimeError(f"Failed to load model after {max_retries} attempts")
 
 
-def _load_with_retry(restore_path, config, max_retries=3):
+def _load_with_retry(restore_path: Union[str, Path], config: Dict[str, Any], max_retries: int = 3) -> Any:
     """Load model from .nemo file with retry logic for Windows file lock issues.
     
     Enhanced retry logic wrapper for ASRModel.restore_from() that handles
     Windows file locking errors during model extraction.
-    
-    Since we've set tempfile.tempdir to use our custom cache directory (Fix #2),
-    NeMo's internal extraction will use that location instead of system %TEMP%.
-    This function adds retry logic to handle any remaining transient file locks.
-    
-    How it works:
-    1. Attempts to load model using ASRModel.restore_from()
-    2. If WinError 32 occurs, cleanup and retry with linear backoff
-    3. Force garbage collection between retries to release file handles
-    4. Provides detailed error messages after all retries exhausted
     
     Args:
         restore_path: Path to .nemo file
@@ -1847,88 +2060,189 @@ def _load_with_retry(restore_path, config, max_retries=3):
         PermissionError: If file lock persists after retries
         OSError: If extraction or loading fails
     """
-    base_delay = 0.5  # 500ms base delay - Windows services need time to release handles
+    base_delay = 0.5
+    display_name = config['display_name']
     
     for attempt in range(max_retries):
         try:
-            # Load model - NeMo will extract to tempfile.tempdir location
-            model = nemo_asr.models.ASRModel.restore_from(
-                restore_path=str(restore_path)
-            )
-            return model
+            return nemo_asr.models.ASRModel.restore_from(restore_path=str(restore_path))  # type: ignore[reportUnknownMemberType, reportReturnType]
             
         except PermissionError as e:
             error_str = str(e)
-            is_file_lock = "WinError 32" in error_str or "being used by another process" in error_str
-            
-            if is_file_lock and attempt < max_retries - 1:
-                # File lock detected - retry with linear backoff
-                delay = base_delay * (attempt + 1)  # 0.5s, 1.0s, 1.5s
-                print(f"   ⚠️  File lock detected (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
-                
-                # Force garbage collection and cache cleanup before retry
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                time.sleep(delay)
-                continue
-            
-            elif is_file_lock:
-                # Final retry failed - provide detailed diagnostics
-                raise PermissionError(
-                    f"\n{'='*80}\n"
-                    f"❌ FILE LOCK ERROR (PERSISTED AFTER {max_retries} RETRIES)\n"
-                    f"{'='*80}\n\n"
-                    f"Model: {config['display_name']}\n"
-                    f"Source: {restore_path}\n\n"
-                    f"The model extraction cannot complete due to persistent file locks.\n"
-                    f"This typically happens when Windows services hold file handles open.\n\n"
-                    f"🔒 Likely Causes:\n"
-                    f"  1. Windows Defender or antivirus scanning temp files\n"
-                    f"  2. OneDrive, Google Drive, or Dropbox syncing the cache folder\n"
-                    f"  3. Windows Search or Windows Indexing Service\n"
-                    f"  4. Another Python process accessing the same models\n\n"
-                    f"💡 Solutions (in order of likelihood to work):\n"
-                    f"  1. Pause OneDrive/Dropbox/Google Drive temporarily\n"
-                    f"  2. Add cache directory to antivirus exclusions:\n"
-                    f"     {CACHE_DIR}\n"
-                    f"  3. Restart your computer\n"
-                    f"  4. Run as Administrator\n"
-                    f"  5. Disable Windows Search indexing for:\n"
-                    f"     {CACHE_DIR}\n"
-                    f"     (especially the tmp subdirectory)\n\n"
-                    f"⚙️ Cache Location:\n"
-                    f"  {CACHE_DIR}\n\n"
-                    f"If this persists, try manually deleting the cache and temp directories.\n"
-                    f"{'='*80}"
-                )
-            else:
-                # Different PermissionError (not file lock) - re-raise immediately
-                raise
+            if _is_file_lock_error(error_str):
+                if _handle_retry_delay(attempt, base_delay, max_retries):
+                    continue
+                raise PermissionError(_format_file_lock_error(display_name, str(restore_path), max_retries))
+            raise  # Non-file-lock permission errors - re-raise immediately
         
         except Exception as e:
-            # Other exceptions - retry for transient issues
-            # Note: Broad exception handling is intentional here to handle various
-            # transient failures (disk I/O, network, etc.) during model extraction
-            if attempt < max_retries - 1:
-                delay = base_delay * (attempt + 1)
-                print(f"   ⚠️  Extraction error (attempt {attempt + 1}/{max_retries}): {e}")
-                print(f"   Retrying in {delay:.1f}s...")
-                
-                # Force garbage collection before retry
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                time.sleep(delay)
+            # Retry transient failures (disk I/O, etc.)
+            if _handle_retry_delay(attempt, base_delay, max_retries):
+                print(f"   ⚠️  Extraction error: {e}")
                 continue
-            else:
-                # Final attempt failed - re-raise the exception
-                raise
+            raise
 
 
-def load_model(model_name, show_progress=False):
+# ============================================================================
+# Model Loading Strategy Functions (extracted from load_model to reduce cc)
+# ============================================================================
+
+def _unload_cached_models(model_name: str, models_cache: Dict[str, Any]) -> None:
+    """Unload other cached models to free VRAM before loading a new model.
+    
+    Args:
+        model_name: The model being loaded (will NOT be unloaded)
+        models_cache: Global model cache dictionary
+    """
+    models_to_unload = [key for key in models_cache.keys() if key != model_name]
+    
+    if not models_to_unload or not torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        return
+        
+    for old_model_key in models_to_unload:
+        try:
+            old_model = models_cache[old_model_key]
+            print(f"🔄 Unloading {old_model_key} to free VRAM for {model_name}...")
+            
+            # Move model to CPU first to free VRAM
+            old_model = old_model.to("cpu")
+            
+            # Delete the model reference
+            del models_cache[old_model_key]
+            del old_model
+            
+            # Clear CUDA cache and run garbage collection
+            torch.cuda.empty_cache()  # type: ignore[reportUnknownMemberType]
+            gc.collect()
+            
+            print(f"   ✅ {old_model_key} unloaded successfully")
+            
+        except Exception as e:
+            print(f"   ⚠️  Failed to unload {old_model_key}: {e}")
+            # Continue loading the new model anyway
+
+
+def _try_load_local_model(model_path: Optional[Path], config: Dict[str, Any]) -> Tuple[Optional[Any], bool]:
+    """Try loading model from local .nemo file.
+    
+    Returns:
+        Tuple of (model, should_fallback: bool)
+    """
+    if not model_path or not model_path.exists():
+        return None, True  # No local file, should fallback
+    
+    print(f"📦 Loading {config['display_name']} from local file...")
+    print(f"   Path: {model_path}")
+    
+    try:
+        model = _load_with_retry(restore_path=model_path, config=config, max_retries=3)
+        _override_model_dataloader_config(model)
+        return model, False
+    except PermissionError as e:
+        if _is_file_lock_error(str(e)):
+            print(f"⚠️  Local file locked, falling back to HuggingFace...")
+            return None, True
+        raise
+    except Exception as e:
+        print(f"⚠️  Local file corrupted or invalid: {e}")
+        print(f"   Falling back to HuggingFace download...")
+        return None, True
+
+
+def _load_model_local_or_huggingface(model_name: str, config: Dict[str, Any], script_dir: Path) -> Any:
+    """Load model trying local .nemo first, then falling back to HuggingFace."""
+    local_path = config.get("local_path")
+    model_path = script_dir / local_path if local_path else None
+    
+    model, _ = _try_load_local_model(model_path, config)
+    if model is not None:
+        return model
+    
+    # Log HuggingFace fallback
+    print(f"📦 Loading {config['display_name']} from HuggingFace...")
+    if model_path:
+        print(f"   Local .nemo file not found: {model_path}")
+    print(f"   To download locally, run: python setup_local_models.py")
+    
+    return _load_model_huggingface(model_name, config)
+
+
+def _load_model_local_only(config: Dict[str, Any], script_dir: Path) -> Any:
+    """Load model strictly from local .nemo file.
+    
+    Raises:
+        FileNotFoundError: If local file doesn't exist
+    """
+    model_path = script_dir / config["local_path"]
+    
+    if not model_path.exists():
+        raise FileNotFoundError(_format_model_error(
+            title="MODEL FILE NOT FOUND!",
+            model_path=model_path,
+            display_name=config['display_name'],
+            problem_msg="The .nemo file must be created once using the setup script.",
+            solution_msg="Please run: python setup_local_models.py"
+        ))
+    
+    print(f"📦 Loading {config['display_name']} from local file...")
+    
+    model = _load_with_retry(restore_path=model_path, config=config, max_retries=3)
+    return model
+
+
+def _load_model_huggingface(model_name: str, config: Dict[str, Any]) -> Any:
+    """Load model from HuggingFace.
+    
+    Raises:
+        ConnectionError: If network fails
+        OSError: If disk space issues
+        RuntimeError: For other unexpected errors
+    """
+    hf_model_id = config["hf_model_id"]
+    
+    print(f"📦 Loading {config['display_name']} from HuggingFace...")
+    print(f"   Model ID: {hf_model_id}")
+    print("   (First load downloads model, subsequent loads use cache)")
+    
+    try:
+        model = _load_from_huggingface_with_retry(hf_model_id, config, max_retries=3)
+        _override_model_dataloader_config(model)
+        return model
+        
+    except ConnectionError as e:
+        raise ConnectionError(_format_network_error(config['display_name'], e))
+    except OSError as e:
+        _handle_huggingface_os_error(e, config['display_name'])
+    except Exception as e:
+        raise RuntimeError(
+            f"\n{'='*80}\n"
+            f"❌ ERROR LOADING MODEL!\n"
+            f"{'='*80}\n\n"
+            f"Model: {config['display_name']}\n"
+            f"An unexpected error occurred: {type(e).__name__}\n\n"
+            f"Solution: Try clearing the cache and retrying.\n"
+            f"Cache location: {CACHE_DIR}\n"
+            f"Original error: {str(e)}\n"
+            f"{'='*80}"
+        )
+
+
+def _move_model_to_cuda(model: Any, model_name: str) -> Any:
+    """Explicitly move model to CUDA if available."""
+    if not torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        return model
+        
+    try:
+        model = model.to("cuda")
+        print(f"   ✅ Model moved to CUDA")
+    except Exception as e:
+        print(f"   ⚠️  Could not move model to CUDA: {e}")
+        # Continue with model on CPU
+    
+    return model
+
+
+def load_model(model_name: str, show_progress: bool = False) -> Any:
     """Load model using the appropriate method based on model type.
     
     All models now use standard ASRModel API (no SALM required).
@@ -1957,216 +2271,47 @@ def load_model(model_name, show_progress=False):
         OSError: If download fails due to disk space issues
         PermissionError: If file locks prevent model extraction
     """
+    # Return cached model if valid
     if model_name in models_cache:
-        # Validate cached model before returning
         cached_model = models_cache[model_name]
         try:
-            # Quick validation: model should have required methods
             if not hasattr(cached_model, 'transcribe'):
                 print(f"⚠️  Cached {model_name} appears corrupted (missing transcribe method)")
-                # Remove corrupted cache entry
                 del models_cache[model_name]
-                # Recursively reload
                 return load_model(model_name, show_progress)
-            # Cached model is valid, return it
             return cached_model
         except Exception as e:
             print(f"⚠️  Cached model validation failed: {e}")
             del models_cache[model_name]
-            # Fall through to reload
     
-    # ========================================================================
-    # Explicit Device Management (Pattern 3: HuggingFace Modernization)
-    # ========================================================================
-    # Before loading a new model, unload any other models from VRAM to prevent
-    # OOM errors. This is critical when switching between models (e.g., 
-    # Parakeet → Canary) as multiple large models cannot fit in VRAM together.
-    # ========================================================================
+    # Unload other cached models to free VRAM
+    _unload_cached_models(model_name, models_cache)
     
-    # Check if other models are cached and unload them
-    models_to_unload = [key for key in models_cache.keys() if key != model_name]
-    
-    if models_to_unload and torch.cuda.is_available():
-        for old_model_key in models_to_unload:
-            try:
-                old_model = models_cache[old_model_key]
-                print(f"🔄 Unloading {old_model_key} to free VRAM for {model_name}...")
-                
-                # Move model to CPU first to free VRAM
-                old_model = old_model.to("cpu")
-                
-                # Delete the model reference
-                del models_cache[old_model_key]
-                del old_model
-                
-                # Clear CUDA cache and run garbage collection
-                torch.cuda.empty_cache()
-                gc.collect()
-                
-                print(f"   ✅ {old_model_key} unloaded successfully")
-                
-            except Exception as e:
-                print(f"   ⚠️  Failed to unload {old_model_key}: {e}")
-                # Continue loading the new model anyway
-    
-    # Model not in cache or cache was invalid, proceed to load
+    # Get config and prepare for loading
     config = MODEL_CONFIGS[model_name]
     script_dir = get_script_dir()
     loading_method = config.get("loading_method", "huggingface")
     
     start_time = time.time()
     
-    # ============================================================
-    # LOCAL_OR_HUGGINGFACE: Try local first, fallback to HuggingFace
-    # ============================================================
+    # Load using appropriate strategy
     if loading_method == "local_or_huggingface":
-        local_path = config.get("local_path")
-        model_path = script_dir / local_path if local_path else None
-        
-        # Try loading from local .nemo file first
-        if model_path and model_path.exists():
-            print(f"📦 Loading {config['display_name']} from local file...")
-            print(f"   Path: {model_path}")
-            
-            try:
-                # Use retry logic for file lock handling
-                models_cache[model_name] = _load_with_retry(
-                    restore_path=model_path,
-                    config=config,
-                    max_retries=3
-                )
-                
-                # Override model config to disable multiprocessing in dataloader
-                # This is a FALLBACK - the primary fix is tensor-based transcription
-                _override_model_dataloader_config(models_cache[model_name])
-                
-                load_time = time.time() - start_time
-                print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
-                return models_cache[model_name]
-                
-            except PermissionError as e:
-                error_str = str(e)
-                if "WinError 32" in error_str or "being used by another process" in error_str:
-                    print(f"⚠️  Local file locked, falling back to HuggingFace...")
-                    # Fall through to HuggingFace download
-                else:
-                    raise
-                    
-            except Exception as e:
-                # Local file exists but is corrupted or invalid
-                print(f"⚠️  Local file corrupted or invalid: {e}")
-                print(f"   Falling back to HuggingFace download...")
-                # Fall through to HuggingFace download
-        else:
-            # Local file not found - inform user
-            print(f"📦 Loading {config['display_name']} from HuggingFace...")
-            if model_path:
-                print(f"   Local .nemo file not found: {model_path}")
-            print(f"   To download locally, run: python setup_local_models.py")
-        
-        # Load from HuggingFace (either no local file, or local file failed)
-        hf_model_id = config["hf_model_id"]
-        print(f"   Model ID: {hf_model_id}")
-        print("   (First load downloads model, subsequent loads use cache)")
-        
-        try:
-            models_cache[model_name] = _load_from_huggingface_with_retry(
-                hf_model_id, config, max_retries=3
-            )
-            
-            # Override model config to disable multiprocessing in dataloader
-            # This is a FALLBACK - the primary fix is tensor-based transcription
-            _override_model_dataloader_config(models_cache[model_name])
-            
-        except ConnectionError as e:
-            raise ConnectionError(_format_network_error(config['display_name'], e))
-        except OSError as e:
-            _handle_huggingface_os_error(e, config['display_name'])
-    
-    # ============================================================
-    # LOCAL: Strictly load from local .nemo file only
-    # ============================================================
+        models_cache[model_name] = _load_model_local_or_huggingface(model_name, config, script_dir)
     elif loading_method == "local":
-        model_path = script_dir / config["local_path"]
-        
-        # Check if .nemo file exists
-        if not model_path.exists():
-            raise FileNotFoundError(_format_model_error(
-                title="MODEL FILE NOT FOUND!",
-                model_path=model_path,
-                display_name=config['display_name'],
-                problem_msg="The .nemo file must be created once using the setup script.",
-                solution_msg="Please run: python setup_local_models.py"
-            ))
-        
-        print(f"📦 Loading {config['display_name']} from local file...")
-        
-        # Use retry logic for file lock handling
-        # _load_with_retry provides comprehensive error messages for file locks
-        models_cache[model_name] = _load_with_retry(
-            restore_path=model_path,
-            config=config,
-            max_retries=3
-        )
-    
-    # ============================================================
-    # HUGGINGFACE: Load from HuggingFace only
-    # ============================================================
+        models_cache[model_name] = _load_model_local_only(config, script_dir)
     else:
-        hf_model_id = config["hf_model_id"]
-        
-        print(f"📦 Loading {config['display_name']} from HuggingFace...")
-        print(f"   Model ID: {hf_model_id}")
-        print("   (First load downloads model, subsequent loads use cache)")
-        
-        try:
-            models_cache[model_name] = _load_from_huggingface_with_retry(
-                hf_model_id, config, max_retries=3
-            )
-            
-            # Override model config to disable multiprocessing in dataloader
-            # This is a FALLBACK - the primary fix is tensor-based transcription
-            _override_model_dataloader_config(models_cache[model_name])
-            
-        except ConnectionError as e:
-            raise ConnectionError(_format_network_error(config['display_name'], e))
-        except OSError as e:
-            _handle_huggingface_os_error(e, config['display_name'])
-        except Exception as e:
-            raise RuntimeError(
-                f"\n{'='*80}\n"
-                f"❌ ERROR LOADING MODEL!\n"
-                f"{'='*80}\n\n"
-                f"Model: {config['display_name']}\n"
-                f"An unexpected error occurred: {type(e).__name__}\n\n"
-                f"Solution: Try clearing the cache and retrying.\n"
-                f"Cache location: {CACHE_DIR}\n"
-                f"Original error: {str(e)}\n"
-                f"{'='*80}"
-            )
+        models_cache[model_name] = _load_model_huggingface(model_name, config)
     
     load_time = time.time() - start_time
     print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
     
-    # ====================================================================
-    # Explicit CUDA Placement (Pattern 3: HuggingFace Modernization)
-    # ====================================================================
-    # Ensure model is explicitly moved to CUDA after loading.
-    # While NeMo usually handles this, explicit placement ensures
-    # consistent behavior across different loading methods.
-    # ====================================================================
-    if torch.cuda.is_available():
-        try:
-            models_cache[model_name] = models_cache[model_name].to("cuda")
-            print(f"   ✅ Model moved to CUDA")
-        except Exception as e:
-            print(f"   ⚠️  Could not move model to CUDA: {e}")
-            # Continue with model on CPU
+    # Move model to CUDA if available
+    models_cache[model_name] = _move_model_to_cuda(models_cache[model_name], model_name)
     
     return models_cache[model_name]
 
 
-def _save_logs(logs, prefix="transcription"):
+def _save_logs(logs: str, prefix: str = "transcription") -> Optional[str]:
     """Save captured logs to a file for download.
     
     Args:
@@ -2204,7 +2349,7 @@ def _save_logs(logs, prefix="transcription"):
 # - Statistics calculation
 # ============================================================================
 
-def _make_error_response(error_type, error_msg, log_capture_obj):
+def _make_error_response(error_type: str, error_msg: str, log_capture_obj: 'LogCapture') -> Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Create standardized error response tuple for transcribe_audio.
     
     Args:
@@ -2268,24 +2413,177 @@ def _make_error_response(error_type, error_msg, log_capture_obj):
     return status, "", None, None, None, log_file
 
 
-def _save_output_files(base_filename, file_info, transcription, timestamps, timestamp_level,
-                       all_transcriptions=None, all_timestamps=None, is_batch=False,
-                       model_choice="", total_duration=0, total_time=0, apply_itn=False):
+# ============================================================================
+# Output File Generation Helpers (extracted to reduce nesting depth)
+# ============================================================================
+
+def _write_txt_header(
+    f: Any, 
+    model_choice: str, 
+    total_duration: float, 
+    total_time: float, 
+    apply_itn: bool, 
+    file_info: List[Dict[str, Any]], 
+    is_batch: bool
+) -> None:
+    """Write TXT file header with metadata."""
+    itn_text = 'Yes' if apply_itn and ITN_AVAILABLE else 'No'
+    mins, secs = int(total_duration // 60), int(total_duration % 60)
+    
+    if is_batch:
+        f.write(f"Batch Transcription - {len(file_info)} files\n")
+        f.write(f"Model: {model_choice}\n")
+        f.write(f"Total Duration: {mins}m {secs}s\n")
+        f.write(f"Processing Time: {total_time:.2f}s\n")
+        f.write(f"ITN Applied: {itn_text}\n")
+        f.write(f"\n{SEPARATOR}\n")
+    else:
+        info = file_info[0]
+        dur_mins, dur_secs = int(info['duration'] // 60), int(info['duration'] % 60)
+        f.write(f"Audio File: {info['name']}\n")
+        f.write(f"Model: {model_choice}\n")
+        f.write(f"Duration: {dur_mins}m {dur_secs}s\n")
+        f.write(f"Processing Time: {total_time:.2f}s\n")
+        f.write(f"ITN Applied: {itn_text}\n")
+        f.write(f"\n{SEPARATOR}\n")
+        f.write(f"TRANSCRIPTION\n")
+        f.write(f"{SEPARATOR}\n\n")
+
+
+def _write_txt_batch_files(
+    f: Any, 
+    file_info: List[Dict[str, Any]], 
+    all_transcriptions: Optional[List[str]], 
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]]
+) -> None:
+    """Write batch file transcriptions to TXT."""
+    for i, info in enumerate(file_info):
+        trans = all_transcriptions[i] if all_transcriptions else ""
+        f.write(f"\nFILE {i+1}: {info['name']}\n")
+        f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
+        f.write(f"{SEPARATOR}\n\n")
+        ts, ts_level = all_timestamps[i] if all_timestamps and i < len(all_timestamps) else ([], 'none')
+        if ts:
+            f.write(format_as_txt_with_timestamps(trans, ts, ts_level))
+        else:
+            f.write(trans)
+        f.write("\n")
+
+
+def _get_batch_file_data(
+    file_info: List[Dict[str, Any]], 
+    all_transcriptions: Optional[List[str]], 
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]], 
+    index: int
+) -> Tuple[str, List[Dict[str, Any]], str, bool]:
+    """Get transcription and timestamps for a batch file index.
+    
+    Returns:
+        Tuple of (transcription, timestamps, timestamp_level, is_valid)
+    """
+    trans = all_transcriptions[index] if all_transcriptions else ""
+    is_valid = not trans.startswith("[Transcription failed:")
+    ts, ts_level = ([], 'none')
+    if all_timestamps and index < len(all_timestamps):
+        ts, ts_level = all_timestamps[index]
+    return trans, ts, ts_level, is_valid
+
+
+def _write_srt_batch(
+    f: Any, 
+    file_info: List[Dict[str, Any]], 
+    all_transcriptions: Optional[List[str]], 
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]]
+) -> None:
+    """Write batch SRT with file headers and sequential numbering."""
+    srt_index = 1
+    for i, info in enumerate(file_info):
+        trans, ts, _, is_valid = _get_batch_file_data(file_info, all_transcriptions, all_timestamps, i)
+        if not is_valid:
+            continue
+            
+        file_srt = format_as_srt(trans, ts, 'segment')
+        
+        # Write file header as first subtitle entry
+        f.write(f"{srt_index}\n00:00:00,000 --> 00:00:02,000\n[FILE: {info['name']}]\n\n")
+        srt_index += 1
+        
+        # Write subtitle entries, renumbering them
+        for block in file_srt.split('\n\n'):
+            if not block.strip():
+                continue
+            parts = block.split('\n', 1)
+            if len(parts) >= 2:
+                f.write(f"{srt_index}\n{parts[1]}\n\n")
+                srt_index += 1
+
+
+def _write_csv_timestamp_row(f: Any, filename: str, stamp: Dict[str, Any]) -> None:
+    """Write a single CSV row for a timestamp entry."""
+    start = stamp.get('start', 0.0)
+    end = stamp.get('end', 0.0)
+    duration = end - start
+    text = stamp.get('text', stamp.get('word', stamp.get('segment', '')))
+    escaped_text = text.replace('"', '""')
+    escaped_name = filename.replace('"', '""')
+    f.write(f'"{escaped_name}",{start:.3f},{end:.3f},{duration:.3f},"{escaped_text}"\n')
+
+
+def _write_csv_batch(
+    f: Any, 
+    file_info: List[Dict[str, Any]], 
+    all_transcriptions: Optional[List[str]], 
+    all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]]
+) -> None:
+    """Write batch CSV with per-file timestamps."""
+    f.write("file,start_time,end_time,duration,text\n")
+    
+    for i, info in enumerate(file_info):
+        trans, ts, ts_level, is_valid = _get_batch_file_data(file_info, all_transcriptions, all_timestamps, i)
+        if not is_valid:
+            continue
+            
+        if ts:
+            for stamp in ts:
+                _write_csv_timestamp_row(f, info['name'], stamp)
+        else:
+            escaped_trans = trans.replace('"', '""')
+            escaped_name = info['name'].replace('"', '""')
+            f.write(f'"{escaped_name}",0.000,{info["duration"]:.3f},{info["duration"]:.3f},"{escaped_trans}"\n')
+
+
+def _write_txt_content(f: TextIO, config: 'OutputFilesConfig') -> None:
+    """Write TXT file content based on config."""
+    if config.is_batch:
+        _write_txt_batch_files(f, config.file_info, config.all_transcriptions, config.all_timestamps)
+    elif config.timestamps:
+        f.write(format_as_txt_with_timestamps(config.transcription or "", config.timestamps or [], config.timestamp_level))
+    else:
+        f.write(config.transcription or "")
+
+
+def _write_srt_content(f: TextIO, config: 'OutputFilesConfig') -> None:
+    """Write SRT file content based on config."""
+    if config.is_batch:
+        _write_srt_batch(f, config.file_info, config.all_transcriptions, config.all_timestamps)
+    else:
+        f.write(format_as_srt(config.transcription or "", config.timestamps or [], config.timestamp_level))
+
+
+def _write_csv_content(f: TextIO, config: 'OutputFilesConfig') -> None:
+    """Write CSV file content based on config."""
+    if config.is_batch:
+        _write_csv_batch(f, config.file_info, config.all_transcriptions, config.all_timestamps)
+    else:
+        f.write(format_as_csv(config.transcription or "", config.timestamps or [], config.timestamp_level))
+
+
+def _save_output_files(base_filename: str, config: OutputFilesConfig):
     """Generate TXT, SRT, and CSV output files.
     
     Args:
         base_filename: Base name for output files (without extension)
-        file_info: List of dicts with file metadata (name, duration, is_video)
-        transcription: Transcription text (single file) or None (batch)
-        timestamps: Timestamp list (single file) or None (batch)
-        timestamp_level: 'word', 'segment', 'char', or 'none'
-        all_transcriptions: List of transcriptions (batch mode)
-        all_timestamps: List of (timestamps, level) tuples (batch mode)
-        is_batch: Whether this is batch processing
-        model_choice: Model name for metadata
-        total_duration: Total audio duration in seconds
-        total_time: Total processing time in seconds
-        apply_itn: Whether ITN was applied
+        config: OutputFilesConfig with all file data and metadata
         
     Returns:
         Tuple of (txt_file, srt_file, csv_file) paths
@@ -2294,103 +2592,55 @@ def _save_output_files(base_filename, file_info, transcription, timestamps, time
     srt_file = f"{base_filename}.srt"
     csv_file = f"{base_filename}.csv"
     
-    # Generate TXT file
     with open(txt_file, "w", encoding="utf-8") as f:
-        if is_batch:
-            f.write(f"Batch Transcription - {len(file_info)} files\n")
-            f.write(f"Model: {model_choice}\n")
-            f.write(f"Total Duration: {int(total_duration // 60)}m {int(total_duration % 60)}s\n")
-            f.write(f"Processing Time: {total_time:.2f}s\n")
-            f.write(f"ITN Applied: {'Yes' if apply_itn and ITN_AVAILABLE else 'No'}\n")
-            f.write(f"\n{SEPARATOR}\n")
-            
-            for i, info in enumerate(file_info):
-                trans = all_transcriptions[i] if all_transcriptions else ""
-                f.write(f"\nFILE {i+1}: {info['name']}\n")
-                f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
-                f.write(f"{SEPARATOR}\n\n")
-                ts, ts_level = all_timestamps[i] if all_timestamps and i < len(all_timestamps) else ([], 'none')
-                if ts:
-                    f.write(format_as_txt_with_timestamps(trans, ts, ts_level))
-                else:
-                    f.write(trans)
-                f.write("\n")
-        else:
-            info = file_info[0]
-            f.write(f"Audio File: {info['name']}\n")
-            f.write(f"Model: {model_choice}\n")
-            f.write(f"Duration: {int(info['duration'] // 60)}m {int(info['duration'] % 60)}s\n")
-            f.write(f"Processing Time: {total_time:.2f}s\n")
-            f.write(f"ITN Applied: {'Yes' if apply_itn and ITN_AVAILABLE else 'No'}\n")
-            f.write(f"\n{SEPARATOR}\n")
-            f.write(f"TRANSCRIPTION\n")
-            f.write(f"{SEPARATOR}\n\n")
-            
-            if timestamps:
-                f.write(format_as_txt_with_timestamps(transcription, timestamps, timestamp_level))
-            else:
-                f.write(transcription)
+        _write_txt_header(f, config.model_choice, config.total_duration, config.total_time, 
+                         config.apply_itn, config.file_info, config.is_batch)
+        _write_txt_content(f, config)
     
-    # Generate SRT file
     with open(srt_file, "w", encoding="utf-8") as f:
-        if is_batch:
-            srt_index = 1
-            for i, info in enumerate(file_info):
-                trans = all_transcriptions[i] if all_transcriptions else ""
-                if not trans.startswith("[Transcription failed:"):
-                    ts, ts_level = all_timestamps[i] if all_timestamps and i < len(all_timestamps) else ([], 'none')
-                    file_srt = format_as_srt(trans, ts, ts_level)
-                    f.write(f"{srt_index}\n")
-                    f.write(f"00:00:00,000 --> 00:00:02,000\n")
-                    f.write(f"[FILE: {info['name']}]\n\n")
-                    srt_index += 1
-                    for line in file_srt.split('\n\n'):
-                        if line.strip():
-                            parts = line.split('\n', 1)
-                            if len(parts) >= 2:
-                                f.write(f"{srt_index}\n{parts[1]}\n\n")
-                                srt_index += 1
-        else:
-            f.write(format_as_srt(transcription, timestamps, timestamp_level))
+        _write_srt_content(f, config)
     
-    # Generate CSV file
     with open(csv_file, "w", encoding="utf-8") as f:
-        if is_batch:
-            f.write("file,start_time,end_time,duration,text\n")
-            for i, info in enumerate(file_info):
-                trans = all_transcriptions[i] if all_transcriptions else ""
-                if not trans.startswith("[Transcription failed:"):
-                    ts, ts_level = all_timestamps[i] if all_timestamps and i < len(all_timestamps) else ([], 'none')
-                    if ts:
-                        for stamp in ts:
-                            start = stamp.get('start', 0.0)
-                            end = stamp.get('end', 0.0)
-                            duration = end - start
-                            text = stamp.get('text', stamp.get('word', stamp.get('segment', '')))
-                            escaped = text.replace('"', '""')
-                            escaped_name = info['name'].replace('"', '""')
-                            f.write(f'"{escaped_name}",{start:.3f},{end:.3f},{duration:.3f},"{escaped}"\n')
-                    else:
-                        escaped = trans.replace('"', '""')
-                        escaped_name = info['name'].replace('"', '""')
-                        f.write(f'"{escaped_name}",0.000,{info["duration"]:.3f},{info["duration"]:.3f},"{escaped}"\n')
-        else:
-            f.write(format_as_csv(transcription, timestamps, timestamp_level))
+        _write_csv_content(f, config)
     
     return txt_file, srt_file, csv_file
 
 
-def _format_batch_status(file_list, file_info, all_transcriptions, per_file_stats, 
-                         per_file_errors, model_choice, gpu_name, total_duration,
-                         total_time, inference_time, chunk_size, rtfx, vram_used,
-                         apply_itn, video_status=""):
+def _format_itn_status(apply_itn: bool) -> str:
+    """Format ITN status string for display."""
+    if apply_itn and ITN_AVAILABLE:
+        return "- **ITN (Numbers to Digits)**: ✅ Applied"
+    elif apply_itn:
+        return "- **ITN (Numbers to Digits)**: ⚠️ Not installed"
+    else:
+        return "- **ITN (Numbers to Digits)**: Disabled"
+
+
+def _format_batch_status(
+    file_list: List[str], 
+    file_info: List[Dict[str, Any]], 
+    all_transcriptions: List[str], 
+    per_file_stats: List[str], 
+    per_file_errors: List[str], 
+    stats: TranscriptionStats, 
+    video_status: str = ""
+) -> Tuple[str, str]:
     """Format status message for batch transcription.
+    
+    Args:
+        file_list: List of original file paths
+        file_info: List of file metadata dicts
+        all_transcriptions: List of transcription strings
+        per_file_stats: List of per-file stats strings
+        per_file_errors: List of error messages
+        stats: TranscriptionStats with processing metrics
+        video_status: Optional video detection message
     
     Returns:
         Tuple of (status_message, combined_transcription)
     """
-    total_mins = int(total_duration // 60)
-    total_secs = int(total_duration % 60)
+    total_mins = int(stats.total_duration // 60)
+    total_secs = int(stats.total_duration % 60)
     
     # Calculate total words only from successful transcriptions
     successful = [t for t in all_transcriptions if not t.startswith("[Transcription failed:")]
@@ -2404,25 +2654,21 @@ def _format_batch_status(file_list, file_info, all_transcriptions, per_file_stat
             + "\n".join(per_file_errors)
         )
     
-    # ITN status
-    itn_status = "- **ITN (Numbers to Digits)**: " + (
-        "✅ Applied" if apply_itn and ITN_AVAILABLE else 
-        ("⚠️ Not installed" if apply_itn else "Disabled")
-    )
+    itn_status = _format_itn_status(stats.apply_itn)
     
     status = f"""
 ### ✅ Batch Transcription Complete!
 
 {video_status}**📊 Overall Statistics:**
 - **Files Processed**: {len(file_list)} ({len(file_list) - len(per_file_errors)} successful, {len(per_file_errors)} failed)
-- **Model**: {model_choice}
-- **GPU**: {gpu_name}
+- **Model**: {stats.model_choice}
+- **GPU**: {stats.gpu_name}
 - **Total Audio Duration**: {total_mins}m {total_secs}s
-- **Processing Time**: {total_time:.2f} seconds
-- **Inference Time**: {inference_time:.2f} seconds
-- **Chunk Size**: {chunk_size}s
-- **Real-Time Factor**: {rtfx:.1f}× (processed {rtfx:.1f}× faster than real-time)
-- **VRAM Used**: {vram_used:.2f} GB
+- **Processing Time**: {stats.total_time:.2f} seconds
+- **Inference Time**: {stats.inference_time:.2f} seconds
+- **Chunk Size**: {stats.chunk_size}s
+- **Real-Time Factor**: {stats.rtfx:.1f}× (processed {stats.rtfx:.1f}× faster than real-time)
+- **VRAM Used**: {stats.vram_used:.2f} GB
 - **Total Words**: {total_words}
 {itn_status}
 
@@ -2443,10 +2689,17 @@ def _format_batch_status(file_list, file_info, all_transcriptions, per_file_stat
     return status, combined
 
 
-def _format_single_status(file_info, model_choice, gpu_name, total_time, inference_time,
-                          load_time, chunk_size, rtfx, vram_used, transcription,
-                          timestamp_level, include_timestamps, apply_itn, video_status=""):
+def _format_single_status(file_info: List[Dict[str, Any]], stats: TranscriptionStats, transcription: str,
+                          timestamp_level: str, include_timestamps: bool, video_status: str = "") -> str:
     """Format status message for single file transcription.
+    
+    Args:
+        file_info: List with single file metadata dict
+        stats: TranscriptionStats with processing metrics
+        transcription: The transcription text
+        timestamp_level: Level of timestamps ('word', 'segment', etc.)
+        include_timestamps: Whether timestamps were requested
+        video_status: Optional video detection message
     
     Returns:
         Status message string
@@ -2457,25 +2710,21 @@ def _format_single_status(file_info, model_choice, gpu_name, total_time, inferen
     
     file_type_msg = "🎬 Video file detected - audio extracted automatically\n" if info["is_video"] else ""
     timestamp_status = format_timestamp_status(timestamp_level, include_timestamps)
-    
-    itn_status = "- **ITN (Numbers to Digits)**: " + (
-        "✅ Applied" if apply_itn and ITN_AVAILABLE else 
-        ("⚠️ Not installed" if apply_itn else "Disabled")
-    )
+    itn_status = _format_itn_status(stats.apply_itn)
     
     return f"""
 ### ✅ Transcription Complete!
 
 {file_type_msg}**📊 Statistics:**
-- **Model**: {model_choice}
-- **GPU**: {gpu_name}
+- **Model**: {stats.model_choice}
+- **GPU**: {stats.gpu_name}
 - **Audio Duration**: {minutes}m {seconds}s
-- **Processing Time**: {total_time:.2f} seconds
-- **Inference Time**: {inference_time:.2f} seconds
-- **Model Load Time**: {load_time:.2f} seconds
-- **Chunk Size**: {chunk_size}s
-- **Real-Time Factor**: {rtfx:.1f}× (processed {rtfx:.1f}× faster than real-time)
-- **VRAM Used**: {vram_used:.2f} GB
+- **Processing Time**: {stats.total_time:.2f} seconds
+- **Inference Time**: {stats.inference_time:.2f} seconds
+- **Model Load Time**: {stats.load_time:.2f} seconds
+- **Chunk Size**: {stats.chunk_size}s
+- **Real-Time Factor**: {stats.rtfx:.1f}× (processed {stats.rtfx:.1f}× faster than real-time)
+- **VRAM Used**: {stats.vram_used:.2f} GB
 - **Transcription Length**: {len(transcription)} characters ({len(transcription.split())} words)
 {itn_status}
 {timestamp_status}
@@ -2484,7 +2733,7 @@ def _format_single_status(file_info, model_choice, gpu_name, total_time, inferen
 """
 
 
-def _get_audio_duration_with_retry(file_path, max_retries=4, base_delay=0.5):
+def _get_audio_duration_with_retry(file_path: str, max_retries: int = 4, base_delay: float = 0.5) -> float:
     """Get audio duration with retry logic for Windows file locks.
     
     Args:
@@ -2502,9 +2751,9 @@ def _get_audio_duration_with_retry(file_path, max_retries=4, base_delay=0.5):
     
     for attempt in range(max_retries):
         try:
-            duration = librosa.get_duration(path=file_path)
+            duration: float = librosa.get_duration(path=file_path)  # type: ignore[reportUnknownMemberType]
             gc.collect()
-            return duration
+            return duration  # type: ignore[reportReturnType]
         except (OSError, PermissionError) as e:
             if attempt < max_retries - 1:
                 delay = base_delay * (attempt + 1)
@@ -2512,9 +2761,12 @@ def _get_audio_duration_with_retry(file_path, max_retries=4, base_delay=0.5):
                 time.sleep(delay)
                 continue
             raise
+    
+    # This shouldn't be reached due to raise above, but satisfies type checker
+    raise RuntimeError("Retry loop exited unexpectedly")
 
 
-def _process_audio_files(file_list, log_capture_obj):
+def _process_audio_files(file_list: List[str], log_capture_obj: 'LogCapture') -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], float, int, Optional[Tuple[Any, ...]]]:
     """Process and validate uploaded audio/video files.
     
     Copies files to cache directory and extracts duration information.
@@ -2527,8 +2779,8 @@ def _process_audio_files(file_list, log_capture_obj):
         Tuple of (processed_files, file_info, total_duration, video_count, error_response)
         If error_response is not None, processing failed and should return immediately.
     """
-    processed_files = []
-    file_info = []
+    processed_files: List[str] = []
+    file_info: List[Dict[str, Any]] = []
     total_duration = 0
     video_count = 0
     
@@ -2576,24 +2828,404 @@ def _process_audio_files(file_list, log_capture_obj):
     return processed_files, file_info, total_duration, video_count, None
 
 
-def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps,
-                     output_format="txt", apply_itn=True, chunk_size=120, batch_size=1):
-    """
-    Main transcription function with batch processing, video support, and GPU optimization
+def _normalize_file_list(audio_files: Any) -> List[str]:
+    """Convert various Gradio file input formats to a flat list of paths.
     
     Args:
-        audio_files: Path to uploaded audio/video file OR list of paths for batch processing
-        model_choice: Model selection from radio button
-        save_to_file: Boolean - whether to save output file
-        include_timestamps: Boolean - whether to generate timestamps
-        output_format: Output format - "txt", "srt", or "csv" (primary format for UI display)
-        apply_itn: Boolean - whether to apply Inverse Text Normalization (numbers as digits)
-        chunk_size: Chunk size in seconds for long audio (30-300)
-        batch_size: Batch size for processing (1-8, higher uses more VRAM)
+        audio_files: File input from Gradio - string, list, or file object
+        
+    Returns:
+        List of file path strings
+    """
+    if audio_files is None:
+        return []
+    
+    if isinstance(audio_files, str):
+        return [audio_files]
+    
+    if isinstance(audio_files, list):
+        result: List[str] = []
+        for f in audio_files:
+            if hasattr(f, 'name'):  # type: ignore[reportUnknownArgumentType]
+                result.append(f.name)  # type: ignore[reportUnknownMemberType]
+            else:
+                result.append(str(f))  # type: ignore[reportUnknownArgumentType]
+        return result
+    
+    if hasattr(audio_files, 'name'):
+        return [audio_files.name]
+    
+    return [str(audio_files)]
+
+
+def _load_model_for_transcription(model_key: str, log_capture: 'LogCapture') -> Tuple[Any, Optional[Tuple[Any, ...]]]:
+    """Load transcription model with standardized error handling.
+    
+    Args:
+        model_key: Model key from MODEL_CONFIGS
+        log_capture: LogCapture instance for error responses
+        
+    Returns:
+        Tuple of (model, error_response) - error_response is None on success
+    """
+    try:
+        model = load_model(model_key)
+        return model, None
+    except PermissionError as e:
+        error_msg = str(e)
+        print(f"GRADIO_ERROR (PermissionError): {error_msg}")
+        error_type = 'permission_file_lock' if ("WinError 32" in error_msg or "being used by another process" in error_msg) else 'permission'
+        return None, _make_error_response(error_type, error_msg, log_capture)
+    except ConnectionError as e:
+        print(f"GRADIO_ERROR (ConnectionError): {e}")
+        return None, _make_error_response('network', str(e), log_capture)
+    except FileNotFoundError as e:
+        print(f"GRADIO_ERROR (FileNotFoundError): {e}")
+        return None, _make_error_response('file_not_found', str(e), log_capture)
+    except OSError as e:
+        print(f"GRADIO_ERROR (OSError): {e}")
+        return None, _make_error_response('filesystem', str(e), log_capture)
+    except RuntimeError as e:
+        print(f"GRADIO_ERROR (RuntimeError): {e}")
+        return None, _make_error_response('runtime', str(e), log_capture)
+    except Exception as e:
+        error_msg = f"Type: {type(e).__name__}\nMessage: {str(e)}"
+        print(f"GRADIO_ERROR (Unexpected): {error_msg}")
+        return None, _make_error_response('generic', error_msg, log_capture)
+
+
+def _get_gpu_stats() -> Tuple[float, str]:
+    """Get GPU statistics for reporting.
     
     Returns:
-        Tuple of (status_message, transcription_text, txt_file, srt_file, csv_file, log_file)
+        Tuple of (vram_used_gb, gpu_name)
     """
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        vram_used: float = torch.cuda.memory_allocated() / 1024**3  # type: ignore[reportUnknownMemberType]
+        gpu_name: str = torch.cuda.get_device_name(0)  # type: ignore[reportUnknownMemberType]
+        return vram_used, gpu_name  # type: ignore[reportReturnType]
+    return 0.0, "CPU"
+
+
+def _process_batch_results(
+    result: List[Any], 
+    file_info: List[Dict[str, Any]], 
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
+    apply_itn: bool, 
+    include_timestamps: bool
+) -> Tuple[List[str], List[Tuple[List[Dict[str, Any]], str]], List[str], List[str]]:
+    """Process batch transcription results with validation and ITN.
+    
+    Args:
+        result: List of transcription results from model
+        file_info: List of file metadata dicts
+        chunk_timestamps_map: Dict mapping file index to chunk timestamps
+        apply_itn: Whether to apply inverse text normalization
+        include_timestamps: Whether timestamps were requested
+        
+    Returns:
+        Tuple of (all_transcriptions, all_timestamps, per_file_stats, per_file_errors)
+    """
+    all_transcriptions: List[str] = []
+    all_timestamps: List[Tuple[List[Dict[str, Any]], str]] = []
+    per_file_stats: List[str] = []
+    per_file_errors: List[str] = []
+    
+    for i, (res, info) in enumerate(zip(result, file_info)):
+        success, transcription, error_msg = validate_transcription_result(result, i)
+        
+        if success:
+            # Apply ITN if enabled and NOT already applied per-chunk
+            if apply_itn and i not in chunk_timestamps_map:
+                transcription = apply_inverse_text_normalization(transcription)
+            
+            all_transcriptions.append(transcription)
+            
+            # Get timestamps - use chunk timestamps if available
+            if i in chunk_timestamps_map:
+                timestamps = chunk_timestamps_map[i]
+                timestamp_level = 'segment'
+            else:
+                timestamps, timestamp_level = extract_timestamps(res, include_timestamps)
+            all_timestamps.append((timestamps, timestamp_level))
+            
+            # Build stats entry
+            file_duration = info["duration"]
+            file_mins, file_secs = int(file_duration // 60), int(file_duration % 60)
+            file_type = "🎬 Video" if info["is_video"] else "🎵 Audio"
+            
+            per_file_stats.append(
+                f"**{i+1}. {info['name']}** ({file_type})\n"
+                f"   - Duration: {file_mins}m {file_secs}s\n"
+                f"   - Words: {len(transcription.split())}"
+            )
+        else:
+            all_transcriptions.append(f"[Transcription failed: {error_msg}]")
+            all_timestamps.append(([], 'none'))
+            per_file_errors.append(f"**{i+1}. {info['name']}**: {error_msg}")
+            per_file_stats.append(
+                f"**{i+1}. {info['name']}** ❌ Failed\n"
+                f"   - Error: {error_msg}"
+            )
+    
+    return all_transcriptions, all_timestamps, per_file_stats, per_file_errors
+
+
+def _process_single_result(
+    result: List[Any], 
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
+    apply_itn: bool, 
+    include_timestamps: bool, 
+    log_capture: 'LogCapture'
+) -> Tuple[Optional[str], List[Dict[str, Any]], str, Optional[Tuple[Any, ...]]]:
+    """Process single file transcription result with validation and ITN.
+    
+    Args:
+        result: Transcription result from model
+        chunk_timestamps_map: Dict mapping file index to chunk timestamps
+        apply_itn: Whether to apply inverse text normalization
+        include_timestamps: Whether timestamps were requested
+        log_capture: LogCapture instance for error responses
+        
+    Returns:
+        Tuple of (transcription, timestamps, timestamp_level, error_response)
+        error_response is None on success
+    """
+    success, transcription, error_msg = validate_transcription_result(result, 0)
+    
+    if not success:
+        return None, [], 'none', _make_error_response('validation', error_msg, log_capture)
+    
+    # Apply ITN if enabled and NOT already applied per-chunk
+    has_chunk_timestamps = 0 in chunk_timestamps_map
+    if apply_itn and not has_chunk_timestamps:
+        print(f"   🔢 Applying Inverse Text Normalization...")
+        transcription = apply_inverse_text_normalization(transcription)
+    elif apply_itn and has_chunk_timestamps:
+        print(f"   🔢 ITN already applied per-chunk during transcription")
+    
+    # Get timestamps
+    timestamps, timestamp_level = _extract_single_result_timestamps(
+        result, chunk_timestamps_map, include_timestamps
+    )
+    
+    return transcription, timestamps, timestamp_level, None
+
+
+def _extract_single_result_timestamps(
+    result: List[Any], 
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
+    include_timestamps: bool
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Extract timestamps from single result, preferring chunk-based if available.
+    
+    Returns:
+        Tuple of (timestamps list, timestamp_level string)
+    """
+    if 0 in chunk_timestamps_map and chunk_timestamps_map[0]:
+        timestamps = chunk_timestamps_map[0]
+        ts_level = 'word' if any('word' in ts for ts in timestamps) else 'segment'
+        print(f"   ⏱️ Using chunk-based timestamps ({len(timestamps)} entries)")
+        return timestamps, ts_level
+    
+    if include_timestamps:
+        return extract_timestamps(result[0], include_timestamps)
+    
+    return [], 'none'
+
+
+def _generate_and_save_output_files(
+    save_to_file: bool, 
+    config: OutputFilesConfig
+) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    """Generate output files if save_to_file is enabled.
+    
+    Args:
+        save_to_file: Whether to save files
+        config: OutputFilesConfig with all file generation parameters
+    
+    Returns:
+        Tuple of (txt_file, srt_file, csv_file, status_suffix)
+    """
+    if not save_to_file:
+        return None, None, None, ""
+    
+    base_name = os.path.splitext(os.path.basename(config.file_list[0]))[0]
+    
+    if config.is_batch:
+        base_filename = f"batch_transcription_{len(config.file_list)}_files"
+        # Create batch config with no timestamps set
+        batch_config = OutputFilesConfig(
+            file_list=config.file_list,
+            file_info=config.file_info,
+            is_batch=True,
+            include_timestamps=False,
+            model_choice=config.model_choice,
+            total_duration=config.total_duration,
+            total_time=config.total_time,
+            apply_itn=config.apply_itn,
+            transcription=None,
+            timestamps=None,
+            timestamp_level='none',
+            all_transcriptions=config.all_transcriptions,
+            all_timestamps=config.all_timestamps
+        )
+        txt_file, srt_file, csv_file = _save_output_files(base_filename, batch_config)
+    else:
+        base_filename = f"{base_name}_transcription"
+        # Create single file config with adjusted timestamps
+        single_config = OutputFilesConfig(
+            file_list=config.file_list,
+            file_info=config.file_info,
+            is_batch=False,
+            include_timestamps=config.include_timestamps,
+            model_choice=config.model_choice,
+            total_duration=config.total_duration,
+            total_time=config.total_time,
+            apply_itn=config.apply_itn,
+            transcription=config.transcription,
+            timestamps=config.timestamps if config.include_timestamps else None,
+            timestamp_level=config.timestamp_level
+        )
+        txt_file, srt_file, csv_file = _save_output_files(base_filename, single_config)
+    
+    return txt_file, srt_file, csv_file, f"\n💾 **Files saved**: `{base_filename}.[txt/srt/csv]`"
+
+
+def _process_batch_transcription(
+    result: List[Any], 
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
+    ctx: ResultProcessingContext
+) -> Tuple[str, str, List[Any], str, List[str], List[Tuple[List[Dict[str, Any]], str]]]:
+    """Process batch transcription results and format output.
+    
+    Args:
+        result: Transcription result from model
+        chunk_timestamps_map: Map of chunk timestamps
+        ctx: ResultProcessingContext with stats, file_info, etc.
+    
+    Returns:
+        Tuple of (status, transcription_output, timestamps, timestamp_level, all_transcriptions, all_timestamps)
+    """
+    all_transcriptions, all_timestamps, per_file_stats, per_file_errors = _process_batch_results(
+        result, ctx.file_info, chunk_timestamps_map, ctx.stats.apply_itn, ctx.include_timestamps
+    )
+    
+    status, transcription_output = _format_batch_status(
+        file_list=ctx.file_list,
+        file_info=ctx.file_info,
+        all_transcriptions=all_transcriptions,
+        per_file_stats=per_file_stats,
+        per_file_errors=per_file_errors,
+        stats=ctx.stats,
+        video_status=ctx.video_status
+    )
+    
+    return status, transcription_output, [], 'none', all_transcriptions, all_timestamps
+
+
+def _process_single_transcription(
+    result: List[Any], 
+    chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
+    log_capture: 'LogCapture', 
+    ctx: ResultProcessingContext
+) -> Tuple[Optional[str], Optional[str], List[Dict[str, Any]], str, Optional[Tuple[Any, ...]]]:
+    """Process single file transcription result and format output.
+    
+    Args:
+        result: Transcription result from model
+        chunk_timestamps_map: Map of chunk timestamps
+        log_capture: LogCapture instance for error handling
+        ctx: ResultProcessingContext with stats, file_info, etc.
+    
+    Returns:
+        Tuple of (status, transcription_output, timestamps, timestamp_level, error_response)
+    """
+    transcription, timestamps, timestamp_level, error_response = _process_single_result(
+        result, chunk_timestamps_map, ctx.stats.apply_itn, ctx.include_timestamps, log_capture
+    )
+    
+    if error_response is not None:
+        return None, None, [], 'none', error_response
+    
+    # Create stats with single-file duration
+    single_stats = TranscriptionStats(
+        model_choice=ctx.stats.model_choice,
+        gpu_name=ctx.stats.gpu_name,
+        total_duration=ctx.file_info[0]["duration"],
+        total_time=ctx.stats.total_time,
+        inference_time=ctx.stats.inference_time,
+        load_time=ctx.load_time,
+        chunk_size=ctx.stats.chunk_size,
+        rtfx=ctx.stats.rtfx,
+        vram_used=ctx.stats.vram_used,
+        apply_itn=ctx.stats.apply_itn
+    )
+    
+    status = _format_single_status(
+        file_info=ctx.file_info,
+        stats=single_stats,
+        transcription=transcription or "",
+        timestamp_level=timestamp_level,
+        include_timestamps=ctx.include_timestamps
+    )
+    
+    if timestamps and ctx.include_timestamps:
+        transcription_output = format_as_txt_with_timestamps(transcription or "", timestamps, timestamp_level)
+    else:
+        transcription_output = transcription or ""
+    
+    return status, transcription_output, timestamps, timestamp_level, None
+
+
+def _run_transcription(
+    model: Any, 
+    processed_files: List[str], 
+    batch_size: int, 
+    chunk_size: int, 
+    apply_itn: bool, 
+    log_capture: 'LogCapture'
+) -> Tuple[Optional[List[Any]], Dict[int, List[Dict[str, Any]]], Optional[Tuple[Any, ...]]]:
+    """Run transcription with error handling.
+    
+    Returns:
+        Tuple of (result, chunk_timestamps_map, error_response)
+    """
+    try:
+        result, chunk_timestamps_map = _transcribe_with_retry(
+            model=model,
+            files=processed_files,
+            batch_size=batch_size,
+            use_cuda=torch.cuda.is_available(),  # type: ignore[reportUnknownMemberType]
+            max_retries=3,
+            chunk_size_override=chunk_size,
+            apply_itn=apply_itn
+        )
+        return result, chunk_timestamps_map, None
+            
+    except PermissionError as e:
+        error_str = str(e)
+        print(f"❌ Transcription permission error: {error_str}")
+        error_type = 'transcription_file_lock' if _is_file_lock_error(error_str) else 'permission'
+        return None, {}, _make_error_response(error_type, error_str, log_capture)
+                
+    except Exception as e:
+        error_msg = f"Error Type: {type(e).__name__}\n\nDetails: {str(e)}"
+        print(f"❌ Transcription error: {type(e).__name__}: {str(e)}")
+        return None, {}, _make_error_response('transcription', error_msg, log_capture)
+
+
+def transcribe_audio(
+    audio_files: Any, 
+    model_choice: str, 
+    save_to_file: bool, 
+    include_timestamps: bool,
+    output_format: str = "txt", 
+    apply_itn: bool = True, 
+    chunk_size: int = 120, 
+    batch_size: int = 1
+) -> Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Main transcription function with batch processing, video support, and GPU optimization."""
     
     # Start capturing logs
     log_capture.start()
@@ -2604,37 +3236,16 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
     # Update global chunk settings
     global chunk_duration_sec, long_audio_threshold_sec
     chunk_duration_sec = chunk_size
-    long_audio_threshold_sec = chunk_size + 30  # Threshold slightly above chunk size
+    long_audio_threshold_sec = chunk_size + 30
     
-    if audio_files is None:
+    # Early return for empty input
+    file_list = _normalize_file_list(audio_files)
+    if not file_list:
         logs = log_capture.stop()
         return "⚠️ Please upload an audio or video file first", "", None, None, None, None
     
     try:
         import librosa
-        
-        # Handle both single file and multiple files
-        # Gradio gr.File with file_count="multiple" returns list of file objects
-        # Each file object has a .name attribute with the path
-        if audio_files is None or (isinstance(audio_files, list) and len(audio_files) == 0):
-            logs = log_capture.stop()
-            return "⚠️ Please upload an audio or video file first", "", None, None, None, None
-        
-        # Convert file objects to paths
-        if isinstance(audio_files, str):
-            file_list = [audio_files]
-        elif isinstance(audio_files, list):
-            # Handle list of file objects or strings
-            file_list = []
-            for f in audio_files:
-                if hasattr(f, 'name'):
-                    file_list.append(f.name)
-                else:
-                    file_list.append(str(f))
-        elif hasattr(audio_files, 'name'):
-            file_list = [audio_files.name]
-        else:
-            file_list = [str(audio_files)]
         
         is_batch = len(file_list) > 1
         
@@ -2646,306 +3257,99 @@ def transcribe_audio(audio_files, model_choice, save_to_file, include_timestamps
         print(f"⏱️ Timestamps: {'Enabled' if include_timestamps else 'Disabled'}")
         print(f"📦 Chunk size: {chunk_size}s")
         
-        # Determine which model to use - extract key from choice text
         model_key = get_model_key_from_choice(model_choice)
-        
-        # Start timing
         start_time = time.time()
         
-        # Load model with explicit error handling for Gradio display
-        # Uses helper function to standardize error responses
-        try:
-            model = load_model(model_key)
-        except PermissionError as e:
-            error_msg = str(e)
-            print(f"GRADIO_ERROR (PermissionError): {error_msg}")
-            error_type = 'permission_file_lock' if ("WinError 32" in error_msg or "being used by another process" in error_msg) else 'permission'
-            return _make_error_response(error_type, error_msg, log_capture)
-        except ConnectionError as e:
-            print(f"GRADIO_ERROR (ConnectionError): {e}")
-            return _make_error_response('network', str(e), log_capture)
-        except FileNotFoundError as e:
-            print(f"GRADIO_ERROR (FileNotFoundError): {e}")
-            return _make_error_response('file_not_found', str(e), log_capture)
-        except OSError as e:
-            print(f"GRADIO_ERROR (OSError): {e}")
-            return _make_error_response('filesystem', str(e), log_capture)
-        except RuntimeError as e:
-            print(f"GRADIO_ERROR (RuntimeError): {e}")
-            return _make_error_response('runtime', str(e), log_capture)
-        except Exception as e:
-            error_msg = f"Type: {type(e).__name__}\nMessage: {str(e)}"
-            print(f"GRADIO_ERROR (Unexpected): {error_msg}")
-            return _make_error_response('generic', error_msg, log_capture)
-        
-        load_time = time.time() - start_time
-        
-        # ============================================================================
-        # FIX #4: Copy Gradio Uploads to Cache Directory
-        # ============================================================================
-        # Process files using helper function that handles copying to cache,
-        # duration extraction, and video detection with proper error handling.
-        # ============================================================================
-        
-        processed_files, file_info, total_duration, video_count, error_response = _process_audio_files(
-            file_list, log_capture
-        )
-        
+        # Load model
+        model, error_response = _load_model_for_transcription(model_key, log_capture)
         if error_response is not None:
             return error_response
         
-        # Use NeMo's default batch_size for file batching
-        # NeMo handles optimal batching automatically based on VRAM
-        batch_size = 4  # NeMo default for file-count batching
+        load_time = time.time() - start_time
         
-        # Prepare status update for video processing
-        video_status = ""
-        if video_count > 0:
-            video_status = f"🎬 Extracted audio from {video_count} video file(s)\n"
+        # Process audio files
+        processed_files, file_info, total_duration, video_count, error_response = _process_audio_files(
+            file_list, log_capture
+        )
+        if error_response is not None:
+            return error_response
         
-        # ============================================================================
-        # Transcription with Retry Logic (WinError 32 Fix)
-        # ============================================================================
-        # Uses _transcribe_with_retry() which:
-        # 1. Uses num_workers=0 to disable multiprocessing (prevents manifest.json locking)
-        # 2. Uses NeMo's official transcribe() API with direct parameters
-        # 3. Has retry logic with linear backoff for transient file locks
-        # 4. Runs garbage collection between retries to release handles
-        #
-        # This fixes the WinError 32 "file being used by another process" error
-        # that occurs when Windows services lock manifest.json files.
-        # ============================================================================
+        # Assert non-None after error check (for type checker)
+        assert processed_files is not None
+        assert file_info is not None
         
-        # Transcribe with retry wrapper (handles file locks gracefully)
+        video_status = f"🎬 Extracted audio from {video_count} video file(s)\n" if video_count > 0 else ""
+        
+        # Run transcription
         inference_start = time.time()
+        result, chunk_timestamps_map, error_response = _run_transcription(
+            model, processed_files, 4, chunk_size, apply_itn, log_capture
+        )
+        if error_response is not None:
+            return error_response
         
-        try:
-            result, chunk_timestamps_map = _transcribe_with_retry(
-                model=model,
-                files=processed_files,
-                batch_size=batch_size,
-                use_cuda=torch.cuda.is_available(),
-                max_retries=3,
-                chunk_size_override=chunk_size
-            )
-                
-        except PermissionError as e:
-            error_str = str(e)
-            print(f"❌ Transcription permission error: {error_str}")
-            error_type = 'transcription_file_lock' if ("WinError 32" in error_str or "being used by another process" in error_str) else 'permission'
-            return _make_error_response(error_type, error_str, log_capture)
-                    
-        except Exception as e:
-            error_msg = f"Error Type: {type(e).__name__}\n\nDetails: {str(e)}"
-            print(f"❌ Transcription error: {type(e).__name__}: {str(e)}")
-            return _make_error_response('transcription', error_msg, log_capture)
+        # Assert result is not None after error check (for type checker)
+        assert result is not None
         
         inference_time = time.time() - inference_start
         total_time = time.time() - start_time
-        
-        # Get GPU stats
-        if torch.cuda.is_available():
-            vram_used = torch.cuda.memory_allocated() / 1024**3
-            gpu_name = torch.cuda.get_device_name(0)
-        else:
-            vram_used = 0
-            gpu_name = "CPU"
-        
-        # Calculate real-time factor
+        vram_used, gpu_name = _get_gpu_stats()
         rtfx = total_duration / inference_time if inference_time > 0 else 0
         
         print(f"\n✅ Transcription complete!")
         print(f"   Duration: {total_duration:.1f}s audio in {inference_time:.1f}s ({rtfx:.1f}× real-time)")
         
-        # ========================================================================
-        # Output Validation (Pattern 2: HuggingFace Modernization)
-        # ========================================================================
-        # Validate transcription result before accessing .text to prevent
-        # crashes from malformed results.
-        # ========================================================================
+        # Create shared stats for result processing
+        stats = TranscriptionStats(
+            model_choice=model_choice, gpu_name=gpu_name, total_duration=total_duration,
+            total_time=total_time, inference_time=inference_time, load_time=load_time,
+            chunk_size=chunk_size, rtfx=rtfx, vram_used=vram_used, apply_itn=apply_itn
+        )
+        ctx = ResultProcessingContext(
+            stats=stats, file_list=file_list, file_info=file_info,
+            include_timestamps=include_timestamps, video_status=video_status, load_time=load_time
+        )
         
-        # Build output based on single vs batch processing
+        # Process results based on batch vs single
         if is_batch:
-            # ================================================================
-            # Batch processing with per-file validation (Pattern 5)
-            # ================================================================
-            all_transcriptions = []
-            all_timestamps = []  # Store timestamps for each file
-            per_file_stats = []
-            per_file_errors = []
-            
-            for i, (res, info) in enumerate(zip(result, file_info)):
-                # Validate each result individually
-                success, transcription, error_msg = validate_transcription_result(result, i)
-                
-                if success:
-                    # Apply ITN if enabled
-                    if apply_itn:
-                        transcription = apply_inverse_text_normalization(transcription)
-                    
-                    all_transcriptions.append(transcription)
-                    
-                    # Get timestamps - use chunk timestamps if available, else model timestamps
-                    if i in chunk_timestamps_map:
-                        timestamps = chunk_timestamps_map[i]
-                        timestamp_level = 'segment'  # Chunk timestamps are segment-level
-                    else:
-                        timestamps, timestamp_level = extract_timestamps(res, include_timestamps)
-                    all_timestamps.append((timestamps, timestamp_level))
-                    
-                    file_duration = info["duration"]
-                    file_mins = int(file_duration // 60)
-                    file_secs = int(file_duration % 60)
-                    file_type = "🎬 Video" if info["is_video"] else "🎵 Audio"
-                    
-                    per_file_stats.append(
-                        f"**{i+1}. {info['name']}** ({file_type})\n"
-                        f"   - Duration: {file_mins}m {file_secs}s\n"
-                        f"   - Words: {len(transcription.split())}"
-                    )
-                else:
-                    # Record error for this file
-                    all_transcriptions.append(f"[Transcription failed: {error_msg}]")
-                    all_timestamps.append(([], 'none'))
-                    per_file_errors.append(f"**{i+1}. {info['name']}**: {error_msg}")
-                    per_file_stats.append(
-                        f"**{i+1}. {info['name']}** ❌ Failed\n"
-                        f"   - Error: {error_msg}"
-                    )
-            
-            # Use helper function to format batch status
-            status, transcription_output = _format_batch_status(
-                file_list=file_list,
-                file_info=file_info,
-                all_transcriptions=all_transcriptions,
-                per_file_stats=per_file_stats,
-                per_file_errors=per_file_errors,
-                model_choice=model_choice,
-                gpu_name=gpu_name,
-                total_duration=total_duration,
-                total_time=total_time,
-                inference_time=inference_time,
-                chunk_size=chunk_size,
-                rtfx=rtfx,
-                vram_used=vram_used,
-                apply_itn=apply_itn,
-                video_status=video_status
-            )
-            
-            timestamps = []  # For single-file compatibility
-            timestamp_level = 'none'
-            
+            status, transcription_output, timestamps, timestamp_level, all_transcriptions, all_timestamps = \
+                _process_batch_transcription(result, chunk_timestamps_map, ctx)
         else:
-            # ================================================================
-            # Single file processing with validation (Pattern 2)
-            # ================================================================
-            
-            # Validate result before accessing
-            success, transcription, error_msg = validate_transcription_result(result, 0)
-            
-            if not success:
-                return _make_error_response('validation', error_msg, log_capture)
-            
-            # Apply ITN if enabled
-            if apply_itn:
-                print(f"   🔢 Applying Inverse Text Normalization...")
-                transcription = apply_inverse_text_normalization(transcription)
-            
-            # ================================================================
-            # Timestamp Extraction - Use chunk timestamps if available
-            # ================================================================
-            timestamp_level = 'none'
-            timestamps = []
-            
-            # Check if we have chunk timestamps (from long audio chunking)
-            if 0 in chunk_timestamps_map and chunk_timestamps_map[0]:
-                timestamps = chunk_timestamps_map[0]
-                timestamp_level = 'word' if any('word' in ts for ts in timestamps) else 'segment'
-                print(f"   ⏱️ Using chunk-based timestamps ({len(timestamps)} entries)")
-            elif include_timestamps:
-                timestamps, timestamp_level = extract_timestamps(result[0], include_timestamps)
-            
-            # Use helper function to format single file status
-            status = _format_single_status(
-                file_info=file_info,
-                model_choice=model_choice,
-                gpu_name=gpu_name,
-                total_time=total_time,
-                inference_time=inference_time,
-                load_time=load_time,
-                chunk_size=chunk_size,
-                rtfx=rtfx,
-                vram_used=vram_used,
-                transcription=transcription,
-                timestamp_level=timestamp_level,
-                include_timestamps=include_timestamps,
-                apply_itn=apply_itn
-            )
-            # Format transcription output for UI display with timestamps
-            if timestamps and include_timestamps:
-                transcription_output = format_as_txt_with_timestamps(transcription, timestamps, timestamp_level)
-            else:
-                transcription_output = transcription
+            status, transcription_output, timestamps, timestamp_level, error_response = \
+                _process_single_transcription(result, chunk_timestamps_map, log_capture, ctx)
+            if error_response is not None:
+                return error_response
+            all_transcriptions, all_timestamps = None, None
         
-        # Generate all 3 file formats for download using helper function
-        txt_file = None
-        srt_file = None  
-        csv_file = None
+        # Generate output files
+        output_config = OutputFilesConfig(
+            file_list=file_list, file_info=file_info, is_batch=is_batch,
+            include_timestamps=include_timestamps, model_choice=model_choice,
+            total_duration=total_duration, total_time=total_time, apply_itn=apply_itn,
+            transcription=transcription_output if not is_batch else None,
+            timestamps=timestamps if not is_batch else None,
+            timestamp_level=timestamp_level,
+            all_transcriptions=all_transcriptions if is_batch else None,
+            all_timestamps=all_timestamps if is_batch else None
+        )
+        txt_file, srt_file, csv_file, status_suffix = _generate_and_save_output_files(
+            save_to_file=save_to_file, config=output_config
+        )
+        if status is not None:
+            status = status + status_suffix
+        else:
+            status = status_suffix
         
-        if save_to_file:
-            base_name = os.path.splitext(os.path.basename(file_list[0]))[0]
-            
-            if is_batch:
-                base_filename = f"batch_transcription_{len(file_list)}_files"
-                txt_file, srt_file, csv_file = _save_output_files(
-                    base_filename=base_filename,
-                    file_info=file_info,
-                    transcription=None,
-                    timestamps=None,
-                    timestamp_level='none',
-                    all_transcriptions=all_transcriptions,
-                    all_timestamps=all_timestamps,
-                    is_batch=True,
-                    model_choice=model_choice,
-                    total_duration=total_duration,
-                    total_time=total_time,
-                    apply_itn=apply_itn
-                )
-            else:
-                base_filename = f"{base_name}_transcription"
-                txt_file, srt_file, csv_file = _save_output_files(
-                    base_filename=base_filename,
-                    file_info=file_info,
-                    transcription=transcription,
-                    timestamps=timestamps if include_timestamps else None,
-                    timestamp_level=timestamp_level,
-                    is_batch=False,
-                    model_choice=model_choice,
-                    total_duration=total_duration,
-                    total_time=total_time,
-                    apply_itn=apply_itn
-                )
-            
-            status += f"\n💾 **Files saved**: `{base_filename}.[txt/srt/csv]`"
-        
-        # Save logs and return
         print(f"\n{'='*60}")
         print(f"✅ Transcription Complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
         
         logs = log_capture.stop()
         log_file = _save_logs(logs, "transcription")
-        
-        return status, transcription_output, txt_file, srt_file, csv_file, log_file
+        return status, transcription_output or "", txt_file, srt_file, csv_file, log_file
         
     except Exception as e:
-        # Get actual VRAM info for error message
-        if torch.cuda.is_available():
-            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            vram_info = f"you have {vram_total:.0f}GB"
-        else:
-            vram_info = "no GPU detected"
-        
+        vram_info = f"you have {torch.cuda.get_device_properties(0).total_memory / 1024**3:.0f}GB" if torch.cuda.is_available() else "no GPU detected"  # type: ignore[reportUnknownMemberType]
         error_msg = f"""
 ### ❌ Error During Transcription
 
@@ -2965,14 +3369,20 @@ If the error persists, please check the console output for more details.
         logs = log_capture.stop()
         log_file = _save_logs(logs, "error")
         return error_msg, "", None, None, None, log_file
+        logs = log_capture.stop()
+        log_file = _save_logs(logs, "error")
+        return error_msg, "", None, None, None, log_file
 
-def get_system_info():
+def get_system_info() -> str:
     """Display system information"""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        vram_free = (torch.cuda.get_device_properties(0).total_memory - 
-                     torch.cuda.memory_allocated()) / 1024**3
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        gpu_name: str = torch.cuda.get_device_name(0)  # type: ignore[reportUnknownMemberType]
+        vram_total: float = torch.cuda.get_device_properties(0).total_memory / 1024**3  # type: ignore[reportUnknownMemberType]
+        vram_free: float = (torch.cuda.get_device_properties(0).total_memory -  # type: ignore[reportUnknownMemberType]
+                     torch.cuda.memory_allocated()) / 1024**3  # type: ignore[reportUnknownMemberType]
+        
+        cuda_version: str = torch.version.cuda  # type: ignore[reportUnknownMemberType]
+        pytorch_version: str = torch.__version__  # type: ignore[reportUnknownMemberType]
         
         info = f"""
 ### 🖥️ System Information
@@ -2980,8 +3390,8 @@ def get_system_info():
 **GPU**: {gpu_name}
 **Total VRAM**: {vram_total:.1f} GB
 **Available VRAM**: {vram_free:.1f} GB
-**CUDA Version**: {torch.version.cuda}
-**PyTorch Version**: {torch.__version__}
+**CUDA Version**: {cuda_version}
+**PyTorch Version**: {pytorch_version}
 **NeMo Available**: ✅ Yes
 
 **Status**: ✅ Ready for transcription
@@ -3000,11 +3410,11 @@ CUDA is not available. Please check:
 """
     return info
 
-def get_privacy_performance_info():
+def get_privacy_performance_info() -> str:
     """Generate dynamic privacy & performance information"""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        gpu_name: str = torch.cuda.get_device_name(0)  # type: ignore[reportUnknownMemberType]
+        vram_total: float = torch.cuda.get_device_properties(0).total_memory / 1024**3  # type: ignore[reportUnknownMemberType]
         gpu_info = f"**GPU**: {gpu_name} ({vram_total:.0f}GB VRAM)"
     else:
         gpu_info = "**GPU**: CPU Mode (No CUDA GPU detected)"
@@ -3133,11 +3543,11 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                 
                 batch_size_slider = gr.Slider(
                     minimum=1,
-                    maximum=8,
+                    maximum=24,
                     value=1,
                     step=1,
                     label="📦 Batch Size",
-                    info="Higher = more VRAM usage. Increase to utilize more VRAM (try 2-4 for 12GB)."
+                    info="Higher = more VRAM usage. Increase to utilize more VRAM (1-8 for 8-12GB, 8-16 for 16GB+, 16-24 for 24GB+)."
                 )
                 
                 gr.Markdown(f"""
@@ -3147,8 +3557,10 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                   - 120-180s: Good for 12GB VRAM  
                   - 200-300s: For 16GB+ VRAM
                 - **Batch Size**: How many chunks to process at once
-                  - 1: Safest, lowest VRAM
-                  - 2-4: Better GPU utilization for 12GB+
+                  - 1-4: Safe for 8-12GB VRAM
+                  - 4-8: Better GPU utilization for 12GB+
+                  - 8-16: Optimal for 16GB+ VRAM
+                  - 16-24: For 24GB+ VRAM (high throughput)
                 
                 **ITN Status**: {'✅ Available' if ITN_AVAILABLE else '❌ Not installed (run: pip install nemo_text_processing)'}
                 """)
