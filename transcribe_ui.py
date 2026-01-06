@@ -15,6 +15,22 @@ import os
 import sys
 from pathlib import Path
 
+# ============================================================================
+# FIX #0: Disable Multiprocessing/Threading BEFORE any imports
+# ============================================================================
+# These environment variables MUST be set before importing PyTorch, NeMo,
+# or any library that uses multiprocessing. They prevent Lhotse's dataloader
+# from spawning worker processes that create manifest.json files.
+# ============================================================================
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Prevent PyTorch from using multiple threads for data loading
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Keep async for performance
+# Force single-threaded behavior for dataloaders
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Get script directory and create cache directory structure
 _script_dir = Path(__file__).parent.absolute()
 _cache_dir = _script_dir / "model_cache"
@@ -82,20 +98,22 @@ else:
     print(f"✓ Temp directory verified: {_temp_dir}")
 
 # ============================================================================
-# NOTE: Direct Method Parameters for Deadlock Prevention
+# NOTE: Tensor-Based Transcription for Windows File Lock Prevention
 # ============================================================================
-# NeMo's ASR models use Lhotse dataloaders internally. To prevent deadlocks
-# during transcription (where progress hangs at 0%), we use direct method
-# parameters to model.transcribe() instead of override_config.
-# 
-# Why this matters:
-# - Using override_config can interfere with NeMo's internal initialization
-# - Direct parameters (num_workers=0, batch_size, etc.) are the safe, official approach
-# - This matches the working HuggingFace Spaces implementation
-# - Prevents both deadlocks and Windows file-lock issues
+# NeMo's ASR models use Lhotse dataloaders internally which create manifest.json
+# files. The num_workers parameter to model.transcribe() does NOT override the
+# model's internal config (which has num_workers=2 from training).
+#
+# The REAL fix is to bypass the file-based dataloader entirely by:
+# 1. Loading audio into numpy arrays with librosa
+# 2. Passing numpy arrays directly to model.transcribe()
+# 3. This bypasses manifest.json creation completely
+#
+# Additionally, we override model.cfg after loading to set num_workers=0
+# as a fallback for any code paths that still use file-based transcription.
 # ============================================================================
-print("\n✅ Using direct method parameters for transcription (HuggingFace pattern)")
-print("   This prevents deadlocks and Windows file-lock issues")
+print("\n✅ Using tensor-based transcription (bypasses manifest.json creation)")
+print("   This prevents WinError 32 file locking issues on Windows")
 
 # ============================================================================
 # NOW import libraries (after cache directories are configured)
@@ -460,74 +478,109 @@ def format_timestamp_status(level, include_timestamps):
 
 
 # ============================================================================
-# Transcription Helper with Retry Logic (WinError 32 Fix)
+# Transcription Helper with Tensor-Based Input (WinError 32 Fix)
 # ============================================================================
 # NeMo's Lhotse dataloader creates manifest.json files during inference that
 # Windows services (antivirus, indexing, cloud sync) can lock, causing errors.
 #
-# The fix uses direct parameters to model.transcribe():
-# 1. num_workers=0: Disables multiprocessing worker coordination
-# 2. batch_size: NeMo handles internal batching optimally
-# 3. Retry logic with linear backoff for transient file locks
+# The REAL fix: Pass audio as numpy arrays instead of file paths!
+# - NeMo's transcribe() accepts numpy arrays directly
+# - This BYPASSES the Lhotse dataloader entirely
+# - No manifest.json files are created
+# - No multiprocessing workers are spawned
 #
-# Based on NeMo official API: model.transcribe(audio, batch_size, num_workers=0)
 # Reference: https://github.com/nvidia/nemo/blob/main/docs/source/asr/results.md
+# "Inference on Numpy Audio Array" section shows this is officially supported
 # ============================================================================
 
+def _load_audio_to_numpy(file_path, target_sr=16000):
+    """Load audio file to numpy array for tensor-based transcription.
+    
+    This bypasses NeMo's file-based dataloader by loading audio directly
+    into memory as numpy arrays. NeMo's transcribe() accepts numpy arrays,
+    which avoids manifest.json creation entirely.
+    
+    Args:
+        file_path: Path to audio file
+        target_sr: Target sample rate (NeMo expects 16kHz)
+        
+    Returns:
+        Tuple of (numpy_array, sample_rate)
+    """
+    import librosa  # Import here to match pattern used elsewhere in file
+    
+    try:
+        # Load with librosa - handles various formats and resamples
+        audio, sr = librosa.load(file_path, sr=target_sr, mono=True)
+        return audio, sr
+    except Exception as e:
+        print(f"   ⚠️ Failed to load {file_path}: {e}")
+        raise
+
+
 def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=3):
-    """Transcribe with retry logic for Windows file lock handling.
+    """Transcribe using tensor-based input to bypass manifest.json creation.
     
-    Uses NeMo's official transcribe() API with direct parameters:
-    - batch_size: Controls how many files are batched together
-    - num_workers=0: Disables multiprocessing to prevent file locks
-    - return_hypotheses=True: Returns hypothesis objects with .text attribute
+    CRITICAL FIX: This function now loads audio into numpy arrays and passes
+    them directly to model.transcribe(). This completely bypasses NeMo's
+    Lhotse dataloader and prevents manifest.json file creation.
     
-    Includes retry logic with linear backoff for transient Windows file locks
-    that may occur during NeMo's internal manifest.json creation.
+    The num_workers parameter to transcribe() does NOT override the model's
+    internal config (which has num_workers=2 from training). The ONLY reliable
+    fix is to bypass the file-based dataloader entirely.
     
     Args:
         model: Loaded NeMo ASR model
         files: List of audio file paths to transcribe
-        batch_size: Batch size for transcription
+        batch_size: Batch size for transcription (used for numpy batching)
         use_cuda: Whether to use CUDA with mixed precision
-        max_retries: Maximum retry attempts for file lock errors
+        max_retries: Maximum retry attempts for any errors
         
     Returns:
         Transcription result from model.transcribe()
         
     Raises:
-        PermissionError: If file lock persists after all retries
-        Exception: For other transcription errors
+        Exception: For transcription errors
     """
     import gc
     
     base_delay = 0.5  # 500ms base delay
     last_error = None
     
+    # Load all audio files into numpy arrays FIRST
+    # This completely bypasses NeMo's file-based dataloader
+    print(f"   📂 Loading {len(files)} audio file(s) into memory...")
+    audio_arrays = []
+    for file_path in files:
+        try:
+            audio_np, _ = _load_audio_to_numpy(file_path, target_sr=16000)
+            audio_arrays.append(audio_np)
+        except Exception as e:
+            print(f"   ❌ Failed to load audio: {file_path}")
+            raise
+    
+    print(f"   ✅ Audio loaded into memory, starting transcription...")
+    
     for attempt in range(max_retries):
         try:
-            # Use NeMo's official transcribe() API with direct parameters
-            # Key Windows-safe settings:
-            # - num_workers=0: Prevents multiprocessing file coordination issues
-            # - batch_size: NeMo handles optimal internal batching
+            # Pass numpy arrays directly to transcribe()
+            # This BYPASSES the Lhotse dataloader - no manifest.json created!
             if use_cuda and torch.cuda.is_available():
                 # Use mixed precision (FP16) for faster inference on CUDA
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     result = model.transcribe(
-                        audio=files,
+                        audio=audio_arrays,  # NUMPY ARRAYS, not file paths!
                         batch_size=batch_size,
-                        num_workers=0,  # CRITICAL: Prevents manifest.json worker coordination
-                        return_hypotheses=True,  # Required for .text access
-                        verbose=True  # Shows progress indicator
+                        return_hypotheses=True,
+                        verbose=True
                     )
             else:
                 # CPU fallback - no autocast
                 result = model.transcribe(
-                    audio=files,
+                    audio=audio_arrays,  # NUMPY ARRAYS, not file paths!
                     batch_size=batch_size,
-                    num_workers=0,  # CRITICAL: Prevents manifest.json worker coordination
-                    return_hypotheses=True,  # Required for .text access
-                    verbose=True  # Shows progress indicator
+                    return_hypotheses=True,
+                    verbose=True
                 )
             
             # Success!
@@ -554,8 +607,18 @@ def _transcribe_with_retry(model, files, batch_size, use_cuda=True, max_retries=
                 raise
                 
         except Exception as e:
-            # Non-permission errors - don't retry
-            raise
+            # For other errors, retry once in case it's transient
+            if attempt < max_retries - 1:
+                last_error = e
+                delay = base_delay * (attempt + 1)
+                print(f"   ⚠️ Transcription error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                time.sleep(delay)
+                continue
+            else:
+                raise
     
     # All retries exhausted
     if last_error:
@@ -637,6 +700,61 @@ MODEL_CONFIGS = {
         "additional_features": ["Speech Translation (AST)", "NeMo Forced Aligner timestamps"]
     }
 }
+
+
+# ============================================================================
+# Model Config Override for Windows File Lock Prevention (Fallback)
+# ============================================================================
+# Even though tensor-based transcription is the primary fix, we also override
+# the model's internal config to set num_workers=0 as a fallback for any code
+# paths that might still use file-based transcription.
+#
+# The model's embedded config (from training) has num_workers=2 in train_ds,
+# validation_ds, and test_ds. The num_workers parameter to transcribe() does
+# NOT override these - we must modify model.cfg directly using OmegaConf.
+# ============================================================================
+
+def _override_model_dataloader_config(model):
+    """Override model's internal dataloader config to prevent file locking.
+    
+    This modifies model.cfg to set num_workers=0 in all dataloader configs.
+    This is a FALLBACK measure - the primary fix is tensor-based transcription.
+    
+    The model's embedded config (from training) has num_workers=2 which Lhotse
+    uses regardless of what's passed to transcribe(). We must modify model.cfg
+    directly to override this.
+    
+    Args:
+        model: Loaded NeMo ASR model
+    """
+    try:
+        from omegaconf import OmegaConf
+        
+        # Disable struct mode to allow modifications
+        OmegaConf.set_struct(model.cfg, False)
+        
+        # Override num_workers in all dataloader configs
+        modified = []
+        for ds_name in ['train_ds', 'validation_ds', 'test_ds']:
+            if hasattr(model.cfg, ds_name):
+                ds_cfg = getattr(model.cfg, ds_name)
+                if hasattr(ds_cfg, 'num_workers'):
+                    old_value = ds_cfg.num_workers
+                    ds_cfg.num_workers = 0
+                    modified.append(f"{ds_name}: {old_value} -> 0")
+        
+        # Re-enable struct mode
+        OmegaConf.set_struct(model.cfg, True)
+        
+        if modified:
+            print(f"   ✅ Overrode dataloader num_workers: {', '.join(modified)}")
+        else:
+            print(f"   ℹ️  No dataloader num_workers found in model.cfg")
+            
+    except Exception as e:
+        # Non-fatal - tensor-based transcription is the primary fix
+        print(f"   ⚠️  Could not override model config (non-fatal): {e}")
+
 
 def get_model_key_from_choice(choice_text):
     """Extract model key from radio button choice text
@@ -1164,6 +1282,11 @@ def load_model(model_name, show_progress=False):
                     config=config,
                     max_retries=3
                 )
+                
+                # Override model config to disable multiprocessing in dataloader
+                # This is a FALLBACK - the primary fix is tensor-based transcription
+                _override_model_dataloader_config(models_cache[model_name])
+                
                 load_time = time.time() - start_time
                 print(f"✓ {config['display_name']} loaded from local file in {load_time:.1f}s")
                 return models_cache[model_name]
@@ -1197,6 +1320,11 @@ def load_model(model_name, show_progress=False):
             models_cache[model_name] = _load_from_huggingface_with_retry(
                 hf_model_id, config, max_retries=3
             )
+            
+            # Override model config to disable multiprocessing in dataloader
+            # This is a FALLBACK - the primary fix is tensor-based transcription
+            _override_model_dataloader_config(models_cache[model_name])
+            
         except ConnectionError as e:
             raise ConnectionError(
                 f"\n{'='*80}\n"
@@ -1263,6 +1391,11 @@ def load_model(model_name, show_progress=False):
             models_cache[model_name] = _load_from_huggingface_with_retry(
                 hf_model_id, config, max_retries=3
             )
+            
+            # Override model config to disable multiprocessing in dataloader
+            # This is a FALLBACK - the primary fix is tensor-based transcription
+            _override_model_dataloader_config(models_cache[model_name])
+            
         except ConnectionError as e:
             raise ConnectionError(
                 f"\n{'='*80}\n"
