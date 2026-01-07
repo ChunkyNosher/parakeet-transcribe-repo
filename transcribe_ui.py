@@ -204,6 +204,9 @@ class ResultProcessingContext:
     include_timestamps: bool
     video_status: str = ""
     load_time: float = 0.0
+    # ITN mode settings
+    apply_itn_final: bool = False
+    had_itn_per_chunk: bool = False
     # Batch-specific (optional for single)
     all_transcriptions: Optional[List[str]] = None
     all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]] = None
@@ -594,22 +597,27 @@ def _finalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segment: int = 8, max_duration: float = 5.0) -> List[Dict[str, Any]]:
-    """Group word-level timestamps into subtitle segments using sentence boundaries.
+def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segment: int = 8, max_duration: float = 5.0, silence_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Group word-level timestamps into subtitle segments using sentence boundaries and silence detection.
     
     First attempts to detect sentence boundaries by punctuation marks (. ? !).
+    Also ends segments when a silence gap > silence_threshold is detected between words.
     Falls back to grouping by word count/duration if no punctuation is detected.
     
     Args:
         timestamps: List of word timestamp dicts with 'start', 'end', 'word'/'text' keys
         words_per_segment: Target words per subtitle segment (default: 8, used as fallback)
         max_duration: Maximum segment duration in seconds (default: 5.0)
+        silence_threshold: End segment if gap between words exceeds this (default: use global setting)
         
     Returns:
         List of segment dicts with 'start', 'end', 'text' keys
     """
     if not timestamps:
         return []
+    
+    # Use global silence threshold if not specified
+    effective_silence_threshold = silence_threshold if silence_threshold is not None else silence_threshold_sec
     
     # Check if source has punctuation for sentence detection
     has_punctuation = any(
@@ -619,13 +627,27 @@ def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segme
     
     segments: List[Dict[str, Any]] = []
     current: Dict[str, Any] = {'start': timestamps[0].get('start', 0.0), 'end': 0.0, 'words': []}
+    last_end_time: float = timestamps[0].get('start', 0.0)
     
     for stamp in timestamps:
         word = _get_word_text_from_timestamp(stamp)
+        start = stamp.get('start', 0.0)
         end = stamp.get('end', 0.0)
+        
+        # Check for silence gap since last word (silence detection)
+        if current['words'] and effective_silence_threshold > 0:
+            gap = start - last_end_time
+            if gap >= effective_silence_threshold:
+                # End current segment due to silence gap
+                if current['words']:
+                    segments.append(_finalize_segment(current))
+                    current = {'start': start, 'end': end, 'words': [word]}
+                    last_end_time = end
+                    continue
         
         current['words'].append(word)
         current['end'] = end
+        last_end_time = end
         
         segment_duration = end - current['start']
         if _should_end_segment(word, segment_duration, len(current['words']), 
@@ -1191,10 +1213,24 @@ DEFAULT_CHUNK_DURATION_SEC = 60   # Duration of each transcription chunk
 CHUNK_OVERLAP_SEC = 2             # Context overlap on each side of chunk
 DEFAULT_LONG_AUDIO_THRESHOLD_SEC = 90  # Audio longer than this triggers chunking
 
+# Silence detection threshold for SRT segment boundaries (in seconds)
+# If gap between words > this threshold, end the current subtitle segment
+DEFAULT_SILENCE_THRESHOLD_SEC = 0.5
+
+# ITN (Inverse Text Normalization) mode options
+# - "per_chunk": Apply ITN to each chunk during transcription (best for long audio)
+# - "final_pass": Apply ITN once to complete transcription (simpler, may fail on long text)
+# - "both": Apply ITN per-chunk AND final pass (most thorough)
+# - "disabled": Don't apply ITN
+ITN_MODE_CHOICES = ["per_chunk", "final_pass", "both", "disabled"]
+DEFAULT_ITN_MODE = "per_chunk"
+
 # Runtime configuration (can be changed via Gradio UI)
 # These are module-level so they can be modified by the UI
 chunk_duration_sec = DEFAULT_CHUNK_DURATION_SEC
 long_audio_threshold_sec = DEFAULT_LONG_AUDIO_THRESHOLD_SEC
+silence_threshold_sec = DEFAULT_SILENCE_THRESHOLD_SEC
+itn_mode = DEFAULT_ITN_MODE
 
 
 def _clear_vram() -> None:
@@ -3102,18 +3138,20 @@ def _process_batch_results(
 def _process_single_result(
     result: List[Any], 
     chunk_timestamps_map: Dict[int, List[Dict[str, Any]]], 
-    apply_itn: bool, 
+    apply_itn_final: bool, 
     include_timestamps: bool, 
-    log_capture: 'LogCapture'
+    log_capture: 'LogCapture',
+    had_itn_per_chunk: bool = False
 ) -> Tuple[Optional[str], List[Dict[str, Any]], str, Optional[Tuple[Any, ...]]]:
     """Process single file transcription result with validation and ITN.
     
     Args:
         result: Transcription result from model
         chunk_timestamps_map: Dict mapping file index to chunk timestamps
-        apply_itn: Whether to apply inverse text normalization
+        apply_itn_final: Whether to apply final-pass inverse text normalization
         include_timestamps: Whether timestamps were requested
         log_capture: LogCapture instance for error responses
+        had_itn_per_chunk: Whether ITN was already applied per-chunk
         
     Returns:
         Tuple of (transcription, timestamps, timestamp_level, error_response)
@@ -3124,13 +3162,15 @@ def _process_single_result(
     if not success:
         return None, [], 'none', _make_error_response('validation', error_msg, log_capture)
     
-    # Apply ITN if enabled and NOT already applied per-chunk
-    has_chunk_timestamps = 0 in chunk_timestamps_map
-    if apply_itn and not has_chunk_timestamps:
-        print(f"   🔢 Applying Inverse Text Normalization...")
+    # Apply final-pass ITN based on mode
+    if apply_itn_final:
+        if had_itn_per_chunk:
+            print(f"   🔢 Applying final-pass ITN (already applied per-chunk, mode=both)")
+        else:
+            print(f"   🔢 Applying final-pass Inverse Text Normalization...")
         transcription = apply_inverse_text_normalization(transcription)
-    elif apply_itn and has_chunk_timestamps:
-        print(f"   🔢 ITN already applied per-chunk during transcription")
+    elif had_itn_per_chunk:
+        print(f"   🔢 ITN was applied per-chunk during transcription")
     
     # Get timestamps
     timestamps, timestamp_level = _extract_single_result_timestamps(
@@ -3270,7 +3310,8 @@ def _process_single_transcription(
         Tuple of (status, transcription_output, timestamps, timestamp_level, error_response)
     """
     transcription, timestamps, timestamp_level, error_response = _process_single_result(
-        result, chunk_timestamps_map, ctx.stats.apply_itn, ctx.include_timestamps, log_capture
+        result, chunk_timestamps_map, ctx.apply_itn_final, ctx.include_timestamps, log_capture,
+        had_itn_per_chunk=ctx.had_itn_per_chunk
     )
     
     if error_response is not None:
@@ -3351,9 +3392,24 @@ def transcribe_audio(
     output_format: str = "txt", 
     apply_itn: bool = True, 
     chunk_size: int = 120, 
-    batch_size: int = 1
+    batch_size: int = 1,
+    silence_threshold: float = 0.5,
+    itn_mode_choice: str = "per_chunk"
 ) -> Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Main transcription function with batch processing, video support, and GPU optimization."""
+    """Main transcription function with batch processing, video support, and GPU optimization.
+    
+    Args:
+        audio_files: Input audio/video files
+        model_choice: Model selection from UI
+        save_to_file: Whether to save output files
+        include_timestamps: Whether to include timestamps
+        output_format: Output format (txt, srt, csv)
+        apply_itn: Whether to apply ITN (legacy, now controlled by itn_mode_choice)
+        chunk_size: Audio chunk size in seconds
+        batch_size: Batch size for processing
+        silence_threshold: End subtitle segments when silence gap exceeds this (seconds)
+        itn_mode_choice: ITN mode - per_chunk, final_pass, both, or disabled
+    """
     
     # Start capturing logs
     log_capture.start()
@@ -3361,10 +3417,17 @@ def transcribe_audio(
     print(f"🎙️ Transcription Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
-    # Update global chunk settings
-    global chunk_duration_sec, long_audio_threshold_sec
+    # Update global settings
+    global chunk_duration_sec, long_audio_threshold_sec, silence_threshold_sec, itn_mode
     chunk_duration_sec = chunk_size
     long_audio_threshold_sec = chunk_size + 30
+    silence_threshold_sec = silence_threshold
+    itn_mode = itn_mode_choice
+    
+    # Determine ITN behavior based on mode
+    apply_itn_per_chunk = itn_mode_choice in ("per_chunk", "both")
+    apply_itn_final = itn_mode_choice in ("final_pass", "both")
+    itn_enabled = itn_mode_choice != "disabled" and apply_itn
     
     # Early return for empty input
     file_list = _normalize_file_list(audio_files)
@@ -3381,9 +3444,10 @@ def transcribe_audio(
         print(f"📁 Files: {len(file_list)}")
         print(f"📊 Model: {model_choice}")
         print(f"📝 Output format: {output_format.upper()}")
-        print(f"🔢 ITN (numbers to digits): {'Enabled' if apply_itn else 'Disabled'}")
+        print(f"🔢 ITN mode: {itn_mode_choice} {'(enabled)' if itn_enabled else '(disabled)'}")
         print(f"⏱️ Timestamps: {'Enabled' if include_timestamps else 'Disabled'}")
         print(f"📦 Chunk size: {chunk_size}s")
+        print(f"🔇 Silence threshold: {silence_threshold}s")
         
         model_key = get_model_key_from_choice(model_choice)
         start_time = time.time()
@@ -3408,10 +3472,10 @@ def transcribe_audio(
         
         video_status = f"🎬 Extracted audio from {video_count} video file(s)\n" if video_count > 0 else ""
         
-        # Run transcription
+        # Run transcription (apply_itn_per_chunk controls per-chunk ITN during chunked transcription)
         inference_start = time.time()
         result, chunk_timestamps_map, error_response = _run_transcription(
-            model, processed_files, 4, chunk_size, apply_itn, log_capture
+            model, processed_files, 4, chunk_size, apply_itn_per_chunk, log_capture
         )
         if error_response is not None:
             return error_response
@@ -3431,11 +3495,12 @@ def transcribe_audio(
         stats = TranscriptionStats(
             model_choice=model_choice, gpu_name=gpu_name, total_duration=total_duration,
             total_time=total_time, inference_time=inference_time, load_time=load_time,
-            chunk_size=chunk_size, rtfx=rtfx, vram_used=vram_used, apply_itn=apply_itn
+            chunk_size=chunk_size, rtfx=rtfx, vram_used=vram_used, apply_itn=itn_enabled
         )
         ctx = ResultProcessingContext(
             stats=stats, file_list=file_list, file_info=file_info,
-            include_timestamps=include_timestamps, video_status=video_status, load_time=load_time
+            include_timestamps=include_timestamps, video_status=video_status, load_time=load_time,
+            apply_itn_final=apply_itn_final, had_itn_per_chunk=apply_itn_per_chunk
         )
         
         # Process results based on batch vs single
@@ -3704,6 +3769,22 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                     info="Higher = more VRAM usage. Increase to utilize more VRAM (1-8 for 8-12GB, 8-16 for 16GB+, 16-24 for 24GB+)."
                 )
                 
+                silence_threshold_slider = gr.Slider(
+                    minimum=0.1,
+                    maximum=3.0,
+                    value=0.5,
+                    step=0.1,
+                    label="🔇 Silence Threshold (seconds)",
+                    info="End subtitle segments when silence gap exceeds this. Lower = more segments, Higher = fewer but longer segments."
+                )
+                
+                itn_mode_dropdown = gr.Dropdown(
+                    choices=["per_chunk", "final_pass", "both", "disabled"],
+                    value="per_chunk",
+                    label="🔢 ITN Mode (Inverse Text Normalization)",
+                    info="per_chunk: Apply during chunked transcription | final_pass: Apply once at end | both: Apply both | disabled: No ITN"
+                )
+                
                 gr.Markdown(f"""
                 **VRAM Optimization Tips**:
                 - **Chunk Size**: Larger chunks process faster but use more VRAM
@@ -3715,6 +3796,17 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                   - 4-8: Better GPU utilization for 12GB+
                   - 8-16: Optimal for 16GB+ VRAM
                   - 16-24: For 24GB+ VRAM (high throughput)
+                
+                **Silence Threshold**: Controls when subtitle segments end based on speech pauses
+                  - 0.3-0.5s: Quick speakers, natural pauses
+                  - 0.5-1.0s: Normal speech patterns
+                  - 1.0-2.0s: Slow speakers, lecture-style
+                
+                **ITN Modes**:
+                  - **per_chunk**: Best for long audio (prevents "input too long" errors)
+                  - **final_pass**: Simpler, processes complete text once (may fail on very long transcriptions)
+                  - **both**: Most thorough, applies ITN twice (per-chunk then final)
+                  - **disabled**: Skip ITN entirely (numbers stay as words)
                 
                 **ITN Status**: {'✅ Available' if ITN_AVAILABLE else '❌ Not installed (run: pip install nemo_text_processing)'}
                 """)
@@ -3848,7 +3940,8 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     transcribe_btn.click(
         fn=transcribe_audio,
         inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox, 
-                output_format, itn_checkbox, chunk_size_slider, batch_size_slider],
+                output_format, itn_checkbox, chunk_size_slider, batch_size_slider,
+                silence_threshold_slider, itn_mode_dropdown],
         outputs=[status_output, transcription_output, txt_file_output, srt_file_output, csv_file_output, log_file_output],
         queue=False
     )
