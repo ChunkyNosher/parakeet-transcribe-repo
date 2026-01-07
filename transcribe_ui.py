@@ -127,7 +127,6 @@ import gc
 import shutil
 import hashlib
 import io
-import re
 import logging
 from datetime import datetime
 from dataclasses import dataclass
@@ -287,7 +286,7 @@ ITN_NORMALIZER: Optional[Any] = None
 ITN_AVAILABLE: bool = False
 
 try:
-    from nemo_text_processing.inverse_text_normalization import InverseNormalizer
+    from nemo_text_processing.inverse_text_normalization import InverseNormalizer  # type: ignore[reportUnusedImport]  # Used at runtime in _get_itn_normalizer()
     # Initialize ITN for English (lazy - will init on first use)
     ITN_AVAILABLE = True  # type: ignore[misc]
     print("✅ ITN (Inverse Text Normalization) available - numbers will be converted to digits")
@@ -634,6 +633,17 @@ def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segme
         start = stamp.get('start', 0.0)
         end = stamp.get('end', 0.0)
         
+        # Fix word timestamps that span silence periods
+        # NeMo sometimes sets word 'start' to the END of the previous word,
+        # even if there was silence between them. This causes words to have
+        # unrealistically long durations (e.g., "With" from 37.2s to 55.0s).
+        # 
+        # The END time is usually more accurate (when next word starts or
+        # when this word's audio actually ends), so we adjust START instead.
+        # If duration > max, assume word was spoken near its end time.
+        if end - start > max_word_duration_sec:
+            start = end - max_word_duration_sec
+        
         # Check for silence gap since last word (silence detection)
         if current['words'] and effective_silence_threshold > 0:
             gap = start - last_end_time
@@ -975,7 +985,7 @@ def validate_and_normalize_audio(file_path: str) -> Tuple[bool, Any, int, str, s
                   sample_rate: int, error_msg: str, warning_msg: str)
     """
     import librosa
-    import numpy as np
+    import numpy as np  # type: ignore[reportUnusedImport]  # Required for librosa array operations
     
     try:
         # Load audio preserving original sample rate
@@ -1217,6 +1227,14 @@ DEFAULT_LONG_AUDIO_THRESHOLD_SEC = 90  # Audio longer than this triggers chunkin
 # If gap between words > this threshold, end the current subtitle segment
 DEFAULT_SILENCE_THRESHOLD_SEC = 0.5
 
+# Maximum duration for a single word timestamp (in seconds)
+# NeMo sometimes sets word START times to the END of the previous word,
+# even when there was silence between them. This causes single words to span
+# long silence periods (e.g., "With" showing 37s→55s when spoken at 55s).
+# Fix: If duration > max, adjust START to be (END - max_duration), assuming
+# the word was spoken near its detected END time.
+DEFAULT_MAX_WORD_DURATION_SEC = 2.0
+
 # ITN (Inverse Text Normalization) mode options
 # - "per_chunk": Apply ITN to each chunk during transcription (best for long audio)
 # - "final_pass": Apply ITN once to complete transcription (simpler, may fail on long text)
@@ -1230,6 +1248,7 @@ DEFAULT_ITN_MODE = "per_chunk"
 chunk_duration_sec = DEFAULT_CHUNK_DURATION_SEC
 long_audio_threshold_sec = DEFAULT_LONG_AUDIO_THRESHOLD_SEC
 silence_threshold_sec = DEFAULT_SILENCE_THRESHOLD_SEC
+max_word_duration_sec = DEFAULT_MAX_WORD_DURATION_SEC
 itn_mode = DEFAULT_ITN_MODE
 
 
@@ -1285,21 +1304,38 @@ def _extract_hypothesis_text(hypothesis: Any) -> str:
 def _adjust_chunk_timestamps(chunk_word_ts: List[Dict[str, Any]], ts_level: str, left_context_duration: float, chunk_start_time: float) -> List[Dict[str, Any]]:
     """Adjust raw timestamps from a chunk to absolute positions.
     
+    IMPORTANT: Filters out words that fall within the left context overlap region,
+    as those words were already captured by the previous chunk. This prevents
+    duplicate words at chunk boundaries.
+    
     Args:
         chunk_word_ts: List of timestamp dicts from extract_timestamps()
         ts_level: Timestamp level ('word', 'segment', 'char')
-        left_context_duration: Duration of left context that was prepended
+        left_context_duration: Duration of left context that was prepended (overlap region)
         chunk_start_time: Start time of this chunk in the full audio
         
     Returns:
-        List of adjusted timestamp dicts
+        List of adjusted timestamp dicts (excluding overlap region words)
     """
     adjusted_timestamps: List[Dict[str, Any]] = []
     
     for ts in chunk_word_ts:
+        raw_start = ts.get('start', 0.0)
+        raw_end = ts.get('end', 0.0)
+        
+        # Skip words that fall entirely within the left context overlap region
+        # These words were already transcribed by the previous chunk
+        if raw_end <= left_context_duration:
+            continue
+        
+        # For words that start in overlap but end after, use chunk_start_time as start
+        # (partial overlap - keep the word but adjust its start)
+        if raw_start < left_context_duration:
+            raw_start = left_context_duration
+        
         adjusted_ts: Dict[str, Any] = {
-            'start': max(0.0, ts.get('start', 0.0) - left_context_duration + chunk_start_time),
-            'end': ts.get('end', 0.0) - left_context_duration + chunk_start_time,
+            'start': max(0.0, raw_start - left_context_duration + chunk_start_time),
+            'end': raw_end - left_context_duration + chunk_start_time,
         }
         # Ensure end >= start
         adjusted_ts['end'] = max(float(adjusted_ts['start']), float(adjusted_ts['end']))
@@ -1328,6 +1364,10 @@ def _process_single_chunk(model: Any, buffer: Any, use_cuda: bool, apply_itn_per
                           left_context_duration: float) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """Process a single audio chunk and return transcription and timestamps.
     
+    IMPORTANT: Filters out words from the left context overlap region to prevent
+    duplicate words at chunk boundaries. The returned text is reconstructed from
+    the filtered timestamps to ensure text and timestamps stay aligned.
+    
     Returns:
         Tuple of (chunk_text or None, chunk_timestamps list)
     """
@@ -1337,23 +1377,44 @@ def _process_single_chunk(model: Any, buffer: Any, use_cuda: bool, apply_itn_per
         return None, []
     
     hypothesis = result[0]
-    chunk_text = _extract_hypothesis_text(hypothesis).strip()
     
-    if not chunk_text:
-        return None, []
-    
-    # Apply ITN to this chunk immediately (before text gets too long)
-    if apply_itn_per_chunk:
-        chunk_text = apply_itn_to_segment(chunk_text)
-    
-    # Extract and adjust timestamps
+    # Extract timestamps first - we'll filter and use them to build text
     chunk_word_ts, ts_level = extract_timestamps(hypothesis, include_timestamps=True)
     
     if chunk_word_ts and ts_level in ('word', 'segment', 'char'):
+        # Filter out overlap region and adjust timestamps
         adjusted = _adjust_chunk_timestamps(chunk_word_ts, ts_level, left_context_duration, chunk_start_time)
+        
+        if not adjusted:
+            return None, []
+        
+        # Reconstruct text from filtered timestamps to ensure alignment
+        words = []
+        for ts in adjusted:
+            word = ts.get('word', ts.get('text', ts.get('segment', ts.get('char', ''))))
+            if word:
+                words.append(word)
+        
+        chunk_text = ' '.join(words).strip()
+        
+        if not chunk_text:
+            return None, []
+        
+        # Apply ITN to this chunk immediately (before text gets too long)
+        if apply_itn_per_chunk:
+            chunk_text = apply_itn_to_segment(chunk_text)
+        
         return chunk_text, adjusted
     else:
-        # Fallback: chunk-level timestamp
+        # Fallback: no word-level timestamps, use full text (can't filter)
+        chunk_text = _extract_hypothesis_text(hypothesis).strip()
+        
+        if not chunk_text:
+            return None, []
+        
+        if apply_itn_per_chunk:
+            chunk_text = apply_itn_to_segment(chunk_text)
+        
         return chunk_text, [_create_chunk_fallback_timestamp(chunk_start_time, chunk_end_time, chunk_text)]
 
 
@@ -1453,7 +1514,7 @@ def _load_audio_files_to_memory(files: List[str]) -> List[Tuple[Any, float]]:
             duration_sec = len(audio_np) / sr
             audio_data.append((audio_np, duration_sec))
             print(f"      • {Path(file_path).name}: {duration_sec:.1f}s")
-        except Exception as e:
+        except Exception:
             print(f"   ❌ Failed to load audio: {file_path}")
             raise
     
@@ -2703,7 +2764,7 @@ def _write_csv_batch(
     f.write("file,start_time,end_time,duration,text\n")
     
     for i, info in enumerate(file_info):
-        trans, ts, ts_level, is_valid = _get_batch_file_data(file_info, all_transcriptions, all_timestamps, i)
+        trans, ts, _ts_level, is_valid = _get_batch_file_data(file_info, all_transcriptions, all_timestamps, i)
         if not is_valid:
             continue
             
@@ -2918,7 +2979,7 @@ def _get_audio_duration_with_retry(file_path: str, max_retries: int = 4, base_de
             duration: float = librosa.get_duration(path=file_path)  # type: ignore[reportUnknownMemberType]
             gc.collect()
             return duration  # type: ignore[reportReturnType]
-        except (OSError, PermissionError) as e:
+        except (OSError, PermissionError):
             if attempt < max_retries - 1:
                 delay = base_delay * (attempt + 1)
                 print(f"   ⚠️  File lock on duration check (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s...")
@@ -3393,6 +3454,7 @@ def transcribe_audio(
     apply_itn: bool = True, 
     chunk_size: int = 120, 
     batch_size: int = 1,
+    max_word_duration: float = 2.0,
     silence_threshold: float = 0.5,
     itn_mode_choice: str = "per_chunk"
 ) -> Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -3407,6 +3469,7 @@ def transcribe_audio(
         apply_itn: Whether to apply ITN (legacy, now controlled by itn_mode_choice)
         chunk_size: Audio chunk size in seconds
         batch_size: Batch size for processing
+        max_word_duration: Cap individual word timestamps to this duration (seconds)
         silence_threshold: End subtitle segments when silence gap exceeds this (seconds)
         itn_mode_choice: ITN mode - per_chunk, final_pass, both, or disabled
     """
@@ -3418,10 +3481,11 @@ def transcribe_audio(
     print(f"{'='*60}")
     
     # Update global settings
-    global chunk_duration_sec, long_audio_threshold_sec, silence_threshold_sec, itn_mode
+    global chunk_duration_sec, long_audio_threshold_sec, silence_threshold_sec, max_word_duration_sec, itn_mode
     chunk_duration_sec = chunk_size
     long_audio_threshold_sec = chunk_size + 30
     silence_threshold_sec = silence_threshold
+    max_word_duration_sec = max_word_duration
     itn_mode = itn_mode_choice
     
     # Determine ITN behavior based on mode
@@ -3436,8 +3500,6 @@ def transcribe_audio(
         return "⚠️ Please upload an audio or video file first", "", None, None, None, None
     
     try:
-        import librosa
-        
         is_batch = len(file_list) > 1
         
         # Log settings
@@ -3753,20 +3815,29 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             with gr.Accordion("⚙️ Advanced Settings", open=False):
                 chunk_size_slider = gr.Slider(
                     minimum=30,
-                    maximum=300,
+                    maximum=1200,
                     value=120,
                     step=10,
                     label="🎛️ Chunk Size (seconds)",
-                    info="Larger = faster but more VRAM. 120-180s recommended for 12GB VRAM. Reduce if OOM errors."
+                    info="Larger = faster but more VRAM. 120-180s for 12GB, 300-600s for 24GB, 600-1200s for 48GB+ VRAM."
                 )
                 
                 batch_size_slider = gr.Slider(
                     minimum=1,
-                    maximum=24,
+                    maximum=32,
                     value=1,
                     step=1,
                     label="📦 Batch Size",
-                    info="Higher = more VRAM usage. Increase to utilize more VRAM (1-8 for 8-12GB, 8-16 for 16GB+, 16-24 for 24GB+)."
+                    info="Higher = more VRAM usage. (1-8 for 8-12GB, 8-16 for 16GB+, 16-32 for 24GB+)"
+                )
+                
+                max_word_duration_slider = gr.Slider(
+                    minimum=0.5,
+                    maximum=5.0,
+                    value=2.0,
+                    step=0.1,
+                    label="⏱️ Max Word Duration (seconds)",
+                    info="Cap individual word timestamps. Prevents single words spanning silence (e.g., 'With' showing 18 seconds)."
                 )
                 
                 silence_threshold_slider = gr.Slider(
@@ -3790,12 +3861,19 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
                 - **Chunk Size**: Larger chunks process faster but use more VRAM
                   - 60-90s: Safe for 8GB VRAM
                   - 120-180s: Good for 12GB VRAM  
-                  - 200-300s: For 16GB+ VRAM
+                  - 300-600s: For 24GB VRAM
+                  - 600-1200s: For 48GB+ VRAM
                 - **Batch Size**: How many chunks to process at once
                   - 1-4: Safe for 8-12GB VRAM
                   - 4-8: Better GPU utilization for 12GB+
                   - 8-16: Optimal for 16GB+ VRAM
-                  - 16-24: For 24GB+ VRAM (high throughput)
+                  - 16-32: For 24GB+ VRAM (high throughput)
+                
+                **Max Word Duration**: Fixes SRT timestamp bug where single words span silence
+                  - NeMo sometimes sets word START to end of previous word (ignoring silence)
+                  - This causes "With" to show 37s→55s when spoken at 55s after silence
+                  - Fix: Adjusts START time so word ends at detected END time minus max duration
+                  - Cap at 2.0s (default) - most words are 0.3-1.5s
                 
                 **Silence Threshold**: Controls when subtitle segments end based on speech pauses
                   - 0.3-0.5s: Quick speakers, natural pauses
@@ -3941,7 +4019,7 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         fn=transcribe_audio,
         inputs=[audio_input, model_selector, save_checkbox, timestamp_checkbox, 
                 output_format, itn_checkbox, chunk_size_slider, batch_size_slider,
-                silence_threshold_slider, itn_mode_dropdown],
+                max_word_duration_slider, silence_threshold_slider, itn_mode_dropdown],
         outputs=[status_output, transcription_output, txt_file_output, srt_file_output, csv_file_output, log_file_output],
         queue=False
     )
@@ -3959,7 +4037,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         print(f"\n✅ GPU: {torch.cuda.get_device_name(0)}")
         print(f"✅ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-        print(f"✅ CUDA: {torch.version.cuda}")
+        print(f"✅ CUDA: {torch.version.cuda}")  # type: ignore[reportAttributeAccessIssue]
         
         # Enable GPU optimizations (TF32, cuDNN)
         setup_gpu_optimizations()
