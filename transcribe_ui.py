@@ -1341,6 +1341,50 @@ def _clear_vram() -> None:
     gc.collect()
 
 
+def _is_multitask_aed_model(model: Any) -> bool:
+    """Return True for Canary-style multi-task AED models."""
+    model_type = type(model).__name__.lower()
+    model_module = type(model).__module__.lower()
+    return (
+        'multitask' in model_type
+        or 'aed' in model_type
+        or 'aed_multitask_models' in model_module
+        or hasattr(model, 'prompt_format')
+    )
+
+
+def _write_temp_chunk_wav(buffer: Any, sample_rate: int = 16000) -> str:
+    """Persist a chunk to temp WAV so AED models can consume file-path input."""
+    import numpy as np
+    import wave
+
+    fd, tmp_path = tempfile.mkstemp(prefix="chunk_", suffix=".wav", dir=str(_temp_dir))
+    os.close(fd)
+
+    audio = np.asarray(buffer, dtype=np.float32)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767.0).astype(np.int16)
+
+    with wave.open(tmp_path, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16.tobytes())
+
+    return tmp_path
+
+
+def _remove_temp_file_safely(path: str) -> None:
+    """Best-effort temp file cleanup with brief retries for Windows locks."""
+    for _ in range(3):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except OSError:
+            time.sleep(0.1)
+
+
 def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
     """Transcribe a single audio buffer.
     
@@ -1352,6 +1396,27 @@ def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
     Returns:
         Result from model.transcribe()
     """
+    if _is_multitask_aed_model(model):
+        tmp_wav_path = _write_temp_chunk_wav(buffer, sample_rate=16000)
+        try:
+            # AED multi-task models (Canary family) are more stable with
+            # file-path inputs than raw numpy chunk tensors in some NeMo builds.
+            mt_kwargs: Dict[str, Any] = {
+                'audio': [tmp_wav_path],
+                'batch_size': 1,
+                'return_hypotheses': True,
+                'num_workers': 0,
+                'timestamps': False,
+                'verbose': False,
+            }
+
+            if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+                with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
+                    return model.transcribe(**mt_kwargs)
+            return model.transcribe(**mt_kwargs)
+        finally:
+            _remove_temp_file_safely(tmp_wav_path)
+
     base_kwargs: Dict[str, Any] = {
         'audio': [buffer],
         'batch_size': 1,  # Single chunk at a time for memory safety
@@ -1554,6 +1619,7 @@ def _transcribe_long_audio_chunked(model: Any, audio_array: Any, sample_rate: in
     
     transcriptions: List[str] = []
     chunk_timestamps: List[Dict[str, Any]] = []
+    failed_chunks = 0
     position = 0
     chunk_num = 0
     
@@ -1582,12 +1648,19 @@ def _transcribe_long_audio_chunked(model: Any, audio_array: Any, sample_rate: in
                 transcriptions.append(chunk_text)
                 chunk_timestamps.extend(ts_list)
         except Exception as e:
+            failed_chunks += 1
             print(f"   ⚠️ Chunk {chunk_num} failed: {type(e).__name__}: {e}")
         
         position += step_samples
         _clear_vram()
     
     print(f"   ✅ Processed {chunk_num} chunks")
+
+    if not transcriptions:
+        raise RuntimeError(
+            f"Chunked transcription failed for all {chunk_num} chunks. "
+            f"Last run had {failed_chunks} failed chunks and 0 successful chunks."
+        )
     
     # Merge transcriptions and clean up spacing
     full_transcription = ' '.join(transcriptions)
