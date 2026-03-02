@@ -1851,7 +1851,7 @@ def _transcribe_multitask_files(model: Any, files: List[str], use_cuda: bool, ma
     transcribe_kwargs: Dict[str, Any] = {
         'audio': files,
         'batch_size': 1,
-        'return_hypotheses': True,
+        'return_hypotheses': False,
         'num_workers': 0,
         'verbose': True,
         'task': 'asr',
@@ -1894,6 +1894,11 @@ def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cu
     Returns:
         Tuple of (results, chunk_timestamps_map)
     """
+    if _is_multitask_aed_model(model):
+        print("   ⚡ Canary detected - using direct multitask transcription path")
+        result = _transcribe_multitask_files(model, files, use_cuda, max_retries=max_retries, base_delay=0.5)
+        return result, {}
+
     audio_data = _load_audio_files_to_memory(files)
     
     # Check if any audio needs chunking
@@ -1901,10 +1906,6 @@ def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cu
     needs_chunking = any(duration > effective_threshold for _, duration in audio_data)
     
     if needs_chunking:
-        if _is_multitask_aed_model(model):
-            print("   ⚡ Long audio + Canary detected - using direct multitask transcription fallback")
-            result = _transcribe_multitask_files(model, files, use_cuda, max_retries=max_retries, base_delay=0.5)
-            return result, {}
         return _transcribe_chunked_files(
             model, audio_data, use_cuda, chunk_size_override, effective_threshold,
             apply_itn_per_chunk=apply_itn  # Apply ITN per chunk to avoid long text issues
@@ -2661,6 +2662,24 @@ def _move_model_to_cuda(model: Any, model_name: str) -> Any:
     return model
 
 
+def _optimize_multitask_decoding(model: Any) -> None:
+    """Apply faster decoding defaults for Canary-style multitask models."""
+    if not _is_multitask_aed_model(model):
+        return
+
+    try:
+        decode_cfg = model.cfg.decoding  # type: ignore[reportUnknownMemberType]
+        if hasattr(decode_cfg, 'strategy'):
+            decode_cfg.strategy = 'greedy'
+        if hasattr(decode_cfg, 'beam') and hasattr(decode_cfg.beam, 'beam_size'):
+            old_beam = decode_cfg.beam.beam_size
+            decode_cfg.beam.beam_size = 1
+            model.change_decoding_strategy(decode_cfg)  # type: ignore[reportUnknownMemberType]
+            print(f"   ✅ Canary decoding optimized: strategy=greedy, beam_size {old_beam} -> 1")
+    except Exception as e:
+        print(f"   ⚠️ Could not optimize Canary decoding strategy: {e}")
+
+
 # ============================================================================
 # VRAM Management: Manual and Auto Unload
 # ============================================================================
@@ -2800,6 +2819,7 @@ def load_model(model_name: str, show_progress: bool = False) -> Any:
     
     # Move model to CUDA if available
     models_cache[model_name] = _move_model_to_cuda(models_cache[model_name], model_name)
+    _optimize_multitask_decoding(models_cache[model_name])
     
     return models_cache[model_name]
 

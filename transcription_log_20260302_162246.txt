@@ -1,0 +1,33 @@
+Transcription Log - 2026-03-02 16:22:46
+============================================================
+
+
+============================================================
+🎙️ Transcription Started: 2026-03-02 16:10:20
+============================================================
+📁 Files: 1
+📊 Model: �🌍 Canary-1B v2 (Multilingual + Translation) - 25 languages with AST
+📝 Output format: TXT
+🔢 ITN mode: per_chunk (enabled)
+⏱️ Timestamps: Enabled
+📦 Chunk size: 120s
+🔇 Silence threshold: 0.5s
+📦 Loading Canary-1B v2 from local file...
+   Path: E:\Chunky's Master Folder\parakeet-transcribe-repo\local_models\canary-1b-v2.nemo
+Error getting class at nemo.collections.asr.modules.transformer.get_nemo_transformer: Located non-class of type 'function' while loading 'nemo.collections.asr.modules.transformer.get_nemo_transformer'
+   ✅ Overrode dataloader num_workers: train_ds: 4 -> 0, validation_ds: 2 -> 0
+✓ Canary-1B v2 loaded in 460.2s
+   ✅ Model moved to CUDA
+📁 Using cached file: 86ff312a2497464a_LIMC video VO_extratakes-1.wav
+   📂 Loading 1 audio file(s) into memory...
+      • 86ff312a2497464a_LIMC video VO_extratakes-1.wav: 329.2s
+   ⚡ Long audio + Canary detected - using direct multitask transcription fallback
+Transcribing: 0it [00:00, ?it/s]Transcribing: 1it [04:42, 282.64s/it]Transcribing: 1it [04:42, 282.64s/it]
+
+✅ Transcription complete!
+   Duration: 329.2s audio in 284.0s (1.2× real-time)
+   🔢 ITN was applied per-chunk during transcription
+
+============================================================
+✅ Transcription Complete: 2026-03-02 16:22:46
+============================================================
