@@ -1401,12 +1401,10 @@ def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
         try:
             # AED multi-task models (Canary family) are more stable with
             # file-path inputs than raw numpy chunk tensors in some NeMo builds.
-            mt_kwargs: Dict[str, Any] = {
+            base_mt_kwargs: Dict[str, Any] = {
                 'audio': [tmp_wav_path],
                 'batch_size': 1,
-                'return_hypotheses': True,
                 'num_workers': 0,
-                'timestamps': False,
                 'verbose': False,
                 'task': 'asr',
                 'taskname': 'asr',
@@ -1416,10 +1414,28 @@ def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
                 'timestamp': 'no',
             }
 
-            if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
-                with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
-                    return model.transcribe(**mt_kwargs)
-            return model.transcribe(**mt_kwargs)
+            # Canary sometimes returns empty outputs for one prompt/config mode.
+            # Retry with alternate output modes before giving up.
+            mt_attempts: List[Dict[str, Any]] = [
+                {'return_hypotheses': True},
+                {'return_hypotheses': False},
+                {'return_hypotheses': True, 'pnc': 'true'},
+            ]
+
+            last_output: Any = None
+            for attempt in mt_attempts:
+                mt_kwargs = {**base_mt_kwargs, **attempt}
+                if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
+                        output = model.transcribe(**mt_kwargs)
+                else:
+                    output = model.transcribe(**mt_kwargs)
+
+                last_output = output
+                if isinstance(output, list) and len(output) > 0:
+                    return output
+
+            return last_output
         finally:
             _remove_temp_file_safely(tmp_wav_path)
 
@@ -1479,8 +1495,14 @@ def _extract_hypothesis_text(hypothesis: Any) -> str:
                 return item
         return ""
     if isinstance(hypothesis, dict):
-        text_val = hypothesis.get('text', '')
-        return str(text_val) if text_val is not None else ""
+        for key in ('text', 'pred_text', 'prediction', 'answer'):
+            if key in hypothesis and hypothesis.get(key) is not None:
+                return str(hypothesis.get(key))
+        return ""
+    if isinstance(hypothesis, list):
+        if len(hypothesis) == 0:
+            return ""
+        return _extract_hypothesis_text(hypothesis[0])
     if isinstance(hypothesis, str):
         return hypothesis
     return str(hypothesis)
@@ -1488,12 +1510,18 @@ def _extract_hypothesis_text(hypothesis: Any) -> str:
 
 def _unwrap_transcription_item(item: Any) -> Any:
     """Unwrap common NeMo wrappers (e.g. (cut, hypothesis))."""
+    if isinstance(item, list):
+        if len(item) == 0:
+            return item
+        return _unwrap_transcription_item(item[0])
     if isinstance(item, tuple):
         for candidate in reversed(item):
             if hasattr(candidate, 'text'):
                 return candidate
             if isinstance(candidate, (str, dict)):
                 return candidate
+            if isinstance(candidate, list) and len(candidate) > 0:
+                return _unwrap_transcription_item(candidate[0])
         if len(item) > 0:
             return item[-1]
     return item
@@ -1572,6 +1600,7 @@ def _process_single_chunk(model: Any, buffer: Any, use_cuda: bool, apply_itn_per
     result = _transcribe_single_buffer(model, buffer, use_cuda)
     
     if not result or len(result) == 0:
+        print("   ⚠️ Chunk returned empty transcription output")
         return None, []
     
     hypothesis = _unwrap_transcription_item(result[0])
@@ -1817,6 +1846,35 @@ def _transcribe_short_audio_batch(model: Any, audio_arrays: List[Any], batch_siz
     raise RuntimeError(f"Transcription failed after {max_retries} attempts")
 
 
+def _transcribe_multitask_files(model: Any, files: List[str], use_cuda: bool, max_retries: int = 3, base_delay: float = 0.5) -> Any:
+    """Transcribe files via Canary multitask API using file-path inputs."""
+    transcribe_kwargs: Dict[str, Any] = {
+        'audio': files,
+        'batch_size': 1,
+        'return_hypotheses': True,
+        'num_workers': 0,
+        'verbose': True,
+        'task': 'asr',
+        'taskname': 'asr',
+        'source_lang': 'en',
+        'target_lang': 'en',
+        'pnc': 'yes',
+        'timestamp': 'no',
+    }
+
+    for attempt in range(max_retries):
+        try:
+            return _execute_transcription(model, transcribe_kwargs, use_cuda)
+        except (PermissionError, Exception) as e:
+            _clear_vram()
+            should_retry = _is_file_lock_error(str(e)) or not isinstance(e, PermissionError)
+            if should_retry and _handle_retry_delay(attempt, base_delay, max_retries):
+                continue
+            raise
+
+    raise RuntimeError(f"Multitask transcription failed after {max_retries} attempts")
+
+
 def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cuda: bool = True, max_retries: int = 3,
                            chunk_size_override: Optional[int] = None, apply_itn: bool = False) -> Tuple[Any, Dict[int, List[Dict[str, Any]]]]:
     """Transcribe using tensor-based input with chunking for long audio.
@@ -1843,6 +1901,10 @@ def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cu
     needs_chunking = any(duration > effective_threshold for _, duration in audio_data)
     
     if needs_chunking:
+        if _is_multitask_aed_model(model):
+            print("   ⚡ Long audio + Canary detected - using direct multitask transcription fallback")
+            result = _transcribe_multitask_files(model, files, use_cuda, max_retries=max_retries, base_delay=0.5)
+            return result, {}
         return _transcribe_chunked_files(
             model, audio_data, use_cuda, chunk_size_override, effective_threshold,
             apply_itn_per_chunk=apply_itn  # Apply ITN per chunk to avoid long text issues
