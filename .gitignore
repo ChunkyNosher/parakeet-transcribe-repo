@@ -33,6 +33,13 @@ transcription-logs/
 env/
 .venv/
 venv/
+.venv311/
+.conda/
+
+# Conda and Python local metadata
+conda-meta/
+*.conda
+.python-version
 
 # Generated transcription outputs
 *_transcription.txt

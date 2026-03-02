@@ -19,8 +19,8 @@ See docs/manual/comprehensive-asr-model-integration-guide.md for details.
 """
 
 import nemo.collections.asr as nemo_asr
-import os
 import sys
+from pathlib import Path
 
 # ============================================================================
 # MODEL DEFINITIONS
@@ -80,14 +80,17 @@ MODELS_TO_DOWNLOAD = {
     }
 }
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOCAL_MODELS_DIR = SCRIPT_DIR / "local_models"
+
 
 def create_local_models_directory():
     """Create local_models directory if it doesn't exist."""
-    if not os.path.exists("local_models"):
-        os.makedirs("local_models")
-        print("✓ Created local_models/ directory")
+    if not LOCAL_MODELS_DIR.exists():
+        LOCAL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"✓ Created {LOCAL_MODELS_DIR}")
     else:
-        print("✓ local_models/ directory already exists")
+        print(f"✓ local_models directory already exists: {LOCAL_MODELS_DIR}")
 
 
 def get_model_status():
@@ -98,22 +101,22 @@ def get_model_status():
     """
     status = {}
     for choice, model in MODELS_TO_DOWNLOAD.items():
-        filepath = os.path.join("local_models", model["filename"])
-        if os.path.exists(filepath):
-            size_gb = os.path.getsize(filepath) / (1024**3)
+        filepath = LOCAL_MODELS_DIR / model["filename"]
+        if filepath.exists():
+            size_gb = filepath.stat().st_size / (1024**3)
             is_valid = size_gb >= model["min_size_gb"]
             status[choice] = {
                 "exists": True,
                 "size_gb": size_gb,
                 "valid": is_valid,
-                "path": filepath
+                "path": str(filepath)
             }
         else:
             status[choice] = {
                 "exists": False,
                 "size_gb": 0,
                 "valid": False,
-                "path": filepath
+                "path": str(filepath)
             }
     return status
 
@@ -165,7 +168,7 @@ def download_and_save_model(choice):
         return False
     
     model = MODELS_TO_DOWNLOAD[choice]
-    output_path = os.path.abspath(f"local_models/{model['filename']}")
+    output_path = (LOCAL_MODELS_DIR / model['filename']).resolve()
     
     print("\n" + "="*80)
     print(f"📦 DOWNLOADING: {model['display_name']}")
@@ -189,8 +192,8 @@ def download_and_save_model(choice):
         print(f"   ✓ Saved to {output_path}")
         
         # Verify file
-        if os.path.exists(output_path):
-            file_size = os.path.getsize(output_path) / (1024**3)
+        if output_path.exists():
+            file_size = output_path.stat().st_size / (1024**3)
             print(f"\n   📊 Verification:")
             print(f"      File size: {file_size:.2f} GB")
             
@@ -284,6 +287,7 @@ def main():
     print("  • Unique filenames prevent overwrites")
     print("  • Automatic integrity verification")
     print("  • Works with transcribe_ui.py fallback loading")
+    print(f"  • Model destination: {LOCAL_MODELS_DIR}")
     
     # Create directory
     create_local_models_directory()

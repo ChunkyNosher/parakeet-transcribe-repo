@@ -1,0 +1,13 @@
+name: parakeet-transcribe
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - ffmpeg
+  - pytorch>=2.5
+  - torchaudio
+  - pip:
+      - -r requirements.txt
