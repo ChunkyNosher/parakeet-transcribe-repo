@@ -587,6 +587,96 @@ def _should_end_segment(word: str, segment_duration: float, word_count: int, has
     )
 
 
+def _normalize_word_timing(start: float, end: float, max_word_duration: float) -> Tuple[float, float]:
+    """Normalize a word's start/end times and trim trailing silence.
+
+    NeMo can occasionally return words that span long silence periods. When the
+    observed duration exceeds max_word_duration, we clamp the word to a short
+    window near its detected end time.
+    """
+    safe_start = float(start)
+    safe_end = float(end)
+
+    if safe_end < safe_start:
+        safe_end = safe_start
+
+    if max_word_duration > 0 and (safe_end - safe_start) > max_word_duration:
+        safe_start = max(safe_start, safe_end - max_word_duration)
+        safe_end = min(safe_end, safe_start + max_word_duration)
+
+    if safe_end < safe_start:
+        safe_end = safe_start
+
+    return safe_start, safe_end
+
+
+def _merge_orphan_sentence_segments(segments: List[Dict[str, Any]], silence_threshold: float) -> List[Dict[str, Any]]:
+    """Merge tiny trailing segments into the previous segment when appropriate.
+
+    This prevents a sentence-final word from becoming an isolated subtitle block
+    when the previous block ended due duration/word-count limits.
+    """
+    if len(segments) < 2:
+        return segments
+
+    merged: List[Dict[str, Any]] = [segments[0]]
+
+    for seg in segments[1:]:
+        prev = merged[-1]
+        prev_text = str(prev.get('text', '')).strip()
+        seg_text = str(seg.get('text', '')).strip()
+
+        seg_word_count = len(seg_text.split())
+        gap = float(seg.get('start', 0.0)) - float(prev.get('end', 0.0))
+
+        # Merge only close-by tiny segments so true silence gaps remain visible.
+        should_merge = (
+            seg_word_count <= 2
+            and gap <= max(0.0, silence_threshold)
+            and not _ends_with_sentence_punctuation(prev_text)
+        )
+
+        if should_merge:
+            combined_text = f"{prev_text} {seg_text}".strip()
+            prev['text'] = combined_text
+            prev['end'] = max(float(prev.get('end', 0.0)), float(seg.get('end', 0.0)))
+            continue
+
+        merged.append(seg)
+
+    return merged
+
+
+def _enforce_segment_boundaries(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure segments are monotonic and never overlap into later speech."""
+    if not segments:
+        return []
+
+    cleaned: List[Dict[str, Any]] = []
+
+    for i, seg in enumerate(segments):
+        start = float(seg.get('start', 0.0))
+        end = float(seg.get('end', start))
+        text = str(seg.get('text', '')).strip()
+
+        if not text:
+            continue
+
+        if end < start:
+            end = start
+
+        # If a later segment starts earlier, trim current end to preserve gaps.
+        if i + 1 < len(segments):
+            next_start = float(segments[i + 1].get('start', end))
+            end = min(end, next_start)
+            if end < start:
+                end = start
+
+        cleaned.append({'start': start, 'end': end, 'text': text})
+
+    return cleaned
+
+
 def _finalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
     """Finalize a segment by joining words and returning clean dict."""
     return {
@@ -630,19 +720,9 @@ def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segme
     
     for stamp in timestamps:
         word = _get_word_text_from_timestamp(stamp)
-        start = stamp.get('start', 0.0)
-        end = stamp.get('end', 0.0)
-        
-        # Fix word timestamps that span silence periods
-        # NeMo sometimes sets word 'start' to the END of the previous word,
-        # even if there was silence between them. This causes words to have
-        # unrealistically long durations (e.g., "With" from 37.2s to 55.0s).
-        # 
-        # The END time is usually more accurate (when next word starts or
-        # when this word's audio actually ends), so we adjust START instead.
-        # If duration > max, assume word was spoken near its end time.
-        if end - start > max_word_duration_sec:
-            start = end - max_word_duration_sec
+        raw_start = float(stamp.get('start', 0.0))
+        raw_end = float(stamp.get('end', 0.0))
+        start, end = _normalize_word_timing(raw_start, raw_end, max_word_duration_sec)
         
         # Check for silence gap since last word (silence detection)
         if current['words'] and effective_silence_threshold > 0:
@@ -670,7 +750,8 @@ def _group_words_into_segments(timestamps: List[Dict[str, Any]], words_per_segme
     if current['words']:
         segments.append(_finalize_segment(current))
     
-    return segments
+    segments = _merge_orphan_sentence_segments(segments, effective_silence_threshold)
+    return _enforce_segment_boundaries(segments)
 
 
 def format_as_srt(transcription: str, timestamps: List[Dict[str, Any]], timestamp_level: str = 'word') -> str:
@@ -1271,18 +1352,41 @@ def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
     Returns:
         Result from model.transcribe()
     """
-    transcribe_kwargs: Dict[str, Any] = {
+    base_kwargs: Dict[str, Any] = {
         'audio': [buffer],
         'batch_size': 1,  # Single chunk at a time for memory safety
-        'return_hypotheses': True,
-        'timestamps': True,  # Enable timestamp extraction for word/segment boundaries
         'verbose': False
     }
-    
-    if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
-        with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
+
+    # Some Canary + NeMo combinations can fail in timestamp mode with
+    # "'tuple' object has no attribute 'cuts'" during long-audio chunking.
+    # Fall back to non-timestamp modes so transcription still succeeds.
+    mode_attempts: List[Dict[str, Any]] = [
+        {'return_hypotheses': True, 'timestamps': True},
+        {'return_hypotheses': True, 'timestamps': False},
+        {'return_hypotheses': False, 'timestamps': False},
+    ]
+
+    last_error: Optional[Exception] = None
+
+    for idx, mode_kwargs in enumerate(mode_attempts, 1):
+        transcribe_kwargs = {**base_kwargs, **mode_kwargs}
+        try:
+            if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+                with torch.autocast(device_type='cuda', dtype=torch.float16):  # type: ignore[reportUnknownMemberType]
+                    return model.transcribe(**transcribe_kwargs)
             return model.transcribe(**transcribe_kwargs)
-    return model.transcribe(**transcribe_kwargs)
+        except Exception as e:
+            last_error = e
+            if idx < len(mode_attempts):
+                print(f"   ⚠️ Chunk transcribe mode {idx} failed: {type(e).__name__}: {e}; trying fallback mode...")
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Chunk transcription failed without a captured exception")
 
 
 def _extract_hypothesis_text(hypothesis: Any) -> str:
@@ -3169,7 +3273,7 @@ def _process_batch_results(
             # Get timestamps - use chunk timestamps if available
             if i in chunk_timestamps_map:
                 timestamps = chunk_timestamps_map[i]
-                timestamp_level = 'segment'
+                timestamp_level = 'word' if any('word' in ts for ts in timestamps) else 'segment'
             else:
                 timestamps, timestamp_level = extract_timestamps(res, include_timestamps)
             all_timestamps.append((timestamps, timestamp_level))
