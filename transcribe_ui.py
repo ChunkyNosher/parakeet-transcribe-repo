@@ -1408,6 +1408,12 @@ def _transcribe_single_buffer(model: Any, buffer: Any, use_cuda: bool) -> Any:
                 'num_workers': 0,
                 'timestamps': False,
                 'verbose': False,
+                'task': 'asr',
+                'taskname': 'asr',
+                'source_lang': 'en',
+                'target_lang': 'en',
+                'pnc': 'yes',
+                'timestamp': 'no',
             }
 
             if use_cuda and torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
@@ -1465,9 +1471,32 @@ def _extract_hypothesis_text(hypothesis: Any) -> str:
     """
     if hasattr(hypothesis, 'text'):
         return hypothesis.text
+    if isinstance(hypothesis, tuple):
+        for item in hypothesis:
+            if hasattr(item, 'text'):
+                return item.text
+            if isinstance(item, str):
+                return item
+        return ""
+    if isinstance(hypothesis, dict):
+        text_val = hypothesis.get('text', '')
+        return str(text_val) if text_val is not None else ""
     if isinstance(hypothesis, str):
         return hypothesis
     return str(hypothesis)
+
+
+def _unwrap_transcription_item(item: Any) -> Any:
+    """Unwrap common NeMo wrappers (e.g. (cut, hypothesis))."""
+    if isinstance(item, tuple):
+        for candidate in reversed(item):
+            if hasattr(candidate, 'text'):
+                return candidate
+            if isinstance(candidate, (str, dict)):
+                return candidate
+        if len(item) > 0:
+            return item[-1]
+    return item
 
 
 def _adjust_chunk_timestamps(chunk_word_ts: List[Dict[str, Any]], ts_level: str, left_context_duration: float, chunk_start_time: float) -> List[Dict[str, Any]]:
@@ -1545,7 +1574,7 @@ def _process_single_chunk(model: Any, buffer: Any, use_cuda: bool, apply_itn_per
     if not result or len(result) == 0:
         return None, []
     
-    hypothesis = result[0]
+    hypothesis = _unwrap_transcription_item(result[0])
     
     # Extract timestamps first - we'll filter and use them to build text
     chunk_word_ts, ts_level = extract_timestamps(hypothesis, include_timestamps=True)
