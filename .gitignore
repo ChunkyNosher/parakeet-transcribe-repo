@@ -23,5 +23,19 @@ __pycache__/
 model_cache/
 
 # Local model files (large binary files that should be downloaded via setup script)
-# Keep the directory structure but ignore the actual model files
-local_models/*.nemo
+# Keep all local model artifacts out of Git
+local_models/
+
+# Runtime logs and generated transcription logs
+transcription-logs/
+
+# Local virtual environments
+env/
+.venv/
+venv/
+
+# Generated transcription outputs
+*_transcription.txt
+*_transcription.srt
+*_transcription.csv
+error_log_*.txt
