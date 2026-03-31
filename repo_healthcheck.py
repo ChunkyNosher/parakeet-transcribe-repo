@@ -13,10 +13,14 @@ REQUIRED_IMPORTS = [
     "librosa",
     "numpy",
     "omegaconf",
+    "transformers",
 ]
 
 OPTIONAL_IMPORTS = [
     "nemo_text_processing.inverse_text_normalization",
+    "qwen_asr",
+    "mistral_common",
+    "huggingface_hub",
 ]
 
 REQUIRED_PATHS = [
@@ -61,6 +65,13 @@ def main() -> int:
     path_failures = _check_paths(repo_root)
     import_failures = _check_imports(REQUIRED_IMPORTS, required=True)
     _check_imports(OPTIONAL_IMPORTS, required=False)
+
+    try:
+        importlib.import_module("transcribe_ui")
+        print("[OK] import transcribe_ui")
+    except Exception as exc:
+        print(f"[ERROR] import transcribe_ui: {type(exc).__name__}: {exc}")
+        import_failures.append("transcribe_ui")
 
     total_failures = len(path_failures) + len(import_failures)
     if total_failures:

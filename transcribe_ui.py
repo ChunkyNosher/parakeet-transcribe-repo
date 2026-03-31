@@ -15,6 +15,19 @@ import os
 import sys
 from pathlib import Path
 
+_stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(_stdout_reconfigure):
+    try:
+        _stdout_reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+_stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+if callable(_stderr_reconfigure):
+    try:
+        _stderr_reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ============================================================================
 # FIX #0: Disable Multiprocessing/Threading BEFORE any imports
 # ============================================================================
@@ -120,7 +133,7 @@ print("   This prevents WinError 32 file locking issues on Windows")
 # ============================================================================
 
 import gradio as gr
-import nemo.collections.asr as nemo_asr
+import importlib
 import torch
 import time
 import gc
@@ -129,8 +142,35 @@ import hashlib
 import io
 import logging
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any, Union, TextIO
+
+
+def _import_dependency(module_name: str, package_name: Optional[str] = None) -> Any:
+    """Import a dependency on demand with an actionable error message."""
+    try:
+        return importlib.import_module(module_name)
+    except Exception as exc:
+        dependency_name = package_name or module_name
+        raise ImportError(
+            f"Missing dependency '{dependency_name}'. "
+            "Use the configured project environment and install the repo requirements. "
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _require_nemo_asr() -> Any:
+    """Load NeMo ASR only when a NeMo-backed model is requested."""
+    return _import_dependency("nemo.collections.asr", "nemo-toolkit[asr]")
+
+
+def _dependency_is_available(module_name: str) -> bool:
+    """Return True when an optional runtime dependency is importable."""
+    try:
+        importlib.import_module(module_name)
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -209,6 +249,29 @@ class ResultProcessingContext:
     # Batch-specific (optional for single)
     all_transcriptions: Optional[List[str]] = None
     all_timestamps: Optional[List[Tuple[List[Dict[str, Any]], str]]] = None
+
+
+@dataclass
+class SimpleHypothesis:
+    """Minimal normalized transcription result shared across backends."""
+    text: str
+    timestamp: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    chunk_timestamps: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class LoadedModelHandle:
+    """Loaded backend runtime plus metadata needed for inference dispatch."""
+    model_key: str
+    backend: str
+    runtime: Any
+    processor: Optional[Any] = None
+    source: str = ""
+    config: Dict[str, Any] = field(default_factory=dict)
+    supports_timestamps: bool = False
+    supports_chunking: bool = False
+    default_language: Optional[str] = None
+    warning: Optional[str] = None
 
 
 # ============================================================================
@@ -1919,97 +1982,168 @@ def _transcribe_with_retry(model: Any, files: List[str], batch_size: int, use_cu
     return result, {}
 
 
-# Model configurations
-# All models use standard ASRModel.from_pretrained() API (no SALM required)
-# Parakeet models: Can load from local .nemo file OR HuggingFace
-# Canary models: Load from HuggingFace or local .nemo file if downloaded
-#
-# loading_method options:
-#   - "local": ONLY load from local .nemo file (fails if missing)
-#   - "huggingface": ONLY load from HuggingFace
-#   - "local_or_huggingface": Try local first, fallback to HuggingFace
+MODEL_DISPLAY_ORDER = [
+    "parakeet-v3",
+    "voxtral-small-24b-2507",
+    "voxtral-mini-4b-realtime-2602",
+    "voxtral-mini-3b-2507",
+    "qwen3-asr-1.7b",
+    "cohere-transcribe-03-2026",
+    "granite-4.0-1b-speech",
+]
+
+DEFAULT_MODEL_KEY = "parakeet-v3"
+
+
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
-    # ========== PARAKEET MODELS ==========
     "parakeet-v3": {
-        "local_path": "local_models/parakeet-0.6b-v3.nemo",  # Unique filename
+        "backend": "nemo",
+        "choice_label": "NVIDIA Parakeet 0.6B-v3 :: NeMo, 25 languages, timestamps",
+        "display_name": "NVIDIA Parakeet 0.6B-v3",
         "hf_model_id": "nvidia/parakeet-tdt-0.6b-v3",
-        "max_batch_size": 32,  # Reference only - NeMo uses default file batching
-        "display_name": "Parakeet-TDT-0.6B v3",
-        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
+        "local_path": "local_models/parakeet-0.6b-v3.nemo",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 32,
         "architecture": "FastConformer-TDT",
         "parameters": "600M",
         "languages": 25,
         "wer": "~1.7%",
         "rtfx": "3,380×",
         "vram_gb": "3-4",
-        "recommended_for": "Best all-around choice, 25 languages, auto-detection"
+        "recommended_for": "Fastest local baseline with word-level timestamps",
+        "supports_timestamps": True,
+        "supports_chunking": True,
+        "supports_local_setup": True,
+        "summary": "NeMo backend, offline, auto language detection"
     },
-    
-    "parakeet-1.1b": {
-        "local_path": "local_models/parakeet-1.1b.nemo",  # Unique filename
-        "hf_model_id": "nvidia/parakeet-tdt-1.1b",
-        "max_batch_size": 24,  # Reference only - NeMo uses default file batching
-        "display_name": "Parakeet-TDT-1.1B",
-        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
-        "architecture": "FastConformer-TDT",
-        "parameters": "1.1B",
-        "languages": 1,
-        "wer": "1.5%",
-        "rtfx": "1,336×",
-        "vram_gb": "5-6",
-        "recommended_for": "Best English transcription accuracy available"
+    "voxtral-small-24b-2507": {
+        "backend": "transformers_voxtral",
+        "choice_label": "mistralai/Voxtral-Small-24B-2507 :: Transformers, 24B, offline transcription",
+        "display_name": "mistralai/Voxtral-Small-24B-2507",
+        "hf_model_id": "mistralai/Voxtral-Small-24B-2507",
+        "local_path": "local_models/Voxtral-Small-24B-2507",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 2,
+        "architecture": "Voxtral audio-text model",
+        "parameters": "24B",
+        "languages": 8,
+        "wer": "State-of-the-art (model card)",
+        "rtfx": "Hardware dependent",
+        "vram_gb": "~55",
+        "recommended_for": "Highest-capacity Voxtral offline transcription",
+        "supports_timestamps": False,
+        "supports_chunking": False,
+        "supports_local_setup": True,
+        "summary": "Offline transcription via Transformers + mistral-common"
     },
-    
-    # ========== CANARY MODELS ==========
-    "canary-1b": {
-        "local_path": "local_models/canary-1b.nemo",  # Unique filename
-        "hf_model_id": "nvidia/canary-1b",
-        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
-        "display_name": "Canary-1B",
-        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
-        "architecture": "FastConformer-Transformer",
+    "voxtral-mini-4b-realtime-2602": {
+        "backend": "unsupported",
+        "choice_label": "mistralai/Voxtral-Mini-4B-Realtime-2602 :: Unavailable in shared env",
+        "display_name": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        "hf_model_id": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        "local_path": "local_models/Voxtral-Mini-4B-Realtime-2602",
+        "loading_method": "local_or_huggingface",
+        "architecture": "Voxtral realtime streaming ASR",
+        "parameters": "4B",
+        "languages": 13,
+        "wer": "Realtime-focused",
+        "rtfx": "Realtime",
+        "vram_gb": "16+",
+        "recommended_for": "Low-latency streaming ASR",
+        "supports_timestamps": False,
+        "supports_chunking": False,
+        "supports_local_setup": True,
+        "supported": False,
+        "summary": "Requires VoxtralRealtime runtime not exposed by transformers==4.57.6",
+        "unavailable_reason": (
+            "Voxtral Realtime needs a runtime that is not available in the shared "
+            "transformers==4.57.6 environment required by qwen-asr."
+        ),
+    },
+    "voxtral-mini-3b-2507": {
+        "backend": "transformers_voxtral",
+        "choice_label": "mistralai/Voxtral-Mini-3B-2507 :: Transformers, 3B, offline transcription",
+        "display_name": "mistralai/Voxtral-Mini-3B-2507",
+        "hf_model_id": "mistralai/Voxtral-Mini-3B-2507",
+        "local_path": "local_models/Voxtral-Mini-3B-2507",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 4,
+        "architecture": "Voxtral audio-text model",
+        "parameters": "3B",
+        "languages": 8,
+        "wer": "Strong offline ASR",
+        "rtfx": "Hardware dependent",
+        "vram_gb": "9-10",
+        "recommended_for": "Smallest locally runnable Voxtral transcription model",
+        "supports_timestamps": False,
+        "supports_chunking": False,
+        "supports_local_setup": True,
+        "summary": "Offline transcription via Transformers + mistral-common"
+    },
+    "qwen3-asr-1.7b": {
+        "backend": "qwen_asr",
+        "choice_label": "Qwen/Qwen3-ASR-1.7B :: qwen-asr, multilingual, optional timestamps",
+        "display_name": "Qwen/Qwen3-ASR-1.7B",
+        "hf_model_id": "Qwen/Qwen3-ASR-1.7B",
+        "local_path": "local_models/Qwen3-ASR-1.7B",
+        "aligner_model_id": "Qwen/Qwen3-ForcedAligner-0.6B",
+        "aligner_local_path": "local_models/Qwen3-ForcedAligner-0.6B",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 8,
+        "architecture": "Qwen3-ASR",
+        "parameters": "1.7B",
+        "languages": 52,
+        "wer": "SOTA among open-source ASR (model card)",
+        "rtfx": "High throughput",
+        "vram_gb": "Model dependent",
+        "recommended_for": "Multilingual ASR with optional forced-aligner timestamps",
+        "supports_timestamps": True,
+        "supports_chunking": False,
+        "supports_local_setup": True,
+        "summary": "qwen-asr backend with optional forced aligner"
+    },
+    "cohere-transcribe-03-2026": {
+        "backend": "transformers_cohere",
+        "choice_label": "CohereLabs/cohere-transcribe-03-2026 :: Transformers, gated access, no timestamps",
+        "display_name": "CohereLabs/cohere-transcribe-03-2026",
+        "hf_model_id": "CohereLabs/cohere-transcribe-03-2026",
+        "local_path": "local_models/cohere-transcribe-03-2026",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 8,
+        "architecture": "Cohere ASR",
+        "parameters": "2B",
+        "languages": 14,
+        "wer": "Best-in-class (model card)",
+        "rtfx": "Fast",
+        "vram_gb": "Model dependent",
+        "recommended_for": "High-accuracy transcription when HF access is approved",
+        "supports_timestamps": False,
+        "supports_chunking": True,
+        "supports_local_setup": True,
+        "default_language": "en",
+        "trust_remote_code": True,
+        "summary": "Transforms audio to text via Transformers; timestamps unavailable"
+    },
+    "granite-4.0-1b-speech": {
+        "backend": "transformers_granite",
+        "choice_label": "ibm-granite/granite-4.0-1b-speech :: Transformers, compact multilingual speech",
+        "display_name": "ibm-granite/granite-4.0-1b-speech",
+        "hf_model_id": "ibm-granite/granite-4.0-1b-speech",
+        "local_path": "local_models/granite-4.0-1b-speech",
+        "loading_method": "local_or_huggingface",
+        "max_batch_size": 8,
+        "architecture": "Granite Speech",
         "parameters": "1B",
-        "languages": 25,
-        "wer": "~1.9% (English)",
-        "rtfx": "~200×",
-        "vram_gb": "4-5",
-        "recommended_for": "Multilingual ASR + speech-to-text translation",
-        "additional_features": ["Speech Translation (AST)", "NeMo Forced Aligner timestamps"]
+        "languages": 6,
+        "wer": "5.52 open ASR leaderboard",
+        "rtfx": "Fast",
+        "vram_gb": "Resource-friendly",
+        "recommended_for": "Compact multilingual speech transcription",
+        "supports_timestamps": False,
+        "supports_chunking": False,
+        "supports_local_setup": True,
+        "summary": "Granite speech backend via Transformers + PEFT"
     },
-    
-    "canary-1b-v2": {
-        "local_path": "local_models/canary-1b-v2.nemo",  # Unique filename
-        "hf_model_id": "nvidia/canary-1b-v2",
-        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
-        "display_name": "Canary-1B v2",
-        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
-        "architecture": "FastConformer-Transformer",
-        "parameters": "1B",
-        "languages": 25,
-        "wer": "1.88% (English)",
-        "rtfx": "~200×",
-        "vram_gb": "4-5",
-        "recommended_for": "Multilingual ASR + speech-to-text translation (improved)",
-        "additional_features": ["Speech Translation (AST)", "NeMo Forced Aligner timestamps"]
-    },
-    
-    # ========== HYBRID TDT-CTC MODELS (with Punctuation & Capitalization) ==========
-    "parakeet-tdt_ctc-1.1b": {
-        "local_path": "local_models/parakeet-tdt_ctc-1.1b.nemo",  # Unique filename for hybrid PnC model
-        "hf_model_id": "nvidia/parakeet-tdt_ctc-1.1b",
-        "max_batch_size": 16,  # Reference only - NeMo uses default file batching
-        "display_name": "Parakeet-TDT_CTC-1.1B (PnC)",
-        "loading_method": "local_or_huggingface",  # Try local, fallback to HF
-        "architecture": "Hybrid FastConformer-TDT-CTC",
-        "parameters": "1.1B",
-        "languages": 1,  # English only
-        "wer": "1.82%",
-        "rtfx": "~1,000×",  # Slightly slower than pure TDT due to hybrid architecture
-        "vram_gb": "5-6",
-        "recommended_for": "Best English accuracy WITH punctuation & capitalization",
-        "has_punctuation": True,  # Built-in punctuation and capitalization
-        "additional_features": ["Punctuation", "Capitalization", "11h audio in single pass"]
-    }
 }
 
 
@@ -2076,31 +2210,90 @@ def get_model_key_from_choice(choice_text: str) -> str:
     Returns:
         Model key string for accessing MODEL_CONFIGS
     """
-    choice_map = {
-        "Parakeet-TDT-0.6B v3": "parakeet-v3",
-        "Parakeet-TDT-1.1B": "parakeet-1.1b",
-        "Parakeet-TDT_CTC-1.1B": "parakeet-tdt_ctc-1.1b",  # Hybrid PnC model
-        "Canary-1B v2": "canary-1b-v2",
-        "Canary-1B": "canary-1b",
-        # Legacy support
-        "Parakeet-TDT-0.6B v2": "parakeet-v3",  # Map old to new multilingual version
-        # Legacy SALM model mapping: Canary-Qwen-2.5B was a 2.5B param SALM-based model
-        # We map it to Canary-1B-v2 (1B param, standard encoder-decoder architecture)
-        # Trade-off: Slightly different model size, but gains multilingual support + simpler architecture
-        "Canary-Qwen-2.5B": "canary-1b-v2"
-    }
-    
-    # Try exact matches first
-    for choice, key in choice_map.items():
-        if choice in choice_text:
-            return key
-    
-    # Default to parakeet-v3 if no match
-    return "parakeet-v3"
+    for model_key in MODEL_DISPLAY_ORDER:
+        if MODEL_CONFIGS[model_key]["choice_label"] == choice_text:
+            return model_key
+    return DEFAULT_MODEL_KEY
+
+
+def get_model_choice_labels() -> List[str]:
+    """Return UI labels in the requested display order."""
+    return [MODEL_CONFIGS[key]["choice_label"] for key in MODEL_DISPLAY_ORDER]
+
+
+def get_default_model_choice() -> str:
+    """Return the default UI label for the selected model."""
+    return MODEL_CONFIGS[DEFAULT_MODEL_KEY]["choice_label"]
+
 
 def get_script_dir() -> Path:
     """Get the directory where the script is located"""
     return Path(__file__).parent.absolute()
+
+
+def _require_transformers_attr(attr_name: str) -> Any:
+    """Import a Transformers symbol with a targeted upgrade hint."""
+    transformers = _import_dependency("transformers", "transformers==4.57.6")
+    if not hasattr(transformers, attr_name):
+        raise ImportError(
+            f"Transformers does not expose '{attr_name}' in the active environment. "
+            "Use transformers==4.57.6 for the supported local backend mix."
+        )
+    return getattr(transformers, attr_name)
+
+
+def _require_qwen_asr_model() -> Any:
+    """Import the Qwen ASR runtime lazily."""
+    qwen_asr = _import_dependency("qwen_asr", "qwen-asr")
+    if not hasattr(qwen_asr, "Qwen3ASRModel"):
+        raise ImportError("qwen-asr is installed but Qwen3ASRModel is unavailable.")
+    return getattr(qwen_asr, "Qwen3ASRModel")
+
+
+def _preferred_torch_dtype() -> Any:
+    """Select a safe default dtype for modern audio backends."""
+    return torch.bfloat16 if torch.cuda.is_available() else torch.float32  # type: ignore[reportUnknownMemberType]
+
+
+def _prepare_pretrained_kwargs() -> Dict[str, Any]:
+    """Build common kwargs for Transformers-style from_pretrained loaders."""
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": _preferred_torch_dtype(),
+    }
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        kwargs["device_map"] = "auto"
+        kwargs["low_cpu_mem_usage"] = True
+    return kwargs
+
+
+def _artifact_exists(path: Path) -> bool:
+    """Return True when a file exists or a directory contains at least one entry."""
+    if not path.exists():
+        return False
+    if path.is_dir():
+        try:
+            next(path.iterdir())
+            return True
+        except StopIteration:
+            return False
+    return True
+
+
+def _resolve_model_source(script_dir: Path, config: Dict[str, Any], *, local_key: str = "local_path", remote_key: str = "hf_model_id") -> Tuple[str, bool]:
+    """Resolve the local artifact path or remote Hugging Face id for a model."""
+    local_path = config.get(local_key)
+    loading_method = config.get("loading_method", "huggingface")
+    if local_path:
+        full_path = script_dir / local_path
+        if _artifact_exists(full_path):
+            return str(full_path), True
+        if loading_method == "local":
+            raise FileNotFoundError(f"Local model artifact not found: {full_path}")
+    remote_source = config.get(remote_key)
+    if not remote_source:
+        raise FileNotFoundError(f"No remote source configured for {config['display_name']}")
+    return str(remote_source), False
+
 
 def _check_model_local_availability(script_dir: Path, model_key: str, config: Dict[str, Any]) -> Tuple[bool, str]:
     """Check if a model is available locally or needs HuggingFace download.
@@ -2116,7 +2309,10 @@ def _check_model_local_availability(script_dir: Path, model_key: str, config: Di
         return False, f"   📥 {display_name}: HuggingFace only ({hf_id})"
     
     full_path = script_dir / local_path
-    if full_path.exists():
+    if _artifact_exists(full_path):
+        if full_path.is_dir():
+            item_count = len(list(full_path.iterdir()))
+            return True, f"   ✅ {display_name}: {full_path.name}/ ({item_count} items)"
         size_mb = full_path.stat().st_size / (1024 * 1024)
         return True, f"   ✅ {display_name}: {full_path.name} ({size_mb:.1f} MB)"
     
@@ -2126,7 +2322,7 @@ def _check_model_local_availability(script_dir: Path, model_key: str, config: Di
 def validate_local_models() -> None:
     """Display local model setup status and provide informational messages.
     
-    With "local_or_huggingface" loading method, local .nemo files are OPTIONAL.
+    With "local_or_huggingface" loading method, local artifacts are optional.
     Models will automatically download from HuggingFace if local files are missing.
     """
     script_dir = get_script_dir()
@@ -2152,7 +2348,7 @@ def validate_local_models() -> None:
         (local_found if is_local else hf_fallback).append(msg)
     
     if local_found:
-        print("\n📦 Local .nemo files found (instant loading):")
+        print("\n📦 Local model artifacts found:")
         for msg in local_found:
             print(msg)
     
@@ -2446,6 +2642,7 @@ def _load_from_huggingface_with_retry(hf_model_id: str, config: Dict[str, Any], 
     """
     base_delay = 0.5
     display_name = config['display_name']
+    nemo_asr = _require_nemo_asr()
     
     for attempt in range(max_retries):
         try:
@@ -2482,6 +2679,7 @@ def _load_with_retry(restore_path: Union[str, Path], config: Dict[str, Any], max
     """
     base_delay = 0.5
     display_name = config['display_name']
+    nemo_asr = _require_nemo_asr()
     
     for attempt in range(max_retries):
         try:
@@ -2501,6 +2699,116 @@ def _load_with_retry(restore_path: Union[str, Path], config: Dict[str, Any], max
                 print(f"   ⚠️  Extraction error: {e}")
                 continue
             raise
+
+
+def _get_model_runtime(model: Any) -> Any:
+    """Return the underlying runtime object for a cached model handle."""
+    if isinstance(model, LoadedModelHandle):
+        return model.runtime
+    return model
+
+
+def _move_runtime_to_device(model: Any, device: str) -> Any:
+    """Best-effort device move for backends that expose .to()/.cpu()."""
+    runtime = _get_model_runtime(model)
+
+    if device == "cpu" and hasattr(runtime, "cpu"):
+        runtime.cpu()
+        return model
+
+    if hasattr(runtime, "to"):
+        runtime = runtime.to(device)
+        if isinstance(model, LoadedModelHandle):
+            model.runtime = runtime
+            return model
+        return runtime
+
+    return model
+
+
+def _build_loaded_handle(model_key: str, backend: str, runtime: Any, config: Dict[str, Any], source: str, processor: Optional[Any] = None) -> LoadedModelHandle:
+    """Create a normalized cache entry for any backend."""
+    return LoadedModelHandle(
+        model_key=model_key,
+        backend=backend,
+        runtime=runtime,
+        processor=processor,
+        source=source,
+        config=config,
+        supports_timestamps=bool(config.get("supports_timestamps", False)),
+        supports_chunking=bool(config.get("supports_chunking", False)),
+        default_language=config.get("default_language"),
+        warning=config.get("warning"),
+    )
+
+
+def _load_transformers_backend(model_name: str, config: Dict[str, Any], script_dir: Path) -> LoadedModelHandle:
+    """Load a Transformers-backed speech model."""
+    backend = config["backend"]
+    source, _ = _resolve_model_source(script_dir, config)
+    load_kwargs = _prepare_pretrained_kwargs()
+
+    if backend == "transformers_voxtral":
+        AutoProcessor = _require_transformers_attr("AutoProcessor")
+        VoxtralForConditionalGeneration = _require_transformers_attr("VoxtralForConditionalGeneration")
+        processor = AutoProcessor.from_pretrained(source)
+        runtime = VoxtralForConditionalGeneration.from_pretrained(source, **load_kwargs)
+        return _build_loaded_handle(model_name, backend, runtime, config, source, processor)
+
+    if backend == "transformers_granite":
+        AutoProcessor = _require_transformers_attr("AutoProcessor")
+        GraniteSpeechForConditionalGeneration = _require_transformers_attr("GraniteSpeechForConditionalGeneration")
+        processor = AutoProcessor.from_pretrained(source)
+        runtime = GraniteSpeechForConditionalGeneration.from_pretrained(source, **load_kwargs)
+        return _build_loaded_handle(model_name, backend, runtime, config, source, processor)
+
+    if backend == "transformers_cohere":
+        AutoProcessor = _require_transformers_attr("AutoProcessor")
+        AutoModelForSpeechSeq2Seq = _require_transformers_attr("AutoModelForSpeechSeq2Seq")
+        processor = AutoProcessor.from_pretrained(source, trust_remote_code=bool(config.get("trust_remote_code", False)))
+        runtime = AutoModelForSpeechSeq2Seq.from_pretrained(
+            source,
+            trust_remote_code=bool(config.get("trust_remote_code", False)),
+            **load_kwargs,
+        )
+        return _build_loaded_handle(model_name, backend, runtime, config, source, processor)
+
+    raise RuntimeError(f"Unsupported transformers backend: {backend}")
+
+
+def _load_qwen_backend(model_name: str, config: Dict[str, Any], script_dir: Path) -> LoadedModelHandle:
+    """Load the Qwen ASR runtime with optional forced aligner support."""
+    source, _ = _resolve_model_source(script_dir, config)
+    Qwen3ASRModel = _require_qwen_asr_model()
+
+    qwen_kwargs: Dict[str, Any] = {
+        "dtype": _preferred_torch_dtype(),
+        "max_inference_batch_size": int(config.get("max_batch_size", 4)),
+        "max_new_tokens": int(config.get("max_new_tokens", 512)),
+    }
+    if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
+        qwen_kwargs["device_map"] = "cuda:0"
+    else:
+        qwen_kwargs["device_map"] = "cpu"
+
+    if config.get("supports_timestamps"):
+        aligner_source, _ = _resolve_model_source(
+            script_dir,
+            {
+                "display_name": f"{config['display_name']} forced aligner",
+                "loading_method": config.get("loading_method", "local_or_huggingface"),
+                "local_path": config.get("aligner_local_path"),
+                "hf_model_id": config.get("aligner_model_id"),
+            },
+        )
+        qwen_kwargs["forced_aligner"] = aligner_source
+        qwen_kwargs["forced_aligner_kwargs"] = {
+            "dtype": _preferred_torch_dtype(),
+            "device_map": qwen_kwargs["device_map"],
+        }
+
+    runtime = Qwen3ASRModel.from_pretrained(source, **qwen_kwargs)
+    return _build_loaded_handle(model_name, "qwen_asr", runtime, config, source)
 
 
 # ============================================================================
@@ -2525,7 +2833,7 @@ def _unload_cached_models(model_name: str, models_cache: Dict[str, Any]) -> None
             print(f"🔄 Unloading {old_model_key} to free VRAM for {model_name}...")
             
             # Move model to CPU first to free VRAM
-            old_model = old_model.to("cpu")
+            old_model = _move_runtime_to_device(old_model, "cpu")
             
             # Delete the model reference
             del models_cache[old_model_key]
@@ -2653,7 +2961,7 @@ def _move_model_to_cuda(model: Any, model_name: str) -> Any:
         return model
         
     try:
-        model = model.to("cuda")
+        model = _move_runtime_to_device(model, "cuda")
         print(f"   ✅ Model moved to CUDA")
     except Exception as e:
         print(f"   ⚠️  Could not move model to CUDA: {e}")
@@ -2664,17 +2972,18 @@ def _move_model_to_cuda(model: Any, model_name: str) -> Any:
 
 def _optimize_multitask_decoding(model: Any) -> None:
     """Apply faster decoding defaults for Canary-style multitask models."""
-    if not _is_multitask_aed_model(model):
+    runtime = _get_model_runtime(model)
+    if not _is_multitask_aed_model(runtime):
         return
 
     try:
-        decode_cfg = model.cfg.decoding  # type: ignore[reportUnknownMemberType]
+        decode_cfg = runtime.cfg.decoding  # type: ignore[reportUnknownMemberType]
         if hasattr(decode_cfg, 'strategy'):
             decode_cfg.strategy = 'greedy'
         if hasattr(decode_cfg, 'beam') and hasattr(decode_cfg.beam, 'beam_size'):
             old_beam = decode_cfg.beam.beam_size
             decode_cfg.beam.beam_size = 1
-            model.change_decoding_strategy(decode_cfg)  # type: ignore[reportUnknownMemberType]
+            runtime.change_decoding_strategy(decode_cfg)  # type: ignore[reportUnknownMemberType]
             print(f"   ✅ Canary decoding optimized: strategy=greedy, beam_size {old_beam} -> 1")
     except Exception as e:
         print(f"   ⚠️ Could not optimize Canary decoding strategy: {e}")
@@ -2714,7 +3023,7 @@ def unload_all_models() -> str:
             model = models_cache[model_key]
             
             # Move to CPU first to free VRAM immediately
-            model.cpu()
+            _move_runtime_to_device(model, "cpu")
             
             # Delete from cache
             del models_cache[model_key]
@@ -2783,12 +3092,19 @@ def load_model(model_name: str, show_progress: bool = False) -> Any:
         OSError: If download fails due to disk space issues
         PermissionError: If file locks prevent model extraction
     """
+    config = MODEL_CONFIGS[model_name]
+    backend = config.get("backend", "nemo")
+
+    if config.get("supported") is False:
+        raise NotImplementedError(config.get("unavailable_reason", f"{config['display_name']} is not supported in this environment."))
+
     # Return cached model if valid
     if model_name in models_cache:
         cached_model = models_cache[model_name]
         try:
-            if not hasattr(cached_model, 'transcribe'):
-                print(f"⚠️  Cached {model_name} appears corrupted (missing transcribe method)")
+            runtime = _get_model_runtime(cached_model)
+            if runtime is None:
+                print(f"⚠️  Cached {model_name} appears corrupted (missing runtime)")
                 del models_cache[model_name]
                 return load_model(model_name, show_progress)
             return cached_model
@@ -2799,20 +3115,26 @@ def load_model(model_name: str, show_progress: bool = False) -> Any:
     # Unload other cached models to free VRAM
     _unload_cached_models(model_name, models_cache)
     
-    # Get config and prepare for loading
-    config = MODEL_CONFIGS[model_name]
     script_dir = get_script_dir()
     loading_method = config.get("loading_method", "huggingface")
     
     start_time = time.time()
     
     # Load using appropriate strategy
-    if loading_method == "local_or_huggingface":
-        models_cache[model_name] = _load_model_local_or_huggingface(model_name, config, script_dir)
-    elif loading_method == "local":
-        models_cache[model_name] = _load_model_local_only(config, script_dir)
+    if backend == "nemo":
+        if loading_method == "local_or_huggingface":
+            runtime = _load_model_local_or_huggingface(model_name, config, script_dir)
+        elif loading_method == "local":
+            runtime = _load_model_local_only(config, script_dir)
+        else:
+            runtime = _load_model_huggingface(model_name, config)
+        models_cache[model_name] = _build_loaded_handle(model_name, backend, runtime, config, config.get("hf_model_id", ""))
+    elif backend.startswith("transformers_"):
+        models_cache[model_name] = _load_transformers_backend(model_name, config, script_dir)
+    elif backend == "qwen_asr":
+        models_cache[model_name] = _load_qwen_backend(model_name, config, script_dir)
     else:
-        models_cache[model_name] = _load_model_huggingface(model_name, config)
+        raise RuntimeError(f"Unsupported backend '{backend}' for {config['display_name']}")
     
     load_time = time.time() - start_time
     print(f"✓ {config['display_name']} loaded in {load_time:.1f}s")
@@ -3377,6 +3699,175 @@ def _normalize_file_list(audio_files: Any) -> List[str]:
     return [str(audio_files)]
 
 
+def _get_runtime_device(runtime: Any) -> Any:
+    """Return the most specific device handle exposed by a runtime."""
+    device = getattr(runtime, "device", None)
+    if device is not None:
+        return device
+    try:
+        return next(runtime.parameters()).device
+    except Exception:
+        return "cuda" if torch.cuda.is_available() else "cpu"  # type: ignore[reportUnknownMemberType]
+
+
+def _batch_to_runtime(batch: Any, runtime: Any, use_dtype: bool = False) -> Any:
+    """Move a processor batch to the runtime device when supported."""
+    if not hasattr(batch, "to"):
+        return batch
+    device = _get_runtime_device(runtime)
+    if use_dtype and hasattr(runtime, "dtype"):
+        return batch.to(device, dtype=runtime.dtype)
+    return batch.to(device)
+
+
+def _normalize_text_list(decoded: Any) -> List[str]:
+    """Normalize decoded model output into a list of stripped strings."""
+    if isinstance(decoded, list):
+        return [str(item).strip() for item in decoded]
+    return [str(decoded).strip()]
+
+
+def _convert_qwen_time_stamps(raw_time_stamps: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Convert Qwen forced-aligner output into the app's timestamp format."""
+    converted: List[Dict[str, Any]] = []
+    if not raw_time_stamps:
+        return {}
+
+    for entry in raw_time_stamps:
+        if isinstance(entry, dict):
+            text = entry.get("text") or entry.get("word") or entry.get("segment") or ""
+            start = entry.get("start") if entry.get("start") is not None else entry.get("start_time")
+            end = entry.get("end") if entry.get("end") is not None else entry.get("end_time")
+        else:
+            text = getattr(entry, "text", "")
+            start = getattr(entry, "start", getattr(entry, "start_time", None))
+            end = getattr(entry, "end", getattr(entry, "end_time", None))
+
+        if start is None or end is None:
+            continue
+
+        converted.append({
+            "start": float(start),
+            "end": float(end),
+            "word": str(text),
+        })
+
+    return {"word": converted} if converted else {}
+
+
+def _transcribe_transformers_granite(handle: LoadedModelHandle, files: List[str]) -> List[Any]:
+    """Run offline transcription for Granite Speech."""
+    assert handle.processor is not None
+    audio_arrays = [_load_audio_to_numpy(file_path, target_sr=16000)[0] for file_path in files]
+    batch_audio: Union[Any, List[Any]] = audio_arrays if len(audio_arrays) > 1 else audio_arrays[0]
+    inputs = handle.processor(audio=batch_audio, return_tensors="pt", padding=len(audio_arrays) > 1)
+    inputs = _batch_to_runtime(inputs, handle.runtime)
+    generated_ids = handle.runtime.generate(**inputs, max_new_tokens=int(handle.config.get("max_new_tokens", 256)), do_sample=False)
+    texts = handle.processor.batch_decode(generated_ids, skip_special_tokens=True)
+    return [SimpleHypothesis(text=text) for text in _normalize_text_list(texts)]
+
+
+def _transcribe_transformers_cohere(handle: LoadedModelHandle, files: List[str]) -> List[Any]:
+    """Run transcription for Cohere ASR through Transformers."""
+    assert handle.processor is not None
+    audio_arrays = [_load_audio_to_numpy(file_path, target_sr=16000)[0] for file_path in files]
+    batch_audio: Union[Any, List[Any]] = audio_arrays if len(audio_arrays) > 1 else audio_arrays[0]
+    language = str(handle.default_language or "en")
+    inputs = handle.processor(
+        batch_audio,
+        sampling_rate=16000,
+        return_tensors="pt",
+        language=language,
+        punctuation=True,
+    )
+    audio_chunk_index = inputs.get("audio_chunk_index") if hasattr(inputs, "get") else None
+    inputs = _batch_to_runtime(inputs, handle.runtime, use_dtype=True)
+    generated_ids = handle.runtime.generate(**inputs, max_new_tokens=int(handle.config.get("max_new_tokens", 256)))
+    decoded = handle.processor.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        audio_chunk_index=audio_chunk_index,
+        language=language,
+    )
+    return [SimpleHypothesis(text=text) for text in _normalize_text_list(decoded)]
+
+
+def _transcribe_transformers_voxtral(handle: LoadedModelHandle, files: List[str]) -> List[Any]:
+    """Run offline Voxtral transcription requests one file at a time."""
+    assert handle.processor is not None
+    results: List[Any] = []
+    for file_path in files:
+        request_kwargs: Dict[str, Any] = {
+            "audio": file_path,
+            "model_id": handle.config["hf_model_id"],
+        }
+        if handle.default_language:
+            request_kwargs["language"] = handle.default_language
+        inputs = handle.processor.apply_transcription_request(**request_kwargs)
+        inputs = _batch_to_runtime(inputs, handle.runtime, use_dtype=True)
+        generated_ids = handle.runtime.generate(
+            **inputs,
+            max_new_tokens=int(handle.config.get("max_new_tokens", 500)),
+            do_sample=False,
+            temperature=0.0,
+        )
+        prompt_tokens = inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+        decoded = handle.processor.batch_decode(generated_ids[:, prompt_tokens:], skip_special_tokens=True)
+        texts = _normalize_text_list(decoded)
+        results.append(SimpleHypothesis(text=texts[0] if texts else ""))
+    return results
+
+
+def _transcribe_qwen_asr(handle: LoadedModelHandle, files: List[str]) -> List[Any]:
+    """Run Qwen ASR transcription and normalize optional forced-aligner timestamps."""
+    qwen_kwargs: Dict[str, Any] = {
+        "audio": files if len(files) > 1 else files[0],
+        "language": None,
+        "return_time_stamps": handle.supports_timestamps,
+    }
+    raw_results = handle.runtime.transcribe(**qwen_kwargs)
+    if not isinstance(raw_results, list):
+        raw_results = [raw_results]
+
+    normalized: List[Any] = []
+    for item in raw_results:
+        text = getattr(item, "text", str(item)).strip()
+        timestamps = _convert_qwen_time_stamps(getattr(item, "time_stamps", None))
+        normalized.append(SimpleHypothesis(text=text, timestamp=timestamps))
+
+    return normalized
+
+
+def _transcribe_backend_files(model: Any, files: List[str], batch_size: int, chunk_size_override: Optional[int], apply_itn: bool) -> Tuple[List[Any], Dict[int, List[Dict[str, Any]]]]:
+    """Dispatch transcription to the backend-specific runtime."""
+    handle = model if isinstance(model, LoadedModelHandle) else LoadedModelHandle(model_key="legacy", backend="nemo", runtime=model)
+
+    if handle.backend == "nemo":
+        return _transcribe_with_retry(
+            model=handle.runtime,
+            files=files,
+            batch_size=batch_size,
+            use_cuda=torch.cuda.is_available(),  # type: ignore[reportUnknownMemberType]
+            max_retries=3,
+            chunk_size_override=chunk_size_override,
+            apply_itn=apply_itn,
+        )
+
+    if handle.backend == "transformers_granite":
+        return _transcribe_transformers_granite(handle, files), {}
+
+    if handle.backend == "transformers_cohere":
+        return _transcribe_transformers_cohere(handle, files), {}
+
+    if handle.backend == "transformers_voxtral":
+        return _transcribe_transformers_voxtral(handle, files), {}
+
+    if handle.backend == "qwen_asr":
+        return _transcribe_qwen_asr(handle, files), {}
+
+    raise NotImplementedError(handle.config.get("unavailable_reason", f"Unsupported backend: {handle.backend}"))
+
+
 def _load_model_for_transcription(model_key: str, log_capture: 'LogCapture') -> Tuple[Any, Optional[Tuple[Any, ...]]]:
     """Load transcription model with standardized error handling.
     
@@ -3404,6 +3895,12 @@ def _load_model_for_transcription(model_key: str, log_capture: 'LogCapture') -> 
     except OSError as e:
         print(f"GRADIO_ERROR (OSError): {e}")
         return None, _make_error_response('filesystem', str(e), log_capture)
+    except ImportError as e:
+        print(f"GRADIO_ERROR (ImportError): {e}")
+        return None, _make_error_response('runtime', str(e), log_capture)
+    except NotImplementedError as e:
+        print(f"GRADIO_ERROR (NotImplementedError): {e}")
+        return None, _make_error_response('runtime', str(e), log_capture)
     except RuntimeError as e:
         print(f"GRADIO_ERROR (RuntimeError): {e}")
         return None, _make_error_response('runtime', str(e), log_capture)
@@ -3716,12 +4213,10 @@ def _run_transcription(
         Tuple of (result, chunk_timestamps_map, error_response)
     """
     try:
-        result, chunk_timestamps_map = _transcribe_with_retry(
+        result, chunk_timestamps_map = _transcribe_backend_files(
             model=model,
             files=processed_files,
             batch_size=batch_size,
-            use_cuda=torch.cuda.is_available(),  # type: ignore[reportUnknownMemberType]
-            max_retries=3,
             chunk_size_override=chunk_size,
             apply_itn=apply_itn
         )
@@ -3831,7 +4326,7 @@ def transcribe_audio(
         # Run transcription (apply_itn_per_chunk controls per-chunk ITN during chunked transcription)
         inference_start = time.time()
         result, chunk_timestamps_map, error_response = _run_transcription(
-            model, processed_files, 4, chunk_size, apply_itn_per_chunk, log_capture
+            model, processed_files, batch_size, chunk_size, apply_itn_per_chunk, log_capture
         )
         if error_response is not None:
             return error_response
@@ -3930,6 +4425,12 @@ If the error persists, please check the console output for more details.
 
 def get_system_info() -> str:
     """Display system information"""
+    nemo_available = _dependency_is_available("nemo.collections.asr")
+    transformers_available = _dependency_is_available("transformers")
+    qwen_available = _dependency_is_available("qwen_asr")
+    supported_models = sum(1 for config in MODEL_CONFIGS.values() if config.get("supported", True))
+    total_models = len(MODEL_CONFIGS)
+
     if torch.cuda.is_available():  # type: ignore[reportUnknownMemberType]
         gpu_name: str = torch.cuda.get_device_name(0)  # type: ignore[reportUnknownMemberType]
         vram_total: float = torch.cuda.get_device_properties(0).total_memory / 1024**3  # type: ignore[reportUnknownMemberType]
@@ -3947,10 +4448,13 @@ def get_system_info() -> str:
 **Available VRAM**: {vram_free:.1f} GB
 **CUDA Version**: {cuda_version}
 **PyTorch Version**: {pytorch_version}
-**NeMo Available**: ✅ Yes
+**NeMo Runtime**: {'✅ Ready' if nemo_available else '⚠️ Missing'}
+**Transformers Runtime**: {'✅ Ready' if transformers_available else '⚠️ Missing'}
+**Qwen ASR Runtime**: {'✅ Ready' if qwen_available else '⚠️ Missing'}
+**Configured Models**: {supported_models}/{total_models} runnable in this environment
 
 **Status**: ✅ Ready for transcription
-**Models Available**: All Parakeet and Canary models supported
+**Models Available**: Mixed local registry with backend-specific loaders
 """
     else:
         info = f"""
@@ -3961,7 +4465,10 @@ CUDA is not available. Please check:
 2. CUDA Toolkit is installed
 3. PyTorch was installed with CUDA support
 
-**NeMo Available**: Check console output
+**NeMo Runtime**: {'✅ Ready' if nemo_available else '⚠️ Missing'}
+**Transformers Runtime**: {'✅ Ready' if transformers_available else '⚠️ Missing'}
+**Qwen ASR Runtime**: {'✅ Ready' if qwen_available else '⚠️ Missing'}
+**Configured Models**: {supported_models}/{total_models} runnable in this environment
 """
     return info
 
@@ -3978,16 +4485,13 @@ def get_privacy_performance_info() -> str:
 ### Privacy:
 - ✅ All transcription processing happens locally on your machine
 - ✅ Your audio never leaves your computer
-- ✅ All models: Try local .nemo first, then HuggingFace fallback
+- ✅ Models use local files when present and otherwise download once into your local cache
 - ✅ Once downloaded, models work offline from cache
 
 ### Model Storage:
-- **Local .nemo files**: `local_models/` directory (run `python setup_local_models.py`)
-  - `parakeet-0.6b-v3.nemo` (~2.4GB)
-  - `parakeet-1.1b.nemo` (~4.5GB)
-  - `canary-1b.nemo` (~5.0GB)
-  - `canary-1b-v2.nemo` (~5.0GB)
-- **HuggingFace Cache**: `model_cache/` directory (auto-downloads if .nemo missing)
+- **Local artifact directory**: `local_models/`
+- **Shared cache directory**: `model_cache/`
+- **Backends**: NeMo, Transformers, and Qwen ASR
 
 ### Cache Location:
 - **Custom cache**: `{CACHE_DIR}` (prevents Windows temp file issues)
@@ -4008,10 +4512,10 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
     
     # Header
     gr.Markdown("""
-    # 🎙️ NVIDIA NeMo Local Audio Transcription
-    ### 100% Offline - Powered by Parakeet & Canary ASR Models
+    # 🎙️ Local Offline ASR Transcription
+    ### Mixed local backends for Parakeet, Voxtral, Qwen, Cohere, and Granite
     
-    Transform your audio and video files into accurate text transcriptions using state-of-the-art AI models stored locally on your system. No internet required.
+    Transcribe audio and video files with locally cached runtimes. Downloads stay on your machine and can be reused fully offline after the first fetch.
     """)
     
     # System info at the top
@@ -4069,16 +4573,10 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             gr.Markdown("### ⚙️ Settings")
             
             model_selector = gr.Radio(
-                choices=[
-                    "📊 Parakeet-TDT-0.6B v3 (Multilingual, Default) - 25 languages, auto-detect",
-                    "🎯 Parakeet-TDT-1.1B (Maximum Accuracy) - 1.5% WER, English only",
-                    "� Parakeet-TDT_CTC-1.1B (PnC) - 1.82% WER, English with Punctuation & Capitalization",
-                    "�🌍 Canary-1B v2 (Multilingual + Translation) - 25 languages with AST",
-                    "🌐 Canary-1B (Multilingual) - 25 languages, standard ASR"
-                ],
-                value="📊 Parakeet-TDT-0.6B v3 (Multilingual, Default) - 25 languages, auto-detect",
+                choices=get_model_choice_labels(),
+                value=get_default_model_choice(),
                 label="Model Selection",
-                info="Choose based on your priority: accuracy, speed, languages, or features"
+                info="Select from the requested local model registry. Voxtral Realtime is listed but currently disabled in this runtime."
             )
             
             save_checkbox = gr.Checkbox(
@@ -4192,37 +4690,28 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
             gr.Markdown("""
             ---
             ### 📖 Model Information
-            
-            **Parakeet-TDT-0.6B v3** (Recommended):
-            - Languages: 25 European languages with auto-detection
-            - Speed: 3,380× real-time (ultra-fast)
-            - Accuracy: ~1.7% WER
-            - VRAM: 3-4 GB
-            - Loads from: `local_models/parakeet-0.6b-v3.nemo` OR HuggingFace
-            
-            **Parakeet-TDT-1.1B** (Best Accuracy):
-            - Languages: English only
-            - Speed: 1,336× real-time
-            - Accuracy: **1.5% WER** (best available)
-            - VRAM: 5-6 GB
-            - Loads from: `local_models/parakeet-1.1b.nemo` OR HuggingFace
-            
-            **Canary-1B v2** (Multilingual + Translation):
-            - Languages: 25 European languages
-            - Speed: ~200× real-time
-            - Accuracy: 1.88% WER (English)
-            - VRAM: 4-5 GB
-            - Features: **Speech Translation** (AST)
-            - Loads from: `local_models/canary-1b-v2.nemo` OR HuggingFace
-            
-            **Canary-1B** (Standard):
-            - Languages: 25 European languages
-            - Speed: ~200× real-time
-            - Accuracy: ~1.9% WER (English)
-            - VRAM: 4-5 GB
-            - Loads from: `local_models/canary-1b.nemo` OR HuggingFace
-            
-            💡 **Tip**: Run `python setup_local_models.py` to download models locally for faster loading.
+
+            **NVIDIA Parakeet 0.6B v3**
+            - NeMo backend, multilingual, word timestamps supported
+            - Best fit when you want the existing fast local Parakeet path
+
+            **Mistral Voxtral Small 24B / Mini 3B**
+            - Transformers backend for offline transcription
+            - Strong long-form transcription quality, no timestamp export wired yet
+
+            **Mistral Voxtral Mini 4B Realtime**
+            - Requested model is listed in the selector
+            - Current local Transformers runtime does not expose the required realtime class yet
+
+            **Qwen3 ASR 1.7B**
+            - Qwen ASR backend with forced-aligner timestamp support
+            - Best option in this set when you need timestamps outside NeMo
+
+            **Cohere Transcribe 03-2026 / IBM Granite 4.0 1B Speech**
+            - Transformers backends for local transcription
+            - Cohere relies on trusted remote code from the local model package
+
+            💡 **Tip**: Store predownloaded artifacts under `local_models/` to avoid repeat downloads.
             """)
         
         # Right column - Output
@@ -4271,7 +4760,7 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         ### Quick Start:
         
         1. **Upload files** (audio or video - select multiple for batch processing)
-        2. **Select model** (choose based on your needs: speed, accuracy, or language support)
+        2. **Select model** from the requested local registry
         3. **Click "Start Transcription"**
         4. **Copy or download** your transcription
         
@@ -4281,12 +4770,11 @@ with gr.Blocks(title="🎙️ Local ASR Transcription") as app:
         - 📦 **Batch Processing**: Upload multiple files at once
         - ⚡ **GPU Optimized**: Uses FP16 mixed precision for faster processing
         - 🔒 **Privacy First**: All processing happens locally on your machine
-        - 🌍 **Multilingual**: Support for 25 European languages (model dependent)
+        - 🌍 **Backend Aware**: NeMo, Transformers, and Qwen ASR runtimes
         
         ### Model Loading:
-        - **All Models**: Try local `.nemo` file first, then HuggingFace fallback
-        - Local files load instantly (no internet required)
-        - HuggingFace downloads are cached for future offline use
+        - Local artifacts in `local_models/` are preferred when present
+        - Missing artifacts are downloaded once into `model_cache/`
         - All models stay in memory after first load (instant subsequent use)
         
         ### Tips:
