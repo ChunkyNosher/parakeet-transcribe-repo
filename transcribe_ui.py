@@ -2839,14 +2839,20 @@ def _save_logs(logs: str, prefix: str = "transcription") -> Optional[str]:
         
     try:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file = f"{prefix}_log_{timestamp}.txt"
-        
-        with open(log_file, "w", encoding="utf-8") as f:
+        script_dir = get_script_dir()
+        # Keep runtime logs grouped by type in dedicated directories.
+        log_subdir = "error" if prefix == "error" else "transcription"
+        log_dir = script_dir / "logs" / log_subdir
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        log_path = log_dir / f"{prefix}_log_{timestamp}.txt"
+
+        with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"Transcription Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 60 + "\n\n")
             f.write(logs)
             
-        return log_file
+        return str(log_path)
     except Exception as e:
         print(f"⚠️ Failed to save log file: {e}")
         return None
