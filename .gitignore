@@ -33,14 +33,13 @@ transcription-logs/
 env/
 .venv/
 venv/
+.venv311/
 
 # Generated transcription outputs
 *_transcription.txt
 *_transcription.srt
 *_transcription.csv
 error_log_*.txt
+logs/transcription
 
-.venv311
-logs
-docs
 .vscode
