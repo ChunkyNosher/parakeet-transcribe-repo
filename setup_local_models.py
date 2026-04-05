@@ -7,6 +7,10 @@ This script supports two local artifact strategies:
 
 The resulting artifacts can be used by transcribe_ui.py when the matching
 backend runtime is available in the configured Python environment.
+
+For the split-app workflow, prefer setup_local_models_nemo.py or
+setup_local_models_transformers.py. This script remains the legacy mixed-app
+artifact manager for transcribe_ui.py.
 """
 
 from __future__ import annotations
@@ -313,6 +317,9 @@ def main() -> None:
     print("\n" + "=" * 80)
     print("Local ASR Multi-Backend Setup Script")
     print("=" * 80)
+    print("Split apps now have their own setup scripts:")
+    print("- setup_local_models_nemo.py")
+    print("- setup_local_models_transformers.py")
     print("\nThis script prepares the requested local ASR model artifacts.")
     print("NeMo models are saved as .nemo files; the others are stored as local repo snapshots.")
     print(f"Artifact destination: {LOCAL_MODELS_DIR}")

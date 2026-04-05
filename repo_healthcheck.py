@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Quick integration/dependency health check for this repository."""
+"""Quick integration/dependency health check for this repository.
+
+For the split-app workflow, prefer repo_healthcheck_nemo.py or
+repo_healthcheck_transformers.py. This script remains the legacy mixed-app
+health check for transcribe_ui.py.
+"""
 
 from __future__ import annotations
 
@@ -61,6 +66,9 @@ def _check_paths(repo_root: Path) -> list[str]:
 def main() -> int:
     repo_root = Path(__file__).resolve().parent
     print(f"Repo root: {repo_root}")
+    print("Split apps now have app-specific health checks:")
+    print("- repo_healthcheck_nemo.py")
+    print("- repo_healthcheck_transformers.py")
 
     path_failures = _check_paths(repo_root)
     import_failures = _check_imports(REQUIRED_IMPORTS, required=True)
