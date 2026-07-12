@@ -1,45 +1,18 @@
-# yt-dlp batch downloader temporary files
-temp_format_check.txt
-temp_full_format.txt
-*.debug
-
-# Keep the dependencies folder structure but ignore specific temp files
-yt-dlp batch downloader dependencies/temp_*.txt
-yt-dlp batch downloader dependencies/*.debug
-
-# Keep logs folder but allow user to commit specific logs if needed
-# (logs are not ignored by default as they may be useful for troubleshooting)
-
-# Python cache files
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-
-# NeMo ASR model cache directories (created by transcribe_ui.py)
-# These contain downloaded models and temp files, not project source code
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
 model_cache/
-
-# Local model files (large binary files that should be downloaded via setup script)
-# Keep all local model artifacts out of Git
 local_models/
-
-# Runtime logs and generated transcription logs
 transcription-logs/
-
-# Local virtual environments
-env/
 .venv/
-venv/
 .venv311/
-
-# Generated transcription outputs
+.uv-cache/
+.uv-python/
+outputs/
+logs/
+.vscode/
 *_transcription.txt
 *_transcription.srt
 *_transcription.csv
-error_log_*.txt
-logs/transcription
-
-.vscode
