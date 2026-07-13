@@ -30,6 +30,16 @@ uv run pytest
 uv run ruff check .
 ```
 
+## Docker Compose
+
+Docker Desktop on Windows must be configured for Linux containers with NVIDIA GPU support. The Compose service reserves one GPU, publishes Gradio only to `127.0.0.1:7860`, and stores downloads plus generated files under `docker-data/` on the host.
+
+```powershell
+docker compose up --build
+```
+
+Open `http://127.0.0.1:7860`. First model use downloads into `docker-data/model_cache`; exports are written to `docker-data/outputs` and remain available through the UI. Stop the service with `docker compose down`.
+
 ## Model notices
 
 See the NVIDIA model cards for [Parakeet v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) and [Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) for licensing, language coverage, and limitations.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from .app import build_app
 from .diagnostics import doctor_report
@@ -16,7 +17,12 @@ def main() -> None:
         if not ready:
             raise SystemExit(1)
         return
-    build_app().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, show_error=True)
+    build_app().launch(
+        server_name=os.environ.get("PARAKEET_SERVER_NAME", "127.0.0.1"),
+        server_port=int(os.environ.get("PARAKEET_SERVER_PORT", "7860")),
+        inbrowser=os.environ.get("PARAKEET_INBROWSER", "true").lower() == "true",
+        show_error=True,
+    )
 
 
 if __name__ == "__main__":

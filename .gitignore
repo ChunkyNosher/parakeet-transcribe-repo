@@ -11,6 +11,7 @@ transcription-logs/
 .uv-cache/
 .uv-python/
 outputs/
+docker-data/
 logs/
 .vscode/
 *_transcription.txt

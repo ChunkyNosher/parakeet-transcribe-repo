@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import shutil
 from datetime import UTC, datetime
@@ -42,7 +43,8 @@ def _subtitle(result: TranscriptResult, *, vtt: bool) -> str:
     return "\n".join(lines)
 
 
-def create_run_directory(base_dir: Path = Path("outputs")) -> Path:
+def create_run_directory(base_dir: Path | None = None) -> Path:
+    base_dir = base_dir or Path(os.environ.get("PARAKEET_OUTPUT_DIR", "outputs"))
     name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}"
     path = base_dir / name
     path.mkdir(parents=True, exist_ok=False)

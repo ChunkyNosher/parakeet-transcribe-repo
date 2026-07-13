@@ -1,0 +1,16 @@
+.git/
+.venv/
+.venv311/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+model_cache/
+local_models/
+outputs/
+docker-data/
+logs/
+transcription-logs/
+__pycache__/
+*.pyc
