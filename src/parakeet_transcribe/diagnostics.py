@@ -85,6 +85,21 @@ def doctor_report() -> tuple[bool, str]:
         if compiler_line:
             lines.append(compiler_line)
         ready = ready and compiler_ok
+        try:
+            import cuda  # noqa: F401
+
+            lines.append("- OK cuda-python (NeMo CUDA-graph while-loops)")
+        except ImportError:
+            try:
+                import cuda.bindings  # noqa: F401
+
+                lines.append("- OK cuda-python (NeMo CUDA-graph while-loops)")
+            except ImportError:
+                lines.append(
+                    "- MISSING cuda-python: install cuda-python>=12.3 so NeMo can enable "
+                    "CUDA-graph while-loop decoding (rebuild the Docker image)"
+                )
+                ready = False
     else:
         lines.append("- SKIP NeMo/CUDA checks on this host (inference runs in Docker).")
 

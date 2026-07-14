@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from html import escape
+from pathlib import Path
 from threading import Event
+from urllib.parse import quote
 
 import gradio as gr
 
@@ -9,10 +12,19 @@ from .diagnostics import doctor_report
 from .exports import create_run_directory, readable_summary, write_bundle, write_result
 from .models import DEFAULT_MODEL_KEY, MODELS, get_model
 from .service import MAX_BATCH_SIZE, TranscriptionService
-from .types import CancelledError, TranscriptionError
+from .types import CancelledError, TranscriptionError, TranscriptResult
 
 SERVICE = TranscriptionService()
 CANCEL_REQUESTED = Event()
+
+_EMPTY_PREVIEW_AND_FILES = (
+    "<p></p>",
+    [],
+    None,
+    None,
+    None,
+    None,
+)
 
 
 def _model_choices() -> list[tuple[str, str]]:
@@ -49,7 +61,45 @@ def _request_cancel() -> str:
     return "Cancellation requested; the active job will stop between chunks."
 
 
-def _publish_results(results, run_dir) -> tuple[str, str, str | None, str | None, str | None, str | None]:
+def _gradio_file_url(path: Path) -> str:
+    return f"/gradio_api/file={quote(str(path.resolve()))}"
+
+
+def _caption_preview_html(audio_path: Path | None, vtt_path: Path | None) -> str:
+    if audio_path is None or not audio_path.is_file():
+        return "<p><em>No timed caption preview available for this run.</em></p>"
+    audio_src = escape(_gradio_file_url(audio_path))
+    if vtt_path is None or not vtt_path.is_file():
+        return (
+            f'<audio controls style="width:100%" src="{audio_src}"></audio>'
+            "<p><em>Audio is ready, but there are no VTT cues "
+            "(NeMo did not return native segment timestamps).</em></p>"
+        )
+    vtt_src = escape(_gradio_file_url(vtt_path))
+    return (
+        '<audio controls style="width:100%">'
+        f'<source src="{audio_src}" type="audio/wav" />'
+        f'<track kind="captions" src="{vtt_src}" srclang="en" label="Captions" default />'
+        "</audio>"
+        "<p><em>Captions use NeMo native segment timestamps. "
+        "Toggle captions on the player if they are hidden.</em></p>"
+    )
+
+
+def _cue_table_rows(result: TranscriptResult) -> list[list[object]]:
+    return [
+        [round(segment.start, 3), round(segment.end, 3), segment.text]
+        for segment in result.segments
+    ]
+
+
+def _failure_outputs(message: str) -> tuple:
+    return (message, "", *_EMPTY_PREVIEW_AND_FILES)
+
+
+def _publish_results(
+    results: list[TranscriptResult], run_dir: Path
+) -> tuple[str, str, str, list[list[object]], str | None, str | None, str | None, str | None]:
     artifacts = [write_result(result, run_dir) for result in results]
     bundle = write_bundle(results, run_dir)
     transcript = "\n\n".join(f"## {result.source_name}\n\n{result.text}" for result in results)
@@ -61,11 +111,23 @@ def _publish_results(results, run_dir) -> tuple[str, str, str | None, str | None
             status_parts.append(f"- Speaker labels attached for {result.source_name}")
         if result.runtime.get("key_phrase_count"):
             status_parts.append(f"- Keyterm boosting applied ({result.runtime['key_phrase_count']} phrases)")
+        if result.runtime.get("segment_source") == "nemo_native":
+            status_parts.append(f"- Caption cues from NeMo native segments ({len(result.segments)})")
+        for warning in result.warnings:
+            status_parts.append(f"- Warning ({result.source_name}): {warning}")
     status = "\n".join(status_parts)
+    first_result = results[0]
     first = artifacts[0]
+    preview_audio = first_result.runtime.get("preview_audio_path")
+    audio_path = Path(preview_audio) if preview_audio else None
+    vtt_path = Path(first["vtt"]) if first.get("vtt") else None
+    preview_html = _caption_preview_html(audio_path, vtt_path)
+    cue_rows = _cue_table_rows(first_result)
     return (
         status,
         transcript,
+        preview_html,
+        cue_rows,
         str(bundle),
         str(first["json"]),
         str(first.get("srt")) if first.get("srt") else None,
@@ -85,7 +147,7 @@ def _run_files(
     redact_pii: bool,
     clean_format: bool,
     progress: gr.Progress = gr.Progress(),  # noqa: B008 - Gradio injects this callback.
-) -> tuple[str, str, str | None, str | None, str | None, str | None]:
+) -> tuple:
     try:
         CANCEL_REQUESTED.clear()
         run_dir = create_run_directory()
@@ -106,11 +168,11 @@ def _run_files(
         )
         return _publish_results(results, run_dir)
     except CancelledError as exc:
-        return str(exc), "", None, None, None, None
+        return _failure_outputs(str(exc))
     except TranscriptionError as exc:
-        return f"### Transcription failed\n\n{exc}", "", None, None, None, None
+        return _failure_outputs(f"### Transcription failed\n\n{exc}")
     except Exception as exc:  # pragma: no cover - defensive UI boundary
-        return f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`", "", None, None, None, None
+        return _failure_outputs(f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`")
 
 
 def _run_youtube(
@@ -125,7 +187,7 @@ def _run_youtube(
     redact_pii: bool,
     clean_format: bool,
     progress: gr.Progress = gr.Progress(),  # noqa: B008 - Gradio injects this callback.
-) -> tuple[str, str, str | None, str | None, str | None, str | None]:
+) -> tuple:
     try:
         CANCEL_REQUESTED.clear()
         run_dir = create_run_directory()
@@ -146,11 +208,11 @@ def _run_youtube(
         )
         return _publish_results(results, run_dir)
     except CancelledError as exc:
-        return str(exc), "", None, None, None, None
+        return _failure_outputs(str(exc))
     except TranscriptionError as exc:
-        return f"### Transcription failed\n\n{exc}", "", None, None, None, None
+        return _failure_outputs(f"### Transcription failed\n\n{exc}")
     except Exception as exc:  # pragma: no cover - defensive UI boundary
-        return f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`", "", None, None, None, None
+        return _failure_outputs(f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`")
 
 
 def build_app() -> gr.Blocks:
@@ -159,7 +221,8 @@ def build_app() -> gr.Blocks:
             "# Parakeet Transcribe\n"
             "Local file transcription with **NVIDIA NeMo** (Parakeet / Nemotron). "
             "Supported runtime: Docker Compose Linux GPU container. "
-            "Models download once into the mounted cache."
+            "Weights download once into the host-mounted cache; the default model is warmed into VRAM at startup "
+            "(use **Unload model** to free VRAM)."
         )
         with gr.Accordion("System diagnostics", open=False):
             diagnostics = gr.Markdown(_system_details())
@@ -185,7 +248,8 @@ def build_app() -> gr.Blocks:
                 language = gr.Textbox(
                     value="auto",
                     label="Language",
-                    info="Use auto, or a locale such as en-US or de-DE when the model supports language hints.",
+                    interactive=False,
+                    info="Automatic language detection only for now. Locale forcing is not wired into NeMo yet.",
                 )
                 keyterms = gr.Textbox(
                     label="Keyterms (GPU-PB phrase boosting)",
@@ -232,7 +296,18 @@ def build_app() -> gr.Blocks:
                 unload.click(_unload, outputs=unload_status, queue=False)
             with gr.Column(scale=2):
                 status = gr.Markdown("Upload files and start a transcription.")
-                transcript = gr.Markdown()
+                gr.Markdown("### Timed caption preview")
+                caption_preview = gr.HTML(
+                    value="<p><em>Timed caption preview appears here after a Parakeet run with native segments.</em></p>",
+                )
+                cue_table = gr.Dataframe(
+                    headers=["Start (s)", "End (s)", "Text"],
+                    datatype=["number", "number", "str"],
+                    label="Caption cues (NeMo native segments)",
+                    interactive=False,
+                    wrap=True,
+                )
+                transcript = gr.Markdown(label="Full transcript")
                 with gr.Row():
                     bundle = gr.File(label="All outputs (ZIP)")
                     json_file = gr.File(label="First file JSON")
@@ -251,10 +326,20 @@ def build_app() -> gr.Blocks:
             redact_pii,
             clean_format,
         ]
+        result_outputs = [
+            status,
+            transcript,
+            caption_preview,
+            cue_table,
+            bundle,
+            json_file,
+            srt_file,
+            vtt_file,
+        ]
         file_event = run.click(
             _run_files,
             inputs=option_inputs,
-            outputs=[status, transcript, bundle, json_file, srt_file, vtt_file],
+            outputs=result_outputs,
         )
         youtube_event = run_youtube.click(
             _run_youtube,
@@ -270,13 +355,14 @@ def build_app() -> gr.Blocks:
                 redact_pii,
                 clean_format,
             ],
-            outputs=[status, transcript, bundle, json_file, srt_file, vtt_file],
+            outputs=result_outputs,
         )
         cancel.click(_request_cancel, outputs=unload_status, cancels=[file_event, youtube_event], queue=False)
         gr.Markdown(
             "NeMo enables long-form local attention, greedy CUDA-graph decoding, and optional GPU-PB keyterms. "
-            "Parakeet supplies timestamped subtitles. Nemotron is offered for broader language coverage but "
-            "does not fabricate SRT/VTT timing. Live microphone streaming, Riva/NIM, and cloud ASR wrappers "
-            "remain out of scope. Optional extras (diarization, summary, PII redaction) run locally after ASR."
+            "Parakeet supplies timestamped subtitles from NeMo native segments. Nemotron is offered for broader "
+            "language coverage but does not fabricate SRT/VTT timing. Live microphone streaming, Riva/NIM, and "
+            "cloud ASR wrappers remain out of scope. Optional extras (diarization, summary, PII redaction) run "
+            "locally after ASR."
         )
     return app.queue(default_concurrency_limit=1)

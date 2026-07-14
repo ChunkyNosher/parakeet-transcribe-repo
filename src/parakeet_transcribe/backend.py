@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .types import ChunkResult, ModelSpec, TranscriptionError, WordTimestamp
+from .types import ChunkResult, ModelSpec, Segment, TranscriptionError, WordTimestamp
 
 SAMPLE_RATE = 16000
 
@@ -69,10 +69,30 @@ def _words_from_nemo_word_timestamps(payload: Any) -> list[WordTimestamp]:
     return words
 
 
+def _segments_from_nemo_segment_timestamps(payload: Any) -> list[Segment]:
+    """Map NeMo ``timestamps=True`` segment entries (start/end in seconds) into Segment cues."""
+
+    if not payload or not isinstance(payload, dict):
+        return []
+    raw_items = payload.get("segment", payload.get("segments"))
+    if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes)):
+        return []
+    segments: list[Segment] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("segment", item.get("text", item.get("word", "")))).strip()
+        start, end = item.get("start"), item.get("end")
+        if text and isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start:
+            segments.append(Segment(text, float(start), float(end)))
+    return segments
+
+
 def chunk_result_from_hypothesis(hypothesis: Any, *, expect_timestamps: bool) -> ChunkResult:
     text = str(getattr(hypothesis, "text", hypothesis) or "").strip()
     text, detected_language = _extract_language(text)
     words: list[WordTimestamp] = []
+    segments: list[Segment] = []
     if expect_timestamps:
         timestamp = getattr(hypothesis, "timestamp", None)
         words = _words_from_nemo_word_timestamps(timestamp)
@@ -80,7 +100,8 @@ def chunk_result_from_hypothesis(hypothesis: Any, *, expect_timestamps: bool) ->
             raise TranscriptionError(
                 "NeMo returned no usable word timestamps. The app will not fabricate subtitle timing."
             )
-    return ChunkResult(text=text, words=words, detected_language=detected_language)
+        segments = _segments_from_nemo_segment_timestamps(timestamp)
+    return ChunkResult(text=text, words=words, detected_language=detected_language, segments=segments)
 
 
 class NeMoASRBackend:
@@ -113,12 +134,38 @@ class NeMoASRBackend:
             self.model = nemo_asr.models.ASRModel.from_pretrained(self.spec.model_id)
             self.model.eval()
             self.model.to(torch.device("cuda"))
-            self.model.half()
-            self.enable_longform_attention()
+            # Attention/decoding rebuild modules in FP32; cast precision after those calls.
+            self._configure_longform_attention()
             self.configure_decoding(self._key_phrases, self._boost_alpha)
+            self._apply_inference_dtype()
         except Exception as exc:
+            self.model = None
+            self._decoding_fingerprint = None
             raise_if_triton_compiler_error(exc)
             raise
+
+    def _apply_inference_dtype(self) -> None:
+        """Cast weights to FP16 after any NeMo reconfiguration that may recreate FP32 modules."""
+
+        if self.model is None:
+            return
+        torch = _torch_runtime()
+        self.model.to(dtype=torch.float16)
+
+    def _configure_longform_attention(self) -> None:
+        assert self.model is not None
+        try:
+            self.model.change_attention_model(
+                self_attention_model="rel_pos_local_attn",
+                att_context_size=[256, 256],
+            )
+            change_chunking = getattr(self.model, "change_subsampling_conv_chunking_factor", None)
+            if callable(change_chunking):
+                change_chunking(1)
+        except Exception as exc:
+            raise TranscriptionError(
+                f"Failed to enable NeMo local-attention long-form mode: {exc}"
+            ) from exc
 
     def unload(self) -> None:
         if self.model is None:
@@ -135,16 +182,8 @@ class NeMoASRBackend:
 
     def enable_longform_attention(self) -> None:
         self.load()
-        assert self.model is not None
-        try:
-            self.model.change_attention_model(
-                self_attention_model="rel_pos_local_attn",
-                att_context_size=[256, 256],
-            )
-        except Exception as exc:
-            raise TranscriptionError(
-                f"Failed to enable NeMo local-attention long-form mode: {exc}"
-            ) from exc
+        self._configure_longform_attention()
+        self._apply_inference_dtype()
 
     def configure_decoding(self, key_phrases: Sequence[str], boost_alpha: float = 1.0) -> None:
         phrases = capitalize_key_phrases(key_phrases)
@@ -185,6 +224,7 @@ class NeMoASRBackend:
             raise_if_triton_compiler_error(exc)
             raise TranscriptionError(f"Failed to configure NeMo decoding strategy: {exc}") from exc
         self._decoding_fingerprint = fingerprint
+        self._apply_inference_dtype()
 
     def transcribe_paths(
         self,

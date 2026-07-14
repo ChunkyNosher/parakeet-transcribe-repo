@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 
 from .diagnostics import doctor_report, inference_runtime_supported
 from .exports import resolved_output_dir
+from .models import DEFAULT_MODEL_KEY
 
 
 def main() -> None:
@@ -25,7 +27,15 @@ def main() -> None:
         print("See README.md Docker Compose section.")
         raise SystemExit(2)
 
-    from .app import build_app
+    from .app import SERVICE, build_app
+
+    warm_thread = threading.Thread(
+        target=SERVICE.warm_default_model,
+        kwargs={"model_key": DEFAULT_MODEL_KEY},
+        name="parakeet-model-warmup",
+        daemon=True,
+    )
+    warm_thread.start()
 
     build_app().launch(
         server_name=os.environ.get("PARAKEET_SERVER_NAME", "127.0.0.1"),

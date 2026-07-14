@@ -16,6 +16,8 @@ dependencies = [
     # NeMo ASR is Linux-only (Docker Compose). Windows hosts run unit tests without it.
     "nemo_toolkit[asr]==2.5.3; sys_platform == 'linux'",
     "torch==2.13.0; sys_platform == 'linux'",
+    # Enables NeMo CUDA-graph while-loop decoding (conditional nodes).
+    "cuda-python>=12.3; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

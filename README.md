@@ -38,7 +38,7 @@ docker compose up --build
 
 Rebuilds reuse a local BuildKit cache at `docker-data/build-cache` (apt + `uv` download caches and layer metadata). The first build is still slow; later builds after dependency or source changes should be much faster. That cache directory is gitignored with the rest of `docker-data/`.
 
-Open `http://127.0.0.1:7860`. First model use downloads into `docker-data/model_cache`; exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
+Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). On container start the app warms the default Parakeet model into VRAM in the background so the first transcription skips that cold load; use **Unload model** if you need the memory back. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
 
 
 Inside the container you can also run:

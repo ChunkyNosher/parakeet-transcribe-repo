@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 
 import numpy as np
 
-from .chunking import segments_from_words
-from .types import TranscriptResult, WordTimestamp
+from .types import Segment, TranscriptResult, WordTimestamp
 
 SAMPLE_RATE = 16000
 
@@ -76,6 +76,19 @@ def _labels_for_times(
     return assigned
 
 
+def _speaker_for_segment(segment: Segment, words: list[WordTimestamp]) -> str | None:
+    """Majority speaker among words overlapping the native NeMo segment time range."""
+
+    overlapping = [
+        word.speaker
+        for word in words
+        if word.speaker and word.end > segment.start and word.start < segment.end
+    ]
+    if not overlapping:
+        return segment.speaker
+    return Counter(overlapping).most_common(1)[0][0]
+
+
 def diarize_transcript(
     result: TranscriptResult,
     samples: np.ndarray,
@@ -107,7 +120,11 @@ def diarize_transcript(
         WordTimestamp(word.text, word.start, word.end, speaker=speaker)
         for word, speaker in zip(result.words, speakers, strict=True)
     ]
-    segments = segments_from_words(words)
+    # Keep NeMo native cue boundaries; only attach speaker labels.
+    segments = [
+        Segment(segment.text, segment.start, segment.end, _speaker_for_segment(segment, words))
+        for segment in result.segments
+    ]
     return replace(
         result,
         words=words,

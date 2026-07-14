@@ -142,6 +142,27 @@ def merge_words(chunks: Iterable[tuple[AudioChunk, list[WordTimestamp]]]) -> lis
     return merged
 
 
+def merge_segments(chunks: Iterable[tuple[AudioChunk, list[Segment]]]) -> list[Segment]:
+    """Offset chunk-relative NeMo segment cues and drop overlap duplicates."""
+
+    merged: list[Segment] = []
+    for chunk, segments in chunks:
+        for segment in segments:
+            start = float(segment.start) + chunk.start
+            end = float(segment.end) + chunk.start
+            adjusted = Segment(segment.text, start, end, segment.speaker)
+            if adjusted.end <= chunk.content_start + 0.01 and merged:
+                continue
+            if (
+                merged
+                and adjusted.start < merged[-1].end
+                and _normalize_token(adjusted.text) == _normalize_token(merged[-1].text)
+            ):
+                continue
+            merged.append(adjusted)
+    return merged
+
+
 def _flush_segment(words: list[WordTimestamp]) -> Segment:
     return Segment(
         " ".join(item.text for item in words),

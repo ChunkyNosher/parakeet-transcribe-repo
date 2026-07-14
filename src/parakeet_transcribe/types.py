@@ -75,6 +75,7 @@ class ChunkResult:
     text: str
     words: list[WordTimestamp]
     detected_language: str | None = None
+    segments: list[Segment] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

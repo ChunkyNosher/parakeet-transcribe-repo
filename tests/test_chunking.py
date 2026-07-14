@@ -1,13 +1,14 @@
 import numpy as np
 
 from parakeet_transcribe.chunking import (
+    merge_segments,
     merge_text,
     merge_words,
     normalize_word_timing,
     segments_from_words,
     split_audio,
 )
-from parakeet_transcribe.types import AudioChunk, WordTimestamp
+from parakeet_transcribe.types import AudioChunk, Segment, WordTimestamp
 
 
 def test_split_audio_has_context_and_coverage() -> None:
@@ -37,7 +38,22 @@ def test_merge_words_offsets_and_removes_overlap() -> None:
     assert merged[-1].start == 4.0
 
 
+def test_merge_segments_offsets_native_cues() -> None:
+    first = AudioChunk(np.array([0]), 0, 4, 0, "a.wav")
+    second = AudioChunk(np.array([0]), 2, 6, 4, "a.wav")
+    merged = merge_segments(
+        [
+            (first, [Segment("Hello there.", 0.0, 1.5)]),
+            (second, [Segment("Hello there.", 0.0, 1.0), Segment("Again.", 2.0, 2.5)]),
+        ]
+    )
+    assert [item.text for item in merged] == ["Hello there.", "Again."]
+    assert merged[-1].start == 4.0
+
+
 def test_segments_are_bounded_by_punctuation() -> None:
+    """Legacy packer helper (unused on NeMo-native production path)."""
+
     words = [
         WordTimestamp("Hello", 0, 0.3),
         WordTimestamp("there.", 0.3, 0.7),
@@ -47,7 +63,7 @@ def test_segments_are_bounded_by_punctuation() -> None:
 
 
 def test_segments_split_on_long_silence_before_next_sentence_start() -> None:
-    """Mode A: post-pause first word must not stay on the silence-heavy prior cue."""
+    """Legacy packer Mode A (unused on NeMo-native production path)."""
 
     words = [
         WordTimestamp("We", 30.0, 30.2),
@@ -67,7 +83,7 @@ def test_segments_split_on_long_silence_before_next_sentence_start() -> None:
 
 
 def test_segments_clamp_stretched_word_start_across_silence() -> None:
-    """Mode B: ASR glued start across silence; clamp then gap-split."""
+    """Legacy packer Mode B (unused on NeMo-native production path)."""
 
     words = [
         WordTimestamp("We", 30.0, 30.2),
@@ -89,6 +105,8 @@ def test_segments_clamp_stretched_word_start_across_silence() -> None:
 
 
 def test_short_pause_does_not_force_split() -> None:
+    """Legacy packer helper (unused on NeMo-native production path)."""
+
     words = [
         WordTimestamp("Hello", 0.0, 0.3),
         WordTimestamp("there", 0.5, 0.8),

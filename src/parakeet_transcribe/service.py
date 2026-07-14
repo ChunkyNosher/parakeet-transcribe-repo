@@ -10,10 +10,10 @@ import numpy as np
 import soundfile as sf
 
 from .backend import NeMoASRBackend, is_cuda_oom, parse_key_phrases
-from .chunking import merge_text, merge_words, segments_from_words, split_audio
+from .chunking import merge_segments, merge_text, merge_words, split_audio
 from .diarization import diarize_transcript
 from .media import prepare_audio
-from .models import get_model
+from .models import DEFAULT_MODEL_KEY, get_model
 from .postprocess import apply_postprocess
 from .types import CancelledError, ChunkResult, TranscriptionError, TranscriptResult
 from .youtube import download_youtube_audio
@@ -53,6 +53,22 @@ class TranscriptionService:
         self._backend = None
         self._model_key = None
         return "Model unloaded and CUDA cache released."
+
+    def warm_default_model(self, model_key: str = DEFAULT_MODEL_KEY) -> str:
+        """Load the default (or given) model into VRAM so the first job skips cold start."""
+
+        spec = get_model(model_key)
+        print(f"Warming up {spec.model_id}...", flush=True)
+        try:
+            backend = self._get_backend(model_key)
+            backend.load()
+        except Exception as exc:
+            message = f"Model warm-up failed for {spec.model_id}: {exc}"
+            print(message, flush=True)
+            return message
+        message = f"Warmed up {spec.model_id}."
+        print(message, flush=True)
+        return message
 
     def _get_backend(self, model_key: str) -> NeMoASRBackend:
         if self._backend is not None and self._model_key == model_key:
@@ -207,14 +223,23 @@ class TranscriptionService:
             words = merge_words(
                 (chunk, result.words) for chunk, result in zip(chunks, chunk_results, strict=True)
             )
+            segments = merge_segments(
+                (chunk, result.segments) for chunk, result in zip(chunks, chunk_results, strict=True)
+            )
         else:
             first = chunk_results[0]
             text = first.text
             language_result = first.detected_language
             words = list(first.words)
+            segments = list(first.segments)
 
         if not text:
             raise TranscriptionError(f"{prepared.source_path.name} produced an empty transcript.")
+        warnings_out = list(warnings)
+        if words and not segments:
+            warnings_out.append(
+                "NeMo returned word timestamps but no native segment cues; SRT/VTT preview will be empty."
+            )
         result = TranscriptResult(
             schema_version="1.0",
             source_name=prepared.source_path.name,
@@ -223,13 +248,15 @@ class TranscriptionService:
             text=text,
             detected_language=language_result,
             words=words,
-            segments=segments_from_words(words),
-            warnings=warnings,
+            segments=segments,
+            warnings=warnings_out,
             runtime={
                 "backend": "nemo",
                 "longform_attention": not used_chunking,
                 "key_phrase_count": len(list(key_phrases)),
                 "boost_alpha": float(boost_alpha),
+                "segment_source": "nemo_native" if segments else "none",
+                "preview_audio_path": str(prepared.canonical_path),
             },
         )
         if diarize:
