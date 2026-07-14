@@ -32,6 +32,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
+# Project installs editable (uv.lock: editable = "."). Compose bind-mounts ./src → /app/src
+# so host code changes apply without rebuilding; restart/watch reloads the process.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 

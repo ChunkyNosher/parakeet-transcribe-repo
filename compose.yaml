@@ -19,8 +19,22 @@ services:
       PARAKEET_SERVER_NAME: 0.0.0.0
       PARAKEET_SERVER_PORT: "7860"
     volumes:
+      # Editable install + bind mount: host ./src changes apply without image rebuild.
+      # Restart the process to reload Python imports (Compose Watch does this automatically).
+      - ./src:/app/src
       - ./docker-data/model_cache:/data/model_cache
       - ./docker-data/outputs:/data/outputs
+    develop:
+      watch:
+        - path: ./src
+          target: /app/src
+          action: sync+restart
+        - path: ./pyproject.toml
+          action: rebuild
+        - path: ./uv.lock
+          action: rebuild
+        - path: ./Dockerfile
+          action: rebuild
     deploy:
       resources:
         reservations:

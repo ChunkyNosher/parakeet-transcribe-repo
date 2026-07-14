@@ -33,10 +33,18 @@ Paste one YouTube video URL into **YouTube video URL** and choose **Transcribe Y
 Docker Desktop on Windows must be configured for Linux containers with NVIDIA GPU support. The Compose service reserves one GPU, publishes Gradio only to `127.0.0.1:7860`, and stores downloads plus generated files under `docker-data/` on the host. The image installs `build-essential` and `libsndfile1` because NeMo/PyTorch need them at runtime.
 
 ```powershell
-docker compose up --build
+docker compose up --build --watch
 ```
 
-Rebuilds reuse a local BuildKit cache at `docker-data/build-cache` (apt + `uv` download caches and layer metadata). The first build is still slow; later builds after dependency or source changes should be much faster. That cache directory is gitignored with the rest of `docker-data/`.
+`--watch` is the day-to-day loop: `./src` is bind-mounted into the container, so Python edits sync from the host and Compose restarts the app process automatically. You do **not** need `--build` for normal code patches.
+
+Rebuild the image only when dependencies or the Dockerfile change (`pyproject.toml`, `uv.lock`, system packages). Rebuilds reuse a local BuildKit cache at `docker-data/build-cache` (apt + `uv` download caches and layer metadata). The first build is still slow; later dependency rebuilds should be much faster. That cache directory is gitignored with the rest of `docker-data/`.
+
+Without watch, after editing `src/` you can still skip a rebuild and just restart:
+
+```powershell
+docker compose restart
+```
 
 Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). On container start the app warms the default Parakeet model into VRAM in the background so the first transcription skips that cold load; use **Unload model** if you need the memory back. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
 
