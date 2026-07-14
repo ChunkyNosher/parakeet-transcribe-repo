@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -7,6 +8,8 @@ from typing import Any
 import numpy as np
 
 from .types import ChunkResult, ModelSpec, TranscriptionError, WordTimestamp
+
+SAMPLE_RATE = 16000
 
 
 def _token_piece(text: str) -> str:
@@ -87,6 +90,17 @@ def _extract_language(text: str) -> tuple[str, str | None]:
     return text[: match.start()].strip(), match.group(1)
 
 
+def max_new_tokens_for_audio(audio: Sequence[np.ndarray], sample_rate: int = SAMPLE_RATE) -> int:
+    """Bound decoder steps from the longest clip in the batch (seconds × generous ASR rate)."""
+
+    max_seconds = max((len(samples) / sample_rate for samples in audio), default=1.0)
+    return min(4096, max(64, int(max_seconds * 25) + 32))
+
+
+def _compile_enabled() -> bool:
+    return os.environ.get("PARAKEET_TORCH_COMPILE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class TransformersASRBackend:
     """One in-process Transformers backend for NVIDIA TDT and RNNT checkpoints."""
 
@@ -95,6 +109,7 @@ class TransformersASRBackend:
         self.processor: Any | None = None
         self.model: Any | None = None
         self.device: str | None = None
+        self._compiled = False
 
     def load(self) -> None:
         if self.model is not None:
@@ -117,6 +132,11 @@ class TransformersASRBackend:
             self.processor = AutoProcessor.from_pretrained(self.spec.model_id)
             model_class = AutoModelForTDT if self.spec.model_class == "tdt" else AutoModelForRNNT
             self.model = model_class.from_pretrained(self.spec.model_id, dtype=dtype).eval().to(self.device)
+            if _compile_enabled() and not self._compiled:
+                self.model.generate = torch.compile(
+                    self.model.generate, mode="reduce-overhead", fullgraph=False
+                )
+                self._compiled = True
         except Exception as exc:
             raise_if_triton_compiler_error(exc)
             raise
@@ -129,26 +149,37 @@ class TransformersASRBackend:
         self.model = None
         self.processor = None
         self.device = None
+        self._compiled = False
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def transcribe(self, audio: Sequence[np.ndarray], *, language: str = "auto") -> list[ChunkResult]:
+    def prepare_inputs(self, audio: Sequence[np.ndarray], *, language: str = "auto") -> Any:
+        """Run the feature processor on CPU so the next batch can prefetch during GPU generate."""
+
         self.load()
-        assert self.model is not None and self.processor is not None and self.device is not None
-        torch = _torch_runtime()
+        assert self.processor is not None
         processor_kwargs: dict[str, Any] = {
-            "sampling_rate": 16000,
+            "sampling_rate": SAMPLE_RATE,
             "return_tensors": "pt",
             "padding": True,
             "return_attention_mask": True,
         }
         if self.spec.model_class == "rnnt":
             processor_kwargs["language"] = language
-        inputs = self.processor(list(audio), **processor_kwargs)
+        return self.processor(list(audio), **processor_kwargs)
+
+    def generate_from_inputs(self, inputs: Any, *, max_new_tokens: int) -> list[ChunkResult]:
+        self.load()
+        assert self.model is not None and self.processor is not None and self.device is not None
+        torch = _torch_runtime()
         inputs = inputs.to(self.device, dtype=torch.float16)
         try:
             with torch.inference_mode():
-                output = self.model.generate(**inputs, return_dict_in_generate=True)
+                output = self.model.generate(
+                    **inputs,
+                    return_dict_in_generate=True,
+                    max_new_tokens=max_new_tokens,
+                )
         except Exception as exc:
             raise_if_triton_compiler_error(exc)
             raise
@@ -184,6 +215,10 @@ class TransformersASRBackend:
                 )
             results.append(ChunkResult(text=text, words=words, detected_language=detected_language))
         return results
+
+    def transcribe(self, audio: Sequence[np.ndarray], *, language: str = "auto") -> list[ChunkResult]:
+        inputs = self.prepare_inputs(audio, language=language)
+        return self.generate_from_inputs(inputs, max_new_tokens=max_new_tokens_for_audio(audio))
 
 
 def is_cuda_oom(error: BaseException) -> bool:

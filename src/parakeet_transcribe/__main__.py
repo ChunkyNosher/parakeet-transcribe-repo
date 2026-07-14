@@ -5,6 +5,7 @@ import os
 
 from .app import build_app
 from .diagnostics import doctor_report
+from .exports import resolved_output_dir
 
 
 def main() -> None:
@@ -22,6 +23,7 @@ def main() -> None:
         server_port=int(os.environ.get("PARAKEET_SERVER_PORT", "7860")),
         inbrowser=os.environ.get("PARAKEET_INBROWSER", "true").lower() == "true",
         show_error=True,
+        allowed_paths=[str(resolved_output_dir())],
     )
 
 

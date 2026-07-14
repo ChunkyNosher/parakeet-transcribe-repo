@@ -3,18 +3,23 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .backend import TransformersASRBackend, is_cuda_oom
+from .backend import TransformersASRBackend, is_cuda_oom, max_new_tokens_for_audio
 from .chunking import merge_text, merge_words, segments_from_words, split_audio
+from .diarization import diarize_transcript
 from .media import prepare_audio
 from .models import get_model
+from .postprocess import apply_postprocess
 from .types import CancelledError, ChunkResult, TranscriptionError, TranscriptResult
 from .youtube import download_youtube_audio
 
 ProgressCallback = Callable[[float, str], None]
 CancelCheck = Callable[[], bool]
+
+MAX_BATCH_SIZE = 16
 
 
 def _noop_progress(_: float, __: str) -> None:
@@ -62,20 +67,37 @@ class TranscriptionService:
     ) -> list[ChunkResult]:
         results: list[ChunkResult] = []
         total = len(chunks)
-        for index in range(0, total, batch_size):
-            if cancel():
-                raise CancelledError("Transcription cancelled before publishing outputs.")
-            group = chunks[index : index + batch_size]
-            progress(
-                progress_base + progress_span * index / max(total, 1),
-                f"Transcribing chunk {index + 1}/{total}",
-            )
-            try:
-                results.extend(backend.transcribe([chunk.samples for chunk in group], language=language))
-            except Exception as exc:
-                if is_cuda_oom(exc):
-                    raise TranscriptionError("CUDA out of memory") from exc
-                raise
+        groups = [chunks[index : index + batch_size] for index in range(0, total, batch_size)]
+        if not groups:
+            return results
+
+        def prepare(group: Sequence[Any]) -> tuple[Any, int]:
+            audio = [chunk.samples for chunk in group]
+            return backend.prepare_inputs(audio, language=language), max_new_tokens_for_audio(audio)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending: Future[tuple[Any, int]] | None = pool.submit(prepare, groups[0])
+            chunk_offset = 0
+            for group_index, group in enumerate(groups):
+                if cancel():
+                    raise CancelledError("Transcription cancelled before publishing outputs.")
+                progress(
+                    progress_base + progress_span * chunk_offset / max(total, 1),
+                    f"Transcribing chunk {chunk_offset + 1}/{total}",
+                )
+                assert pending is not None
+                inputs, token_budget = pending.result()
+                if group_index + 1 < len(groups):
+                    pending = pool.submit(prepare, groups[group_index + 1])
+                else:
+                    pending = None
+                try:
+                    results.extend(backend.generate_from_inputs(inputs, max_new_tokens=token_budget))
+                except Exception as exc:
+                    if is_cuda_oom(exc):
+                        raise TranscriptionError("CUDA out of memory") from exc
+                    raise
+                chunk_offset += len(group)
         return results
 
     def _transcribe_prepared(
@@ -89,10 +111,17 @@ class TranscriptionService:
         cancel: CancelCheck,
         progress_base: float,
         progress_span: float,
+        diarize: bool = False,
+        summarize: bool = False,
+        redact_pii: bool = False,
+        clean_format: bool = False,
     ) -> TranscriptResult:
         warnings: list[str] = []
-        attempts = ((120, batch_size), (120, 1), (60, 1))
+        # Prefer shorter chunks with the requested batch for higher GPU occupancy; fall back under OOM.
+        attempts = ((60, batch_size), (120, max(1, batch_size // 2)), (60, 1), (30, 1))
         error: Exception | None = None
+        chunk_results: list[ChunkResult] = []
+        chunks: list[Any] = []
         for attempt_index, (chunk_seconds, effective_batch) in enumerate(attempts):
             chunks = split_audio(
                 prepared.samples, prepared.sample_rate, prepared.source_path.name, chunk_seconds=chunk_seconds
@@ -106,7 +135,7 @@ class TranscriptionService:
                     progress,
                     cancel,
                     progress_base,
-                    progress_span,
+                    progress_span * 0.9,
                 )
                 if attempt_index:
                     warnings.append(
@@ -128,7 +157,7 @@ class TranscriptionService:
         words = merge_words((chunk, result.words) for chunk, result in zip(chunks, chunk_results, strict=True))
         if not text:
             raise TranscriptionError(f"{prepared.source_path.name} produced an empty transcript.")
-        return TranscriptResult(
+        result = TranscriptResult(
             schema_version="1.0",
             source_name=prepared.source_path.name,
             duration_seconds=prepared.duration_seconds,
@@ -139,6 +168,18 @@ class TranscriptionService:
             segments=segments_from_words(words),
             warnings=warnings,
         )
+        if diarize:
+            progress(progress_base + progress_span * 0.92, "Running local speaker diarization")
+            result = diarize_transcript(result, prepared.samples, prepared.sample_rate)
+        if summarize or redact_pii or clean_format:
+            progress(progress_base + progress_span * 0.96, "Applying transcript post-processing")
+            result = apply_postprocess(
+                result,
+                summarize=summarize,
+                redact_pii=redact_pii,
+                clean_format=clean_format,
+            )
+        return result
 
     def transcribe_files(
         self,
@@ -150,11 +191,15 @@ class TranscriptionService:
         work_dir: Path,
         progress: ProgressCallback | None = None,
         cancel: CancelCheck | None = None,
+        diarize: bool = False,
+        summarize: bool = False,
+        redact_pii: bool = False,
+        clean_format: bool = False,
     ) -> list[TranscriptResult]:
         if not paths:
             raise TranscriptionError("Upload at least one audio or video file.")
-        if batch_size < 1 or batch_size > 4:
-            raise TranscriptionError("Batch size must be between 1 and 4.")
+        if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
+            raise TranscriptionError(f"Batch size must be between 1 and {MAX_BATCH_SIZE}.")
         spec = get_model(model_key)
         if not spec.capabilities.timestamps and language == "":
             language = "auto"
@@ -180,8 +225,13 @@ class TranscriptionService:
                 cancel=cancel,
                 progress_base=base,
                 progress_span=span,
+                diarize=diarize,
+                summarize=summarize,
+                redact_pii=redact_pii,
+                clean_format=clean_format,
             )
             result.runtime = {
+                **result.runtime,
                 "model_key": model_key,
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "requested_batch_size": batch_size,
@@ -200,6 +250,10 @@ class TranscriptionService:
         work_dir: Path,
         progress: ProgressCallback | None = None,
         cancel: CancelCheck | None = None,
+        diarize: bool = False,
+        summarize: bool = False,
+        redact_pii: bool = False,
+        clean_format: bool = False,
     ) -> list[TranscriptResult]:
         progress = progress or _noop_progress
         cancel = cancel or _not_cancelled
@@ -217,6 +271,10 @@ class TranscriptionService:
             work_dir=work_dir,
             progress=progress,
             cancel=cancel,
+            diarize=diarize,
+            summarize=summarize,
+            redact_pii=redact_pii,
+            clean_format=clean_format,
         )
         result = results[0]
         result.source_name = download.source_name

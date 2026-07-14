@@ -7,6 +7,9 @@ import numpy as np
 
 from .types import AudioChunk, Segment, WordTimestamp
 
+DEFAULT_SILENCE_THRESHOLD_SEC = 0.6
+DEFAULT_MAX_WORD_DURATION_SEC = 2.0
+
 
 def _rms_windows(samples: np.ndarray, sample_rate: int, window_seconds: float = 0.1) -> np.ndarray:
     window = max(1, int(sample_rate * window_seconds))
@@ -81,7 +84,22 @@ def split_audio(
 
 
 def _normalize_token(value: str) -> str:
-    return re.sub(r"[^\\w']+", "", value.lower())
+    return re.sub(r"[^\w']+", "", value.lower())
+
+
+def normalize_word_timing(
+    start: float,
+    end: float,
+    *,
+    max_word_duration: float = DEFAULT_MAX_WORD_DURATION_SEC,
+) -> tuple[float, float]:
+    """Clamp stretched starts after pauses; prefer trusting the word end timestamp."""
+
+    start = max(0.0, float(start))
+    end = max(start, float(end))
+    if end - start > max_word_duration:
+        start = max(0.0, end - max_word_duration)
+    return start, end
 
 
 def merge_text(existing: str, incoming: str, maximum_overlap_words: int = 24) -> str:
@@ -110,9 +128,8 @@ def merge_words(chunks: Iterable[tuple[AudioChunk, list[WordTimestamp]]]) -> lis
     merged: list[WordTimestamp] = []
     for chunk, words in chunks:
         for word in words:
-            adjusted = WordTimestamp(
-                word.text, max(0.0, word.start + chunk.start), max(0.0, word.end + chunk.start)
-            )
+            start, end = normalize_word_timing(word.start + chunk.start, word.end + chunk.start)
+            adjusted = WordTimestamp(word.text, start, end, word.speaker)
             if adjusted.end <= chunk.content_start + 0.01 and merged:
                 continue
             if (
@@ -125,22 +142,90 @@ def merge_words(chunks: Iterable[tuple[AudioChunk, list[WordTimestamp]]]) -> lis
     return merged
 
 
+def _flush_segment(words: list[WordTimestamp]) -> Segment:
+    return Segment(
+        " ".join(item.text for item in words),
+        words[0].start,
+        words[-1].end,
+        words[0].speaker,
+    )
+
+
+def _is_sentence_final(text: str) -> bool:
+    return text.rstrip().endswith((".", "?", "!"))
+
+
+def _merge_orphan_segments(segments: list[Segment], *, max_orphan_words: int = 2) -> list[Segment]:
+    """Reattach tiny non-final fragments that were cut mid-phrase by duration limits."""
+
+    if len(segments) < 2:
+        return segments
+    merged: list[Segment] = [segments[0]]
+    for segment in segments[1:]:
+        previous = merged[-1]
+        orphan_words = len(segment.text.split())
+        gap = segment.start - previous.end
+        if (
+            orphan_words <= max_orphan_words
+            and gap < DEFAULT_SILENCE_THRESHOLD_SEC
+            and not _is_sentence_final(previous.text)
+            and (previous.speaker is None or previous.speaker == segment.speaker)
+        ):
+            merged[-1] = Segment(
+                f"{previous.text} {segment.text}".strip(),
+                previous.start,
+                segment.end,
+                previous.speaker or segment.speaker,
+            )
+        else:
+            merged.append(segment)
+    return merged
+
+
+def _enforce_segment_boundaries(segments: list[Segment]) -> list[Segment]:
+    if not segments:
+        return segments
+    fixed: list[Segment] = []
+    for index, segment in enumerate(segments):
+        end = segment.end
+        if index + 1 < len(segments):
+            end = min(end, segments[index + 1].start)
+        end = max(end, segment.start)
+        fixed.append(Segment(segment.text, segment.start, end, segment.speaker))
+    return fixed
+
+
 def segments_from_words(
-    words: list[WordTimestamp], max_words: int = 12, max_duration: float = 8.0
+    words: list[WordTimestamp],
+    max_words: int = 12,
+    max_duration: float = 8.0,
+    *,
+    silence_threshold: float = DEFAULT_SILENCE_THRESHOLD_SEC,
+    max_word_duration: float = DEFAULT_MAX_WORD_DURATION_SEC,
 ) -> list[Segment]:
+    """Group words into subtitle cues; split on silence gaps before absorbing the next word."""
+
     if not words:
         return []
     segments: list[Segment] = []
     current: list[WordTimestamp] = []
     for word in words:
-        current.append(word)
+        start, end = normalize_word_timing(word.start, word.end, max_word_duration=max_word_duration)
+        timed = WordTimestamp(word.text, start, end, word.speaker)
+
+        if current:
+            gap = timed.start - current[-1].end
+            speaker_break = timed.speaker is not None and timed.speaker != current[0].speaker
+            if gap >= silence_threshold or speaker_break:
+                segments.append(_flush_segment(current))
+                current = []
+
+        current.append(timed)
         duration = current[-1].end - current[0].start
-        punctuated = word.text.rstrip().endswith((".", "?", "!"))
+        punctuated = _is_sentence_final(timed.text)
         if len(current) >= max_words or duration >= max_duration or punctuated:
-            segments.append(
-                Segment(" ".join(item.text for item in current), current[0].start, current[-1].end)
-            )
+            segments.append(_flush_segment(current))
             current = []
     if current:
-        segments.append(Segment(" ".join(item.text for item in current), current[0].start, current[-1].end))
-    return segments
+        segments.append(_flush_segment(current))
+    return _enforce_segment_boundaries(_merge_orphan_segments(segments))

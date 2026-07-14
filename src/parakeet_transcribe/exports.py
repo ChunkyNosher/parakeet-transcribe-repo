@@ -4,12 +4,18 @@ import csv
 import json
 import os
 import re
-import shutil
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from .types import TranscriptResult
+
+SCRATCH_DIR_NAMES = frozenset({".work", ".youtube"})
+
+
+def resolved_output_dir() -> Path:
+    return Path(os.environ.get("PARAKEET_OUTPUT_DIR", "outputs")).expanduser().resolve()
 
 
 def _timestamp(seconds: float, *, vtt: bool = False) -> str:
@@ -26,6 +32,12 @@ def _safe_stem(value: str) -> str:
     return cleaned or "transcript"
 
 
+def _segment_line(segment) -> str:
+    if segment.speaker:
+        return f"[{segment.speaker}] {segment.text}"
+    return segment.text
+
+
 def _subtitle(result: TranscriptResult, *, vtt: bool) -> str:
     if not result.segments:
         return ""
@@ -36,7 +48,7 @@ def _subtitle(result: TranscriptResult, *, vtt: bool) -> str:
         lines.extend(
             [
                 f"{_timestamp(segment.start, vtt=vtt)} --> {_timestamp(segment.end, vtt=vtt)}",
-                segment.text,
+                _segment_line(segment),
                 "",
             ]
         )
@@ -44,7 +56,7 @@ def _subtitle(result: TranscriptResult, *, vtt: bool) -> str:
 
 
 def create_run_directory(base_dir: Path | None = None) -> Path:
-    base_dir = base_dir or Path(os.environ.get("PARAKEET_OUTPUT_DIR", "outputs"))
+    base_dir = (base_dir or resolved_output_dir()).resolve()
     name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}"
     path = base_dir / name
     path.mkdir(parents=True, exist_ok=False)
@@ -55,7 +67,11 @@ def write_result(result: TranscriptResult, run_dir: Path) -> dict[str, Path]:
     stem = _safe_stem(result.source_name)
     files: dict[str, Path] = {}
     text_path = run_dir / f"{stem}.txt"
-    text_path.write_text(result.text + "\n", encoding="utf-8")
+    if any(segment.speaker for segment in result.segments):
+        text_body = "\n".join(_segment_line(segment) for segment in result.segments)
+    else:
+        text_body = result.text
+    text_path.write_text(text_body + "\n", encoding="utf-8")
     files["txt"] = text_path
 
     json_path = run_dir / f"{stem}.json"
@@ -65,10 +81,16 @@ def write_result(result: TranscriptResult, run_dir: Path) -> dict[str, Path]:
     csv_path = run_dir / f"{stem}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["start_time", "end_time", "duration", "text"])
+        writer.writerow(["start_time", "end_time", "duration", "text", "speaker"])
         for word in result.words:
             writer.writerow(
-                [f"{word.start:.3f}", f"{word.end:.3f}", f"{word.end - word.start:.3f}", word.text]
+                [
+                    f"{word.start:.3f}",
+                    f"{word.end:.3f}",
+                    f"{word.end - word.start:.3f}",
+                    word.text,
+                    word.speaker or "",
+                ]
             )
     files["csv"] = csv_path
 
@@ -79,17 +101,40 @@ def write_result(result: TranscriptResult, run_dir: Path) -> dict[str, Path]:
         vtt_path = run_dir / f"{stem}.vtt"
         vtt_path.write_text(_subtitle(result, vtt=True), encoding="utf-8")
         files["vtt"] = vtt_path
+
+    if result.summary:
+        summary_path = run_dir / f"{stem}.summary.txt"
+        summary_path.write_text(result.summary + "\n", encoding="utf-8")
+        files["summary"] = summary_path
+    if result.chapters:
+        chapters_path = run_dir / f"{stem}.chapters.txt"
+        chapter_lines = [
+            f"{_timestamp(chapter['start'])} {_timestamp(chapter['end'])} {chapter['title']}"
+            for chapter in result.chapters
+        ]
+        chapters_path.write_text("\n".join(chapter_lines) + "\n", encoding="utf-8")
+        files["chapters"] = chapters_path
     return files
 
 
 def write_bundle(results: list[TranscriptResult], run_dir: Path) -> Path:
+    """Zip transcript artifacts only — never scratch dirs like `.work` or `.youtube`."""
+
     manifest = run_dir / "manifest.json"
     manifest.write_text(
         json.dumps([result.to_dict() for result in results], ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    archive = shutil.make_archive(str(run_dir), "zip", root_dir=run_dir)
-    return Path(archive)
+    archive_path = Path(f"{run_dir}.zip")
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(run_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(run_dir)
+            if any(part in SCRATCH_DIR_NAMES for part in relative.parts):
+                continue
+            archive.write(path, arcname=relative.as_posix())
+    return archive_path
 
 
 def readable_summary(result: TranscriptResult) -> str:

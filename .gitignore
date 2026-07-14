@@ -19,3 +19,6 @@ logs/
 *_transcription.srt
 *_transcription.csv
 .cursor/hooks/state/continual-learning.json
+.cursor/hooks/state/continual-learning-index.json
+.pytest-tmp2
+.pytest-tmp3

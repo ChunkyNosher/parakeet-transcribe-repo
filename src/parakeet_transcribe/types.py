@@ -27,6 +27,7 @@ class WordTimestamp:
     text: str
     start: float
     end: float
+    speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class Segment:
     text: str
     start: float
     end: float
+    speaker: str | None = None
 
 
 @dataclass
@@ -48,6 +50,8 @@ class TranscriptResult:
     segments: list[Segment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     runtime: dict[str, Any] = field(default_factory=dict)
+    summary: str | None = None
+    chapters: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_timestamps(self) -> bool:
