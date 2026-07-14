@@ -1,49 +1,59 @@
+from types import SimpleNamespace
+
 import pytest
 
 from parakeet_transcribe.backend import (
     _extract_language,
-    _words_from_timestamp_payload,
+    _words_from_nemo_word_timestamps,
+    capitalize_key_phrases,
+    chunk_result_from_hypothesis,
     is_triton_compiler_error,
+    parse_key_phrases,
     raise_if_triton_compiler_error,
 )
 from parakeet_transcribe.types import TranscriptionError
 
 
-def test_tdt_token_spans_align_to_visible_words() -> None:
+def test_nemo_word_timestamps_map_directly() -> None:
     payload = [
-        {"token": "W", "start": 0.32, "end": 0.40},
-        {"token": "ell", "start": 0.40, "end": 0.56},
-        {"token": ",", "start": 0.56, "end": 0.56},
-        {"token": "I", "start": 0.64, "end": 0.80},
-        {"token": "don", "start": 0.80, "end": 0.96},
-        {"token": "'t", "start": 0.96, "end": 1.04},
+        {"word": "Hello", "start": 0.0, "end": 0.4},
+        {"word": "world.", "start": 0.45, "end": 0.9},
     ]
-    words = _words_from_timestamp_payload(payload, "Well, I don't")
+    words = _words_from_nemo_word_timestamps(payload)
     assert [(word.text, word.start, word.end) for word in words] == [
-        ("Well,", 0.32, 0.56),
-        ("I", 0.64, 0.80),
-        ("don't", 0.80, 1.04),
+        ("Hello", 0.0, 0.4),
+        ("world.", 0.45, 0.9),
     ]
 
 
-def test_tdt_space_prefixed_tokens_align_to_visible_words() -> None:
-    payload = [
-        {"token": "W", "start": 0.96, "end": 1.12},
-        {"token": "hat", "start": 1.12, "end": 1.28},
-        {"token": " are", "start": 1.28, "end": 1.44},
-        {"token": " you", "start": 1.44, "end": 1.52},
-        {"token": "?", "start": 1.52, "end": 1.52},
-    ]
-    words = _words_from_timestamp_payload(payload, "What are you?")
-    assert [(word.text, word.start, word.end) for word in words] == [
-        ("What", 0.96, 1.28),
-        ("are", 1.28, 1.44),
-        ("you?", 1.44, 1.52),
-    ]
+def test_nemo_timestamp_dict_word_key() -> None:
+    payload = {"word": [{"word": "Hi", "start": 1.0, "end": 1.2}]}
+    words = _words_from_nemo_word_timestamps(payload)
+    assert words[0].text == "Hi"
+
+
+def test_chunk_result_requires_timestamps_when_expected() -> None:
+    hyp = SimpleNamespace(text="hello", timestamp={"word": []})
+    with pytest.raises(TranscriptionError, match="no usable word timestamps"):
+        chunk_result_from_hypothesis(hyp, expect_timestamps=True)
+
+
+def test_chunk_result_untimed_ok() -> None:
+    hyp = SimpleNamespace(text="hello <en-US>", timestamp=None)
+    result = chunk_result_from_hypothesis(hyp, expect_timestamps=False)
+    assert result.text == "hello"
+    assert result.detected_language == "en-US"
+    assert result.words == []
 
 
 def test_language_tag_is_removed_from_nemotron_transcript() -> None:
     assert _extract_language("Bonjour tout le monde. <fr-FR>") == ("Bonjour tout le monde.", "fr-FR")
+
+
+def test_parse_key_phrases_title_cases() -> None:
+    assert parse_key_phrases("acmeCorp, GPU\nnvidia") == ["Acmecorp", "GPU", "Nvidia"]
+    assert capitalize_key_phrases(["already Title"]) == ["Already Title"]
+    assert parse_key_phrases("  ") == []
 
 
 def test_triton_compiler_error_is_detected() -> None:
@@ -58,3 +68,27 @@ def test_triton_compiler_error_becomes_transcription_error() -> None:
     error = RuntimeError("Failed to find C compiler. Please specify via CC")
     with pytest.raises(TranscriptionError, match="build-essential"):
         raise_if_triton_compiler_error(error)
+
+
+def test_configure_decoding_applies_gpu_pb_phrases() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    backend = NeMoASRBackend(PARAKEET_V3)
+    captured: dict = {}
+
+    class FakeModel:
+        cfg = SimpleNamespace(decoding=OmegaConf.create({"strategy": "greedy", "greedy": {}}))
+
+        def change_decoding_strategy(self, cfg) -> None:
+            captured["cfg"] = cfg
+
+    backend.model = FakeModel()
+    backend.configure_decoding(["acme"], boost_alpha=1.5)
+    cfg = captured["cfg"]
+    assert cfg.strategy == "greedy_batch"
+    assert cfg.greedy.use_cuda_graph_decoder is True
+    assert cfg.greedy.boosting_tree_alpha == 1.5
+    assert list(cfg.greedy.boosting_tree.key_phrases_list) == ["Acme"]

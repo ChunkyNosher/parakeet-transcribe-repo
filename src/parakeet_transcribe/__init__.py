@@ -1,11 +1,11 @@
-"""NVIDIA-only local transcription application."""
+"""NVIDIA NeMo local transcription application (Docker Linux GPU)."""
 
 import os
 from pathlib import Path
 
 __version__ = "1.0.0"
 
-# Configure this before Transformers/Hugging Face is imported. Native Windows
+# Configure HF cache before NeMo / Hugging Face downloads. Native Windows
 # environments commonly deny writes to the inherited user-level cache.
 APP_ROOT = Path(__file__).resolve().parents[2]
 HF_HOME = APP_ROOT / "model_cache" / "huggingface"

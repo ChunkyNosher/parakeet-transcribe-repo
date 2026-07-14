@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Persist BuildKit layer + mount caches across rebuilds (NeMo/uv are expensive).
+      # Requires Docker BuildKit (default on Docker Desktop). First build creates the dir.
+      cache_from:
+        - type=local,src=./docker-data/build-cache
+      cache_to:
+        - type=local,dest=./docker-data/build-cache,mode=max
     image: parakeet-transcribe:local
     ports:
       - "127.0.0.1:7860:7860"

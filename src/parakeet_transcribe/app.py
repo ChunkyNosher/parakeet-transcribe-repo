@@ -4,6 +4,7 @@ from threading import Event
 
 import gradio as gr
 
+from .backend import parse_key_phrases
 from .diagnostics import doctor_report
 from .exports import create_run_directory, readable_summary, write_bundle, write_result
 from .models import DEFAULT_MODEL_KEY, MODELS, get_model
@@ -27,6 +28,7 @@ def _model_details(model_key: str) -> str:
     )
     return (
         f"**{spec.model_id}**  \n"
+        f"Backend: NVIDIA NeMo (Docker Linux GPU)  \n"
         f"Languages: {spec.capabilities.supported_languages}; automatic detection: "
         f"{'yes' if spec.capabilities.automatic_language_detection else 'no'}  \n"
         f"Timestamp exports: {timestamp}"
@@ -57,6 +59,8 @@ def _publish_results(results, run_dir) -> tuple[str, str, str | None, str | None
             status_parts.append(f"- Summary ready for {result.source_name}")
         if any(segment.speaker for segment in result.segments):
             status_parts.append(f"- Speaker labels attached for {result.source_name}")
+        if result.runtime.get("key_phrase_count"):
+            status_parts.append(f"- Keyterm boosting applied ({result.runtime['key_phrase_count']} phrases)")
     status = "\n".join(status_parts)
     first = artifacts[0]
     return (
@@ -74,6 +78,8 @@ def _run_files(
     model_key: str,
     language: str,
     batch_size: int,
+    keyterms: str,
+    boost_alpha: float,
     diarize: bool,
     summarize: bool,
     redact_pii: bool,
@@ -88,6 +94,8 @@ def _run_files(
             model_key=model_key,
             language=language.strip() or "auto",
             batch_size=int(batch_size),
+            key_phrases=parse_key_phrases(keyterms),
+            boost_alpha=float(boost_alpha),
             work_dir=run_dir,
             progress=lambda fraction, description: progress(fraction, desc=description),
             cancel=CANCEL_REQUESTED.is_set,
@@ -110,6 +118,8 @@ def _run_youtube(
     model_key: str,
     language: str,
     batch_size: int,
+    keyterms: str,
+    boost_alpha: float,
     diarize: bool,
     summarize: bool,
     redact_pii: bool,
@@ -124,6 +134,8 @@ def _run_youtube(
             model_key=model_key,
             language=language.strip() or "auto",
             batch_size=int(batch_size),
+            key_phrases=parse_key_phrases(keyterms),
+            boost_alpha=float(boost_alpha),
             work_dir=run_dir,
             progress=lambda fraction, description: progress(fraction, desc=description),
             cancel=CANCEL_REQUESTED.is_set,
@@ -145,7 +157,9 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="Parakeet Transcribe") as app:
         gr.Markdown(
             "# Parakeet Transcribe\n"
-            "Local Windows file transcription with NVIDIA ASR checkpoints. Models download once and then run from the local cache."
+            "Local file transcription with **NVIDIA NeMo** (Parakeet / Nemotron). "
+            "Supported runtime: Docker Compose Linux GPU container. "
+            "Models download once into the mounted cache."
         )
         with gr.Accordion("System diagnostics", open=False):
             diagnostics = gr.Markdown(_system_details())
@@ -171,15 +185,31 @@ def build_app() -> gr.Blocks:
                 language = gr.Textbox(
                     value="auto",
                     label="Language",
-                    info="Use auto, or a locale such as en-US or de-DE for Nemotron.",
+                    info="Use auto, or a locale such as en-US or de-DE when the model supports language hints.",
+                )
+                keyterms = gr.Textbox(
+                    label="Keyterms (GPU-PB phrase boosting)",
+                    lines=3,
+                    placeholder="ProperNoun\nAcronym\nmulti word phrase",
+                    info="One phrase per line (or comma-separated). Applied via NeMo GPU-PB shallow fusion. "
+                    "Phrases are Title-Cased for Parakeet; leave empty to disable.",
+                )
+                boost_alpha = gr.Slider(
+                    0.0,
+                    5.0,
+                    value=1.0,
+                    step=0.1,
+                    label="Keyterm boost strength",
+                    info="NeMo boosting_tree_alpha. Higher biases harder toward listed phrases.",
                 )
                 batch_size = gr.Slider(
                     1,
                     MAX_BATCH_SIZE,
                     value=2,
                     step=1,
-                    label="Chunk batch size",
-                    info=f"Higher uses more VRAM (max {MAX_BATCH_SIZE}). Leave the model loaded between files for best throughput.",
+                    label="Chunk batch size (OOM fallback)",
+                    info=f"Used when long-form local attention OOMs and the app falls back to chunking "
+                    f"(max {MAX_BATCH_SIZE}). Leave the model loaded between files for best throughput.",
                 )
                 diarize = gr.Checkbox(
                     label="Speaker diarization (local MFCC clustering)",
@@ -209,7 +239,18 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     srt_file = gr.File(label="First file SRT")
                     vtt_file = gr.File(label="First file VTT")
-        option_inputs = [files, model, language, batch_size, diarize, summarize, redact_pii, clean_format]
+        option_inputs = [
+            files,
+            model,
+            language,
+            batch_size,
+            keyterms,
+            boost_alpha,
+            diarize,
+            summarize,
+            redact_pii,
+            clean_format,
+        ]
         file_event = run.click(
             _run_files,
             inputs=option_inputs,
@@ -217,12 +258,25 @@ def build_app() -> gr.Blocks:
         )
         youtube_event = run_youtube.click(
             _run_youtube,
-            inputs=[youtube_url, model, language, batch_size, diarize, summarize, redact_pii, clean_format],
+            inputs=[
+                youtube_url,
+                model,
+                language,
+                batch_size,
+                keyterms,
+                boost_alpha,
+                diarize,
+                summarize,
+                redact_pii,
+                clean_format,
+            ],
             outputs=[status, transcript, bundle, json_file, srt_file, vtt_file],
         )
         cancel.click(_request_cancel, outputs=unload_status, cancels=[file_event, youtube_event], queue=False)
         gr.Markdown(
-            "Parakeet supplies timestamped subtitles. Nemotron is offered for broader language coverage but deliberately does not "
-            "produce fabricated SRT or VTT timing. Optional extras (diarization, summary, PII redaction) run locally after ASR."
+            "NeMo enables long-form local attention, greedy CUDA-graph decoding, and optional GPU-PB keyterms. "
+            "Parakeet supplies timestamped subtitles. Nemotron is offered for broader language coverage but "
+            "does not fabricate SRT/VTT timing. Live microphone streaming, Riva/NIM, and cloud ASR wrappers "
+            "remain out of scope. Optional extras (diarization, summary, PII redaction) run locally after ASR."
         )
     return app.queue(default_concurrency_limit=1)

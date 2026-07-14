@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from parakeet_transcribe.diagnostics import _linux_triton_compiler_ready
+from parakeet_transcribe.diagnostics import _linux_triton_compiler_ready, inference_runtime_supported
 
 
 def test_linux_triton_compiler_ok_when_gcc_on_path(monkeypatch) -> None:
@@ -44,3 +44,18 @@ def test_non_linux_skips_triton_compiler_check(monkeypatch) -> None:
     ok, line = _linux_triton_compiler_ready()
     assert ok
     assert line == ""
+
+
+def test_windows_inference_requires_docker(monkeypatch) -> None:
+    monkeypatch.setattr("parakeet_transcribe.diagnostics.sys.platform", "win32")
+    monkeypatch.delenv("PARAKEET_ALLOW_NATIVE_WINDOWS", raising=False)
+    ok, line = inference_runtime_supported()
+    assert not ok
+    assert "Docker Compose" in line
+
+
+def test_linux_inference_platform_ok(monkeypatch) -> None:
+    monkeypatch.setattr("parakeet_transcribe.diagnostics.sys.platform", "linux")
+    ok, line = inference_runtime_supported()
+    assert ok
+    assert "linux" in line

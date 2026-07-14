@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .backend import TransformersASRBackend, is_cuda_oom, max_new_tokens_for_audio
+import numpy as np
+import soundfile as sf
+
+from .backend import NeMoASRBackend, is_cuda_oom, parse_key_phrases
 from .chunking import merge_text, merge_words, segments_from_words, split_audio
 from .diarization import diarize_transcript
 from .media import prepare_audio
@@ -30,12 +32,18 @@ def _not_cancelled() -> bool:
     return False
 
 
+def _write_chunk_wav(path: Path, samples: np.ndarray, sample_rate: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), samples, sample_rate, subtype="FLOAT")
+    return path
+
+
 class TranscriptionService:
     def __init__(self, cache_dir: Path = Path("model_cache/huggingface")) -> None:
         self.cache_dir = cache_dir.resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(self.cache_dir))
-        self._backend: TransformersASRBackend | None = None
+        self._backend: NeMoASRBackend | None = None
         self._model_key: str | None = None
 
     def unload(self) -> str:
@@ -46,20 +54,23 @@ class TranscriptionService:
         self._model_key = None
         return "Model unloaded and CUDA cache released."
 
-    def _get_backend(self, model_key: str) -> TransformersASRBackend:
+    def _get_backend(self, model_key: str) -> NeMoASRBackend:
         if self._backend is not None and self._model_key == model_key:
             return self._backend
         self.unload()
-        self._backend = TransformersASRBackend(get_model(model_key))
+        self._backend = NeMoASRBackend(get_model(model_key))
         self._model_key = model_key
         return self._backend
 
     def _transcribe_chunk_groups(
         self,
-        backend: TransformersASRBackend,
+        backend: NeMoASRBackend,
         chunks: Sequence[Any],
         batch_size: int,
-        language: str,
+        *,
+        timestamps: bool,
+        sample_rate: int,
+        chunk_dir: Path,
         progress: ProgressCallback,
         cancel: CancelCheck,
         progress_base: float,
@@ -68,93 +79,140 @@ class TranscriptionService:
         results: list[ChunkResult] = []
         total = len(chunks)
         groups = [chunks[index : index + batch_size] for index in range(0, total, batch_size)]
-        if not groups:
-            return results
-
-        def prepare(group: Sequence[Any]) -> tuple[Any, int]:
-            audio = [chunk.samples for chunk in group]
-            return backend.prepare_inputs(audio, language=language), max_new_tokens_for_audio(audio)
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending: Future[tuple[Any, int]] | None = pool.submit(prepare, groups[0])
-            chunk_offset = 0
-            for group_index, group in enumerate(groups):
-                if cancel():
-                    raise CancelledError("Transcription cancelled before publishing outputs.")
-                progress(
-                    progress_base + progress_span * chunk_offset / max(total, 1),
-                    f"Transcribing chunk {chunk_offset + 1}/{total}",
+        chunk_offset = 0
+        for group in groups:
+            if cancel():
+                raise CancelledError("Transcription cancelled before publishing outputs.")
+            progress(
+                progress_base + progress_span * chunk_offset / max(total, 1),
+                f"Transcribing chunk {chunk_offset + 1}/{total}",
+            )
+            paths: list[Path] = []
+            for local_index, chunk in enumerate(group):
+                path = chunk_dir / f"chunk-{chunk_offset + local_index:05d}.wav"
+                _write_chunk_wav(path, chunk.samples, sample_rate)
+                paths.append(path)
+            try:
+                results.extend(
+                    backend.transcribe_paths(
+                        paths,
+                        timestamps=timestamps,
+                        batch_size=len(paths),
+                    )
                 )
-                assert pending is not None
-                inputs, token_budget = pending.result()
-                if group_index + 1 < len(groups):
-                    pending = pool.submit(prepare, groups[group_index + 1])
-                else:
-                    pending = None
-                try:
-                    results.extend(backend.generate_from_inputs(inputs, max_new_tokens=token_budget))
-                except Exception as exc:
-                    if is_cuda_oom(exc):
-                        raise TranscriptionError("CUDA out of memory") from exc
-                    raise
-                chunk_offset += len(group)
+            except Exception as exc:
+                if is_cuda_oom(exc):
+                    raise TranscriptionError("CUDA out of memory") from exc
+                raise
+            chunk_offset += len(group)
         return results
 
     def _transcribe_prepared(
         self,
-        backend: TransformersASRBackend,
+        backend: NeMoASRBackend,
         prepared: Any,
         *,
         batch_size: int,
         language: str,
+        key_phrases: Sequence[str],
+        boost_alpha: float,
         progress: ProgressCallback,
         cancel: CancelCheck,
         progress_base: float,
         progress_span: float,
+        work_dir: Path,
         diarize: bool = False,
         summarize: bool = False,
         redact_pii: bool = False,
         clean_format: bool = False,
     ) -> TranscriptResult:
+        del language  # NeMo Parakeet auto-detects; Nemotron language prompting is model-specific.
         warnings: list[str] = []
-        # Prefer shorter chunks with the requested batch for higher GPU occupancy; fall back under OOM.
-        attempts = ((60, batch_size), (120, max(1, batch_size // 2)), (60, 1), (30, 1))
-        error: Exception | None = None
+        timestamps = backend.spec.capabilities.timestamps
+        backend.configure_decoding(key_phrases, boost_alpha)
+
         chunk_results: list[ChunkResult] = []
         chunks: list[Any] = []
-        for attempt_index, (chunk_seconds, effective_batch) in enumerate(attempts):
-            chunks = split_audio(
-                prepared.samples, prepared.sample_rate, prepared.source_path.name, chunk_seconds=chunk_seconds
-            )
-            try:
-                chunk_results = self._transcribe_chunk_groups(
-                    backend,
-                    chunks,
-                    effective_batch,
-                    language,
-                    progress,
-                    cancel,
-                    progress_base,
-                    progress_span * 0.9,
-                )
-                if attempt_index:
-                    warnings.append(
-                        f"Recovered from CUDA memory pressure using {chunk_seconds}s chunks and batch size {effective_batch}."
-                    )
-                break
-            except TranscriptionError as exc:
-                error = exc
-                if str(exc) != "CUDA out of memory" or attempt_index == len(attempts) - 1:
-                    raise
-        else:  # pragma: no cover - defensive
-            raise error or TranscriptionError("Transcription did not return a result.")
+        used_chunking = False
 
-        text = ""
-        language_result: str | None = None
-        for item in chunk_results:
-            text = merge_text(text, item.text)
-            language_result = language_result or item.detected_language
-        words = merge_words((chunk, result.words) for chunk, result in zip(chunks, chunk_results, strict=True))
+        if cancel():
+            raise CancelledError("Transcription cancelled before publishing outputs.")
+        progress(progress_base, f"Transcribing {prepared.source_path.name} (NeMo long-form)")
+        try:
+            chunk_results = backend.transcribe_paths(
+                [prepared.canonical_path],
+                timestamps=timestamps,
+                batch_size=1,
+            )
+        except TranscriptionError as exc:
+            if str(exc) != "CUDA out of memory":
+                raise
+            used_chunking = True
+            warnings.append(
+                "Full-file NeMo long-form hit CUDA memory pressure; falling back to chunked transcription."
+            )
+        except Exception as exc:
+            if not is_cuda_oom(exc):
+                raise
+            used_chunking = True
+            warnings.append(
+                "Full-file NeMo long-form hit CUDA memory pressure; falling back to chunked transcription."
+            )
+        else:
+            if not chunk_results:
+                raise TranscriptionError(f"{prepared.source_path.name} produced an empty transcript.")
+
+        if used_chunking:
+            attempts = ((60, batch_size), (120, max(1, batch_size // 2)), (60, 1), (30, 1))
+            error: Exception | None = None
+            chunk_dir = work_dir / "chunks"
+            for attempt_index, (chunk_seconds, effective_batch) in enumerate(attempts):
+                chunks = split_audio(
+                    prepared.samples,
+                    prepared.sample_rate,
+                    prepared.source_path.name,
+                    chunk_seconds=chunk_seconds,
+                )
+                try:
+                    chunk_results = self._transcribe_chunk_groups(
+                        backend,
+                        chunks,
+                        effective_batch,
+                        timestamps=timestamps,
+                        sample_rate=prepared.sample_rate,
+                        chunk_dir=chunk_dir,
+                        progress=progress,
+                        cancel=cancel,
+                        progress_base=progress_base,
+                        progress_span=progress_span * 0.9,
+                    )
+                    if attempt_index or used_chunking:
+                        warnings.append(
+                            f"Recovered using {chunk_seconds}s chunks and batch size {effective_batch}."
+                        )
+                    break
+                except TranscriptionError as exc:
+                    error = exc
+                    if str(exc) != "CUDA out of memory" or attempt_index == len(attempts) - 1:
+                        raise
+            else:  # pragma: no cover - defensive
+                raise error or TranscriptionError("Transcription did not return a result.")
+
+        if used_chunking and chunks:
+            text = ""
+            language_result: str | None = None
+            for item in chunk_results:
+                text = merge_text(text, item.text)
+                language_result = language_result or item.detected_language
+            words = merge_words(
+                (chunk, result.words) for chunk, result in zip(chunks, chunk_results, strict=True)
+            )
+        else:
+            first = chunk_results[0]
+            text = first.text
+            language_result = first.detected_language
+            words = list(first.words)
+
         if not text:
             raise TranscriptionError(f"{prepared.source_path.name} produced an empty transcript.")
         result = TranscriptResult(
@@ -167,6 +225,12 @@ class TranscriptionService:
             words=words,
             segments=segments_from_words(words),
             warnings=warnings,
+            runtime={
+                "backend": "nemo",
+                "longform_attention": not used_chunking,
+                "key_phrase_count": len(list(key_phrases)),
+                "boost_alpha": float(boost_alpha),
+            },
         )
         if diarize:
             progress(progress_base + progress_span * 0.92, "Running local speaker diarization")
@@ -188,6 +252,8 @@ class TranscriptionService:
         model_key: str,
         language: str = "auto",
         batch_size: int = 1,
+        key_phrases: Sequence[str] | str | None = None,
+        boost_alpha: float = 1.0,
         work_dir: Path,
         progress: ProgressCallback | None = None,
         cancel: CancelCheck | None = None,
@@ -200,9 +266,11 @@ class TranscriptionService:
             raise TranscriptionError("Upload at least one audio or video file.")
         if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
             raise TranscriptionError(f"Batch size must be between 1 and {MAX_BATCH_SIZE}.")
-        spec = get_model(model_key)
-        if not spec.capabilities.timestamps and language == "":
-            language = "auto"
+        phrases = (
+            parse_key_phrases(key_phrases)
+            if isinstance(key_phrases, str) or key_phrases is None
+            else list(key_phrases)
+        )
         progress = progress or _noop_progress
         cancel = cancel or _not_cancelled
         backend = self._get_backend(model_key)
@@ -221,10 +289,13 @@ class TranscriptionService:
                 prepared,
                 batch_size=batch_size,
                 language=language or "auto",
+                key_phrases=phrases,
+                boost_alpha=float(boost_alpha),
                 progress=progress,
                 cancel=cancel,
                 progress_base=base,
                 progress_span=span,
+                work_dir=media_dir / str(index),
                 diarize=diarize,
                 summarize=summarize,
                 redact_pii=redact_pii,
@@ -247,6 +318,8 @@ class TranscriptionService:
         model_key: str,
         language: str = "auto",
         batch_size: int = 1,
+        key_phrases: Sequence[str] | str | None = None,
+        boost_alpha: float = 1.0,
         work_dir: Path,
         progress: ProgressCallback | None = None,
         cancel: CancelCheck | None = None,
@@ -268,6 +341,8 @@ class TranscriptionService:
             model_key=model_key,
             language=language,
             batch_size=batch_size,
+            key_phrases=key_phrases,
+            boost_alpha=boost_alpha,
             work_dir=work_dir,
             progress=progress,
             cancel=cancel,

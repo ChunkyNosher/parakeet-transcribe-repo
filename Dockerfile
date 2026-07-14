@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -7,8 +9,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_NO_MANAGED_PYTHON=1 \
     PATH="/app/.venv/bin:${PATH}"
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ffmpeg build-essential \
+# Apt caches persist across builds via BuildKit cache mounts (Compose local cache).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y \
+        ffmpeg \
+        build-essential \
+        libsndfile1 \
+        libsox-dev \
+        sox \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /bin/

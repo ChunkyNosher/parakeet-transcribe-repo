@@ -5,7 +5,12 @@
 .uv-python/
 .pytest_cache/
 .pytest-tmp/
+.pytest-tmp-nemo/
+.pytest-tmp2/
+.pytest-tmp3/
 .ruff_cache/
+.cursor/
+agent-artifacts/
 model_cache/
 local_models/
 outputs/
@@ -14,3 +19,5 @@ logs/
 transcription-logs/
 __pycache__/
 *.pyc
+*.md
+!README.md

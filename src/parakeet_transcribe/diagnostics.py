@@ -6,6 +6,23 @@ import sys
 from pathlib import Path
 
 
+def inference_runtime_supported() -> tuple[bool, str]:
+    """Inference is supported in Linux environments (Docker Compose GPU container)."""
+
+    if sys.platform == "win32" and os.environ.get("PARAKEET_ALLOW_NATIVE_WINDOWS", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return (
+            False,
+            "- ACTION Native Windows inference is not supported. Use Docker Compose "
+            "(`docker compose up --build`) for the NeMo Linux GPU runtime.",
+        )
+    return True, f"- OK inference platform: {sys.platform}"
+
+
 def _linux_triton_compiler_ready() -> tuple[bool, str]:
     """Linux torch pulls Triton, which JIT-builds helpers and needs a C compiler."""
 
@@ -32,28 +49,45 @@ def _linux_triton_compiler_ready() -> tuple[bool, str]:
 def doctor_report() -> tuple[bool, str]:
     lines: list[str] = ["# Parakeet Transcribe diagnostics", ""]
     ready = True
+
+    platform_ok, platform_line = inference_runtime_supported()
+    lines.append(platform_line)
+    ready = ready and platform_ok
+
     for tool in ("ffmpeg", "ffprobe"):
         found = shutil.which(tool)
         lines.append(f"- {'OK' if found else 'MISSING'} {tool}: {found or 'not on PATH'}")
         ready = ready and found is not None
-    try:
-        import torch
 
-        cuda = torch.cuda.is_available()
-        lines.append(f"- {'OK' if cuda else 'MISSING'} Torch: {torch.__version__}")
-        lines.append(f"- {'OK' if cuda else 'MISSING'} CUDA build: {torch.version.cuda or 'CPU-only'}")
-        if cuda:
-            lines.append(f"- OK GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            lines.append("- ACTION Install the CUDA PyTorch wheel with `uv sync` from this project.")
-        ready = ready and cuda
-    except ImportError:
-        lines.append("- MISSING Torch: run `uv sync`")
-        ready = False
-    compiler_ok, compiler_line = _linux_triton_compiler_ready()
-    if compiler_line:
-        lines.append(compiler_line)
-    ready = ready and compiler_ok
+    if sys.platform == "linux":
+        try:
+            import nemo.collections.asr as nemo_asr  # noqa: F401
+
+            lines.append("- OK NeMo ASR import")
+        except ImportError:
+            lines.append("- MISSING NeMo ASR: rebuild the Docker image (`uv sync` with nemo_toolkit[asr])")
+            ready = False
+        try:
+            import torch
+
+            cuda = torch.cuda.is_available()
+            lines.append(f"- {'OK' if cuda else 'MISSING'} Torch: {torch.__version__}")
+            lines.append(f"- {'OK' if cuda else 'MISSING'} CUDA build: {torch.version.cuda or 'CPU-only'}")
+            if cuda:
+                lines.append(f"- OK GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                lines.append("- ACTION CUDA is required inside the Linux GPU container.")
+            ready = ready and cuda
+        except ImportError:
+            lines.append("- MISSING Torch: rebuild the Docker image so NeMo/PyTorch install correctly.")
+            ready = False
+        compiler_ok, compiler_line = _linux_triton_compiler_ready()
+        if compiler_line:
+            lines.append(compiler_line)
+        ready = ready and compiler_ok
+    else:
+        lines.append("- SKIP NeMo/CUDA checks on this host (inference runs in Docker).")
+
     cache = Path("model_cache/huggingface")
     try:
         cache.mkdir(parents=True, exist_ok=True)

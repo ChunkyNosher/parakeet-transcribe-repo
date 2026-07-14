@@ -22,3 +22,4 @@ logs/
 .cursor/hooks/state/continual-learning-index.json
 .pytest-tmp2
 .pytest-tmp3
+.pytest-tmp*
