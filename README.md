@@ -7,7 +7,13 @@ Local file transcription for Windows using NVIDIA ASR checkpoints only.
 - **NVIDIA Parakeet TDT 0.6B v3** is the default: 25 European languages, automatic language detection, punctuation, and word/segment timestamps.
 - **NVIDIA Nemotron 3.5 ASR Streaming 0.6B** is optional: broader language coverage and automatic language detection, but no timestamped subtitle exports.
 
-This is an offline file-transcription app. It intentionally does not ship NeMo, diarization, translation, Riva/NIM, or live microphone streaming.
+This is a local transcription app. It intentionally does not ship NeMo, diarization, translation, Riva/NIM, or live microphone streaming.
+
+## Media and YouTube input
+
+The file picker accepts any uploaded file. FFmpeg determines whether it contains a decodable audio stream, then converts it to canonical mono 16 kHz audio. This covers common containers and codecs including M4A/AAC, MP3, WAV, FLAC, OGG, MP4, MOV, MKV, AVI, and WebM, plus any other format supported by the installed FFmpeg build.
+
+Paste one YouTube video URL into **YouTube video URL** and choose **Transcribe YouTube** to download its best available audio stream and run it through the same local NVIDIA ASR pipeline. It does not process playlists. Make sure you have permission to download and transcribe the video, and note that YouTube may occasionally require an updated `yt-dlp` dependency when it changes its delivery mechanisms.
 
 ## Setup
 
@@ -32,7 +38,7 @@ uv run ruff check .
 
 ## Docker Compose
 
-Docker Desktop on Windows must be configured for Linux containers with NVIDIA GPU support. The Compose service reserves one GPU, publishes Gradio only to `127.0.0.1:7860`, and stores downloads plus generated files under `docker-data/` on the host.
+Docker Desktop on Windows must be configured for Linux containers with NVIDIA GPU support. The Compose service reserves one GPU, publishes Gradio only to `127.0.0.1:7860`, and stores downloads plus generated files under `docker-data/` on the host. The image installs `build-essential` because Linux PyTorch pulls Triton, which needs a C compiler to JIT-build CUDA helpers at inference time.
 
 ```powershell
 docker compose up --build

@@ -11,6 +11,7 @@ from .chunking import merge_text, merge_words, segments_from_words, split_audio
 from .media import prepare_audio
 from .models import get_model
 from .types import CancelledError, ChunkResult, TranscriptionError, TranscriptResult
+from .youtube import download_youtube_audio
 
 ProgressCallback = Callable[[float, str], None]
 CancelCheck = Callable[[], bool]
@@ -187,4 +188,37 @@ class TranscriptionService:
             }
             results.append(result)
         progress(1.0, "Finalizing downloads")
+        return results
+
+    def transcribe_youtube(
+        self,
+        url: str,
+        *,
+        model_key: str,
+        language: str = "auto",
+        batch_size: int = 1,
+        work_dir: Path,
+        progress: ProgressCallback | None = None,
+        cancel: CancelCheck | None = None,
+    ) -> list[TranscriptResult]:
+        progress = progress or _noop_progress
+        cancel = cancel or _not_cancelled
+        if cancel():
+            raise CancelledError("Transcription cancelled before downloading YouTube audio.")
+        progress(0.0, "Downloading YouTube audio")
+        download = download_youtube_audio(url, work_dir / ".youtube")
+        if cancel():
+            raise CancelledError("Transcription cancelled after downloading YouTube audio.")
+        results = self.transcribe_files(
+            [str(download.path)],
+            model_key=model_key,
+            language=language,
+            batch_size=batch_size,
+            work_dir=work_dir,
+            progress=progress,
+            cancel=cancel,
+        )
+        result = results[0]
+        result.source_name = download.source_name
+        result.runtime.update({"source_type": "youtube", "source_url": download.webpage_url})
         return results

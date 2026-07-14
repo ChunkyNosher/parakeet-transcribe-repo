@@ -12,8 +12,10 @@ transcription-logs/
 .uv-python/
 outputs/
 docker-data/
+.docker-compose-runtime/
 logs/
 .vscode/
 *_transcription.txt
 *_transcription.srt
 *_transcription.csv
+.cursor/hooks/state/continual-learning.json

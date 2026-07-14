@@ -12,6 +12,7 @@ dependencies = [
     "soundfile==0.14.0",
     "torch==2.13.0+cu130",
     "transformers==5.13.1",
+    "yt-dlp==2026.6.9",
 ]
 
 [project.optional-dependencies]

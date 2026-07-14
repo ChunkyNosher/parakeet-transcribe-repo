@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ffmpeg \
+    && apt-get install --no-install-recommends -y ffmpeg build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /bin/
@@ -16,10 +16,12 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /bin/
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
 
 EXPOSE 7860
 

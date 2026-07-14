@@ -9,6 +9,12 @@ import numpy as np
 from .types import ChunkResult, ModelSpec, TranscriptionError, WordTimestamp
 
 
+def _token_piece(text: str) -> str:
+    """Normalize tokenizer fragments for alignment (drop SentencePiece markers and spaces)."""
+
+    return text.replace("▁", "").replace("Ġ", "").replace(" ", "")
+
+
 def _torch_runtime() -> Any:
     try:
         import torch
@@ -41,7 +47,7 @@ def _words_from_timestamp_payload(payload: Any, transcript: str) -> list[WordTim
     visible_words = list(re.finditer(r"\S+", transcript))
     if not tokens or not visible_words:
         return []
-    compact_tokens = "".join(token.text.replace("▁", "").replace("Ġ", "") for token in tokens)
+    compact_tokens = "".join(_token_piece(token.text) for token in tokens)
     compact_transcript = "".join(match.group(0) for match in visible_words)
     if compact_tokens != compact_transcript:
         return []
@@ -55,7 +61,11 @@ def _words_from_timestamp_payload(payload: Any, transcript: str) -> list[WordTim
         start = tokens[token_index].start
         end = start
         while consumed < target_length and token_index < len(tokens):
-            token_length = len(tokens[token_index].text.replace("▁", "").replace("Ġ", ""))
+            token_length = len(_token_piece(tokens[token_index].text))
+            if token_length == 0:
+                token_index += 1
+                token_offset = 0
+                continue
             available = token_length - token_offset
             take = min(available, target_length - consumed)
             consumed += take
@@ -103,9 +113,13 @@ class TransformersASRBackend:
             )
         self.device = "cuda"
         dtype = torch.float16
-        self.processor = AutoProcessor.from_pretrained(self.spec.model_id)
-        model_class = AutoModelForTDT if self.spec.model_class == "tdt" else AutoModelForRNNT
-        self.model = model_class.from_pretrained(self.spec.model_id, dtype=dtype).eval().to(self.device)
+        try:
+            self.processor = AutoProcessor.from_pretrained(self.spec.model_id)
+            model_class = AutoModelForTDT if self.spec.model_class == "tdt" else AutoModelForRNNT
+            self.model = model_class.from_pretrained(self.spec.model_id, dtype=dtype).eval().to(self.device)
+        except Exception as exc:
+            raise_if_triton_compiler_error(exc)
+            raise
 
     def unload(self) -> None:
         if self.model is None:
@@ -132,8 +146,12 @@ class TransformersASRBackend:
             processor_kwargs["language"] = language
         inputs = self.processor(list(audio), **processor_kwargs)
         inputs = inputs.to(self.device, dtype=torch.float16)
-        with torch.inference_mode():
-            output = self.model.generate(**inputs, return_dict_in_generate=True)
+        try:
+            with torch.inference_mode():
+                output = self.model.generate(**inputs, return_dict_in_generate=True)
+        except Exception as exc:
+            raise_if_triton_compiler_error(exc)
+            raise
 
         sequences = output.sequences
         durations = getattr(output, "durations", None)
@@ -170,3 +188,17 @@ class TransformersASRBackend:
 
 def is_cuda_oom(error: BaseException) -> bool:
     return "out of memory" in str(error).lower() or "cuda error: out of memory" in str(error).lower()
+
+
+def is_triton_compiler_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "c compiler" in message or "triton.knobs" in message
+
+
+def raise_if_triton_compiler_error(error: BaseException) -> None:
+    if not is_triton_compiler_error(error):
+        return
+    raise TranscriptionError(
+        "Linux PyTorch needs a C compiler for Triton's CUDA helpers. "
+        "Rebuild the Docker image (it installs build-essential) or install gcc and ensure CC points to it."
+    ) from error

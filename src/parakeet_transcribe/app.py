@@ -47,7 +47,23 @@ def _request_cancel() -> str:
     return "Cancellation requested; the active job will stop between chunks."
 
 
-def _run(
+def _publish_results(results, run_dir) -> tuple[str, str, str | None, str | None, str | None, str | None]:
+    artifacts = [write_result(result, run_dir) for result in results]
+    bundle = write_bundle(results, run_dir)
+    transcript = "\n\n".join(f"## {result.source_name}\n\n{result.text}" for result in results)
+    status = "\n".join(f"- {readable_summary(result)}" for result in results)
+    first = artifacts[0]
+    return (
+        status,
+        transcript,
+        str(bundle),
+        str(first["json"]),
+        str(first.get("srt")) if first.get("srt") else None,
+        str(first.get("vtt")) if first.get("vtt") else None,
+    )
+
+
+def _run_files(
     files: list[str] | None,
     model_key: str,
     language: str,
@@ -66,19 +82,35 @@ def _run(
             progress=lambda fraction, description: progress(fraction, desc=description),
             cancel=CANCEL_REQUESTED.is_set,
         )
-        artifacts = [write_result(result, run_dir) for result in results]
-        bundle = write_bundle(results, run_dir)
-        transcript = "\n\n".join(f"## {result.source_name}\n\n{result.text}" for result in results)
-        status = "\n".join(f"- {readable_summary(result)}" for result in results)
-        first = artifacts[0]
-        return (
-            status,
-            transcript,
-            str(bundle),
-            str(first["json"]),
-            str(first.get("srt")) if first.get("srt") else None,
-            str(first.get("vtt")) if first.get("vtt") else None,
+        return _publish_results(results, run_dir)
+    except CancelledError as exc:
+        return str(exc), "", None, None, None, None
+    except TranscriptionError as exc:
+        return f"### Transcription failed\n\n{exc}", "", None, None, None, None
+    except Exception as exc:  # pragma: no cover - defensive UI boundary
+        return f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`", "", None, None, None, None
+
+
+def _run_youtube(
+    url: str,
+    model_key: str,
+    language: str,
+    batch_size: int,
+    progress: gr.Progress = gr.Progress(),  # noqa: B008 - Gradio injects this callback.
+) -> tuple[str, str, str | None, str | None, str | None, str | None]:
+    try:
+        CANCEL_REQUESTED.clear()
+        run_dir = create_run_directory()
+        results = SERVICE.transcribe_youtube(
+            url,
+            model_key=model_key,
+            language=language.strip() or "auto",
+            batch_size=int(batch_size),
+            work_dir=run_dir,
+            progress=lambda fraction, description: progress(fraction, desc=description),
+            cancel=CANCEL_REQUESTED.is_set,
         )
+        return _publish_results(results, run_dir)
     except CancelledError as exc:
         return str(exc), "", None, None, None, None
     except TranscriptionError as exc:
@@ -99,10 +131,17 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=1):
                 files = gr.File(
-                    label="Audio or video files",
+                    label="Audio or video files (any FFmpeg-readable format)",
                     file_count="multiple",
                     type="filepath",
-                    file_types=["audio", "video"],
+                )
+                gr.Markdown(
+                    "FFmpeg validates and decodes uploads, including M4A, MP3, WAV, FLAC, MP4, MKV, and WebM."
+                )
+                youtube_url = gr.Textbox(
+                    label="YouTube video URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    info="Downloads the best available audio stream from one YouTube video, then transcribes it locally.",
                 )
                 model = gr.Dropdown(_model_choices(), value=DEFAULT_MODEL_KEY, label="NVIDIA model")
                 details = gr.Markdown(_model_details(DEFAULT_MODEL_KEY))
@@ -115,6 +154,7 @@ def build_app() -> gr.Blocks:
                 batch_size = gr.Slider(1, 4, value=1, step=1, label="Chunk batch size")
                 with gr.Row():
                     run = gr.Button("Start transcription", variant="primary")
+                    run_youtube = gr.Button("Transcribe YouTube", variant="primary")
                     cancel = gr.Button("Cancel", variant="secondary")
                     unload = gr.Button("Unload model", variant="secondary")
                 unload_status = gr.Markdown("")
@@ -128,12 +168,17 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     srt_file = gr.File(label="First file SRT")
                     vtt_file = gr.File(label="First file VTT")
-        event = run.click(
-            _run,
+        file_event = run.click(
+            _run_files,
             inputs=[files, model, language, batch_size],
             outputs=[status, transcript, bundle, json_file, srt_file, vtt_file],
         )
-        cancel.click(_request_cancel, outputs=unload_status, cancels=[event], queue=False)
+        youtube_event = run_youtube.click(
+            _run_youtube,
+            inputs=[youtube_url, model, language, batch_size],
+            outputs=[status, transcript, bundle, json_file, srt_file, vtt_file],
+        )
+        cancel.click(_request_cancel, outputs=unload_status, cancels=[file_event, youtube_event], queue=False)
         gr.Markdown(
             "Parakeet supplies timestamped subtitles. Nemotron is offered for broader language coverage but deliberately does not "
             "produce fabricated SRT or VTT timing."

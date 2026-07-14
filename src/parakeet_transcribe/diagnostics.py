@@ -1,7 +1,32 @@
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 from pathlib import Path
+
+
+def _linux_triton_compiler_ready() -> tuple[bool, str]:
+    """Linux torch pulls Triton, which JIT-builds helpers and needs a C compiler."""
+
+    if sys.platform != "linux":
+        return True, ""
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return True, ""
+    cc = os.environ.get("CC")
+    if cc and (Path(cc).exists() or shutil.which(cc)):
+        return True, f"- OK Triton C compiler: CC={cc}"
+    for tool in ("gcc", "cc", "clang"):
+        found = shutil.which(tool)
+        if found:
+            return True, f"- OK Triton C compiler: {found}"
+    return (
+        False,
+        "- MISSING Triton C compiler: install build-essential/gcc or set CC "
+        "(required by Linux PyTorch Triton helpers; rebuild the Docker image if using Compose)",
+    )
 
 
 def doctor_report() -> tuple[bool, str]:
@@ -25,6 +50,10 @@ def doctor_report() -> tuple[bool, str]:
     except ImportError:
         lines.append("- MISSING Torch: run `uv sync`")
         ready = False
+    compiler_ok, compiler_line = _linux_triton_compiler_ready()
+    if compiler_line:
+        lines.append(compiler_line)
+    ready = ready and compiler_ok
     cache = Path("model_cache/huggingface")
     try:
         cache.mkdir(parents=True, exist_ok=True)
