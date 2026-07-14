@@ -129,7 +129,7 @@ def merge_words(chunks: Iterable[tuple[AudioChunk, list[WordTimestamp]]]) -> lis
     for chunk, words in chunks:
         for word in words:
             start, end = normalize_word_timing(word.start + chunk.start, word.end + chunk.start)
-            adjusted = WordTimestamp(word.text, start, end, word.speaker)
+            adjusted = WordTimestamp(word.text, start, end, word.speaker, word.confidence)
             if adjusted.end <= chunk.content_start + 0.01 and merged:
                 continue
             if (
@@ -232,7 +232,7 @@ def segments_from_words(
     current: list[WordTimestamp] = []
     for word in words:
         start, end = normalize_word_timing(word.start, word.end, max_word_duration=max_word_duration)
-        timed = WordTimestamp(word.text, start, end, word.speaker)
+        timed = WordTimestamp(word.text, start, end, word.speaker, word.confidence)
 
         if current:
             gap = timed.start - current[-1].end

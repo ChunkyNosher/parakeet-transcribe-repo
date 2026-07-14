@@ -28,6 +28,7 @@ class WordTimestamp:
     start: float
     end: float
     speaker: str | None = None
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)

@@ -50,7 +50,10 @@ def parse_key_phrases(raw: str | None) -> list[str]:
     return capitalize_key_phrases([part.strip() for part in parts if part.strip()])
 
 
-def _words_from_nemo_word_timestamps(payload: Any) -> list[WordTimestamp]:
+def _words_from_nemo_word_timestamps(
+    payload: Any,
+    confidences: Sequence[float] | None = None,
+) -> list[WordTimestamp]:
     """Map NeMo ``timestamps=True`` word entries (start/end in seconds) into WordTimestamp."""
 
     if not payload:
@@ -59,13 +62,21 @@ def _words_from_nemo_word_timestamps(payload: Any) -> list[WordTimestamp]:
     if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes)):
         return []
     words: list[WordTimestamp] = []
-    for item in raw_items:
+    for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             continue
         text = str(item.get("word", item.get("text", item.get("char", "")))).strip()
         start, end = item.get("start"), item.get("end")
         if text and isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start:
-            words.append(WordTimestamp(text, float(start), float(end)))
+            confidence: float | None = None
+            raw_conf = item.get("confidence", item.get("score"))
+            if isinstance(raw_conf, (int, float)):
+                confidence = float(raw_conf)
+            elif confidences is not None and index < len(confidences):
+                value = confidences[index]
+                if isinstance(value, (int, float)):
+                    confidence = float(value)
+            words.append(WordTimestamp(text, float(start), float(end), confidence=confidence))
     return words
 
 
@@ -88,6 +99,16 @@ def _segments_from_nemo_segment_timestamps(payload: Any) -> list[Segment]:
     return segments
 
 
+def _hypothesis_word_confidences(hypothesis: Any) -> list[float] | None:
+    raw = getattr(hypothesis, "word_confidence", None)
+    if raw is None:
+        return None
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        values = [float(value) for value in raw if isinstance(value, (int, float))]
+        return values or None
+    return None
+
+
 def chunk_result_from_hypothesis(hypothesis: Any, *, expect_timestamps: bool) -> ChunkResult:
     text = str(getattr(hypothesis, "text", hypothesis) or "").strip()
     text, detected_language = _extract_language(text)
@@ -95,7 +116,7 @@ def chunk_result_from_hypothesis(hypothesis: Any, *, expect_timestamps: bool) ->
     segments: list[Segment] = []
     if expect_timestamps:
         timestamp = getattr(hypothesis, "timestamp", None)
-        words = _words_from_nemo_word_timestamps(timestamp)
+        words = _words_from_nemo_word_timestamps(timestamp, _hypothesis_word_confidences(hypothesis))
         if not words:
             raise TranscriptionError(
                 "NeMo returned no usable word timestamps. The app will not fabricate subtitle timing."
@@ -218,6 +239,20 @@ class NeMoASRBackend:
             else:
                 greedy.pop("boosting_tree", None)
                 greedy.pop("boosting_tree_alpha", None)
+            decoding_cfg["confidence_cfg"] = {
+                "preserve_frame_confidence": True,
+                "preserve_token_confidence": True,
+                "preserve_word_confidence": True,
+                "aggregation": "min",
+                "exclude_blank": True,
+                "tdt_include_duration": False,
+                "method_cfg": {
+                    "name": "entropy",
+                    "entropy_type": "tsallis",
+                    "alpha": 0.33,
+                    "entropy_norm": "exp",
+                },
+            }
         try:
             self.model.change_decoding_strategy(decoding_cfg)
         except Exception as exc:
@@ -243,6 +278,7 @@ class NeMoASRBackend:
                 path_list,
                 timestamps=bool(timestamps),
                 batch_size=max(1, int(batch_size)),
+                return_hypotheses=True,
             )
         except Exception as exc:
             raise_if_triton_compiler_error(exc)

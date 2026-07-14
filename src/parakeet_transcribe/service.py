@@ -260,8 +260,14 @@ class TranscriptionService:
             },
         )
         if diarize:
-            progress(progress_base + progress_span * 0.92, "Running local speaker diarization")
-            result = diarize_transcript(result, prepared.samples, prepared.sample_rate)
+            progress(progress_base + progress_span * 0.92, "Running speaker diarization")
+            result = diarize_transcript(
+                result,
+                prepared.samples,
+                prepared.sample_rate,
+                audio_path=prepared.canonical_path,
+                release_vram=backend.unload,
+            )
         if summarize or redact_pii or clean_format:
             progress(progress_base + progress_span * 0.96, "Applying transcript post-processing")
             result = apply_postprocess(

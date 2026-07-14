@@ -276,9 +276,9 @@ def build_app() -> gr.Blocks:
                     f"(max {MAX_BATCH_SIZE}). Leave the model loaded between files for best throughput.",
                 )
                 diarize = gr.Checkbox(
-                    label="Speaker diarization (local MFCC clustering)",
+                    label="Speaker diarization (Sortformer GPU, MFCC fallback)",
                     value=False,
-                    info="Optional CPU post-pass. Best with Parakeet timestamps; quality is below commercial diarization APIs.",
+                    info="Unloads ASR briefly, runs NeMo Sortformer on CUDA, then falls back to CPU MFCC if needed. Best with Parakeet timestamps.",
                 )
                 summarize = gr.Checkbox(
                     label="Extractive summary + chapters",

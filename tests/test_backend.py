@@ -115,6 +115,22 @@ def test_triton_compiler_error_becomes_transcription_error() -> None:
         raise_if_triton_compiler_error(error)
 
 
+def test_chunk_result_maps_word_confidence_from_hypothesis() -> None:
+    hyp = SimpleNamespace(
+        text="Hello there.",
+        timestamp={
+            "word": [
+                {"word": "Hello", "start": 0.0, "end": 0.4},
+                {"word": "there.", "start": 0.45, "end": 0.9},
+            ],
+            "segment": [{"segment": "Hello there.", "start": 0.0, "end": 0.9}],
+        },
+        word_confidence=[0.91, 0.77],
+    )
+    result = chunk_result_from_hypothesis(hyp, expect_timestamps=True)
+    assert [word.confidence for word in result.words] == [0.91, 0.77]
+
+
 def test_configure_decoding_applies_gpu_pb_phrases() -> None:
     from omegaconf import OmegaConf
 
@@ -143,6 +159,7 @@ def test_configure_decoding_applies_gpu_pb_phrases() -> None:
     assert cfg.greedy.use_cuda_graph_decoder is True
     assert cfg.greedy.boosting_tree_alpha == 1.5
     assert list(cfg.greedy.boosting_tree.key_phrases_list) == ["Acme"]
+    assert cfg.confidence_cfg.preserve_word_confidence is True
     assert captured["order"][0] == "change_decoding_strategy"
     assert captured["order"][1] == ("to", "float16")
 

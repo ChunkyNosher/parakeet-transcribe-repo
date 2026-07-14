@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import replace
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from .types import Segment, TranscriptResult, WordTimestamp
 
 SAMPLE_RATE = 16000
+SORTFORMER_MODEL_ID = "nvidia/diar_sortformer_4spk-v1"
+
+_sortformer_model: Any | None = None
 
 
 def _frame_features(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
@@ -89,38 +95,132 @@ def _speaker_for_segment(segment: Segment, words: list[WordTimestamp]) -> str | 
     return Counter(overlapping).most_common(1)[0][0]
 
 
-def diarize_transcript(
+def _parse_sortformer_segment(raw: Any) -> tuple[float, float, int] | None:
+    """Normalize Sortformer outputs to (begin_s, end_s, speaker_index)."""
+
+    if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+        begin, end, speaker = raw[0], raw[1], raw[2]
+        if isinstance(begin, (int, float)) and isinstance(end, (int, float)):
+            return float(begin), float(end), int(speaker)
+    if isinstance(raw, str):
+        parts = raw.replace(",", " ").split()
+        if len(parts) >= 3:
+            try:
+                return float(parts[0]), float(parts[1]), int(float(parts[2]))
+            except ValueError:
+                return None
+    begin = getattr(raw, "start", getattr(raw, "begin", None))
+    end = getattr(raw, "end", None)
+    speaker = getattr(raw, "speaker", getattr(raw, "speaker_index", None))
+    if (
+        isinstance(begin, (int, float))
+        and isinstance(end, (int, float))
+        and isinstance(speaker, (int, float, str))
+    ):
+        return float(begin), float(end), int(speaker)
+    return None
+
+
+def _speakers_from_rttm(
+    rttm: Sequence[tuple[float, float, int]], starts: list[float], ends: list[float]
+) -> list[str | None]:
+    """Assign SPEAKER_XX by maximum overlap with Sortformer segments."""
+
+    assigned: list[str | None] = []
+    for start, end in zip(starts, ends, strict=True):
+        best_speaker: int | None = None
+        best_overlap = 0.0
+        midpoint = (start + end) / 2.0
+        nearest_speaker: int | None = None
+        nearest_distance = float("inf")
+        for begin, finish, speaker in rttm:
+            overlap = max(0.0, min(end, finish) - max(start, begin))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker
+            center = (begin + finish) / 2.0
+            distance = abs(midpoint - center)
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_speaker = speaker
+        label = best_speaker if best_overlap > 0 else nearest_speaker
+        assigned.append(None if label is None else f"SPEAKER_{int(label):02d}")
+    return assigned
+
+
+def unload_sortformer() -> None:
+    """Release Sortformer weights and free CUDA cache when possible."""
+
+    global _sortformer_model
+    if _sortformer_model is None:
+        return
+    try:
+        import torch
+
+        try:
+            _sortformer_model.to("cpu")
+        except Exception:  # pragma: no cover - best-effort teardown
+            pass
+        _sortformer_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover
+        _sortformer_model = None
+
+
+def _load_sortformer() -> Any:
+    global _sortformer_model
+    if _sortformer_model is not None:
+        return _sortformer_model
+    import torch
+    from nemo.collections.asr.models import SortformerEncLabelModel
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable for Sortformer diarization.")
+    model = SortformerEncLabelModel.from_pretrained(SORTFORMER_MODEL_ID)
+    model.eval()
+    model.to(torch.device("cuda"))
+    _sortformer_model = model
+    return model
+
+
+def _sortformer_rttm(audio_path: str | Path) -> list[tuple[float, float, int]]:
+    model = _load_sortformer()
+    import torch
+
+    with torch.inference_mode():
+        raw = model.diarize(audio=[str(audio_path)], batch_size=1)
+    if isinstance(raw, tuple):
+        raw = raw[0]
+    if not raw:
+        return []
+    first = raw[0]
+    if _parse_sortformer_segment(first) is not None:
+        file_segments = raw
+    elif isinstance(first, (list, tuple)):
+        file_segments = first
+    else:
+        file_segments = raw
+    parsed: list[tuple[float, float, int]] = []
+    for item in file_segments or []:
+        segment = _parse_sortformer_segment(item)
+        if segment is not None and segment[1] >= segment[0]:
+            parsed.append(segment)
+    return parsed
+
+
+def _apply_speaker_labels(
     result: TranscriptResult,
-    samples: np.ndarray,
-    sample_rate: int = SAMPLE_RATE,
+    speakers: Sequence[str | None],
     *,
-    num_speakers: int | None = None,
+    method: str,
+    speaker_count: int,
+    warning: str,
 ) -> TranscriptResult:
-    """Attach local speaker labels to words/segments via MFCC clustering (CPU-only)."""
-
-    if not result.words:
-        warning = "Diarization skipped: transcript has no word timestamps to align speakers."
-        return replace(
-            result,
-            warnings=[*result.warnings, warning],
-            schema_version="1.1",
-        )
-
-    times, features = _frame_features(samples, sample_rate)
-    if not len(features):
-        warning = "Diarization skipped: no voiced frames detected."
-        return replace(result, warnings=[*result.warnings, warning], schema_version="1.1")
-
-    speaker_count = num_speakers or _choose_speaker_count(features)
-    frame_labels = _kmeans(features, speaker_count)
-    speakers = _labels_for_times(
-        times, frame_labels, [word.start for word in result.words], [word.end for word in result.words]
-    )
     words = [
-        WordTimestamp(word.text, word.start, word.end, speaker=speaker)
+        WordTimestamp(word.text, word.start, word.end, speaker=speaker, confidence=word.confidence)
         for word, speaker in zip(result.words, speakers, strict=True)
     ]
-    # Keep NeMo native cue boundaries; only attach speaker labels.
     segments = [
         Segment(segment.text, segment.start, segment.end, _speaker_for_segment(segment, words))
         for segment in result.segments
@@ -130,6 +230,104 @@ def diarize_transcript(
         words=words,
         segments=segments,
         schema_version="1.1",
-        warnings=[*result.warnings, f"Local diarization labeled {speaker_count} speaker cluster(s)."],
-        runtime={**result.runtime, "diarization": {"speakers": speaker_count, "method": "mfcc-kmeans"}},
+        warnings=[*result.warnings, warning],
+        runtime={
+            **result.runtime,
+            "diarization": {"speakers": speaker_count, "method": method},
+        },
     )
+
+
+def _diarize_mfcc(
+    result: TranscriptResult,
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    num_speakers: int | None,
+    fallback_note: str | None = None,
+) -> TranscriptResult:
+    times, features = _frame_features(samples, sample_rate)
+    if not len(features):
+        warning = "Diarization skipped: no voiced frames detected."
+        if fallback_note:
+            warning = f"{fallback_note} {warning}"
+        return replace(result, warnings=[*result.warnings, warning], schema_version="1.1")
+
+    speaker_count = num_speakers or _choose_speaker_count(features)
+    frame_labels = _kmeans(features, speaker_count)
+    speakers = _labels_for_times(
+        times, frame_labels, [word.start for word in result.words], [word.end for word in result.words]
+    )
+    warning = f"Local MFCC diarization labeled {speaker_count} speaker cluster(s)."
+    if fallback_note:
+        warning = f"{fallback_note} {warning}"
+    return _apply_speaker_labels(
+        result,
+        speakers,
+        method="mfcc-kmeans",
+        speaker_count=speaker_count,
+        warning=warning,
+    )
+
+
+def diarize_transcript(
+    result: TranscriptResult,
+    samples: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    num_speakers: int | None = None,
+    audio_path: str | Path | None = None,
+    prefer_sortformer: bool = True,
+    release_vram: Callable[[], None] | None = None,
+) -> TranscriptResult:
+    """Attach speaker labels to words/segments.
+
+    Prefers NeMo Sortformer on CUDA (commercial-parity GPU diarization). Callers should
+    pass ``release_vram`` to unload the ASR model first so Sortformer fits in VRAM.
+    Falls back to CPU MFCC + k-means when Sortformer is unavailable or fails.
+    """
+
+    if not result.words:
+        warning = "Diarization skipped: transcript has no word timestamps to align speakers."
+        return replace(
+            result,
+            warnings=[*result.warnings, warning],
+            schema_version="1.1",
+        )
+
+    if prefer_sortformer and audio_path is not None:
+        try:
+            if release_vram is not None:
+                release_vram()
+            rttm = _sortformer_rttm(audio_path)
+            unload_sortformer()
+            if rttm:
+                speakers = _speakers_from_rttm(
+                    rttm,
+                    [word.start for word in result.words],
+                    [word.end for word in result.words],
+                )
+                speaker_ids = {speaker for speaker in speakers if speaker}
+                return _apply_speaker_labels(
+                    result,
+                    speakers,
+                    method="sortformer",
+                    speaker_count=len(speaker_ids) or len({spk for _, _, spk in rttm}),
+                    warning=(
+                        f"Sortformer GPU diarization labeled {len(speaker_ids) or len({spk for _, _, spk in rttm})} "
+                        "speaker(s)."
+                    ),
+                )
+            fallback_note = "Sortformer returned no speaker segments;"
+        except Exception as exc:
+            unload_sortformer()
+            fallback_note = f"Sortformer unavailable ({exc});"
+        return _diarize_mfcc(
+            result,
+            samples,
+            sample_rate,
+            num_speakers=num_speakers,
+            fallback_note=fallback_note,
+        )
+
+    return _diarize_mfcc(result, samples, sample_rate, num_speakers=num_speakers)

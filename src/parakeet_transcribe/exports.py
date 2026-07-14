@@ -81,7 +81,7 @@ def write_result(result: TranscriptResult, run_dir: Path) -> dict[str, Path]:
     csv_path = run_dir / f"{stem}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["start_time", "end_time", "duration", "text", "speaker"])
+        writer.writerow(["start_time", "end_time", "duration", "text", "speaker", "confidence"])
         for word in result.words:
             writer.writerow(
                 [
@@ -90,6 +90,7 @@ def write_result(result: TranscriptResult, run_dir: Path) -> dict[str, Path]:
                     f"{word.end - word.start:.3f}",
                     word.text,
                     word.speaker or "",
+                    "" if word.confidence is None else f"{word.confidence:.6f}",
                 ]
             )
     files["csv"] = csv_path

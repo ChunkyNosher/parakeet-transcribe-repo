@@ -101,7 +101,16 @@ def apply_postprocess(
 
     if redact_pii:
         text = redact_pii_text(text)
-        words = [WordTimestamp(redact_pii_text(word.text), word.start, word.end, word.speaker) for word in words]
+        words = [
+            WordTimestamp(
+                redact_pii_text(word.text),
+                word.start,
+                word.end,
+                word.speaker,
+                word.confidence,
+            )
+            for word in words
+        ]
         segments = [
             Segment(redact_pii_text(segment.text), segment.start, segment.end, segment.speaker)
             for segment in segments

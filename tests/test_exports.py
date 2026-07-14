@@ -59,7 +59,10 @@ def test_speaker_labels_appear_in_srt(tmp_path) -> None:
         1.0,
         "nvidia/test",
         "Hello there.",
-        words=[WordTimestamp("Hello", 0.0, 0.4, "SPEAKER_00"), WordTimestamp("there.", 0.4, 0.9, "SPEAKER_01")],
+        words=[
+            WordTimestamp("Hello", 0.0, 0.4, "SPEAKER_00", 0.95),
+            WordTimestamp("there.", 0.4, 0.9, "SPEAKER_01", 0.88),
+        ],
         segments=[
             Segment("Hello", 0.0, 0.4, "SPEAKER_00"),
             Segment("there.", 0.4, 0.9, "SPEAKER_01"),
@@ -67,3 +70,8 @@ def test_speaker_labels_appear_in_srt(tmp_path) -> None:
     )
     files = write_result(result, run_dir)
     assert "[SPEAKER_00] Hello" in files["srt"].read_text(encoding="utf-8")
+    payload = json.loads(files["json"].read_text(encoding="utf-8"))
+    assert payload["words"][0]["confidence"] == 0.95
+    csv_text = files["csv"].read_text(encoding="utf-8")
+    assert "confidence" in csv_text.splitlines()[0]
+    assert "0.950000" in csv_text
