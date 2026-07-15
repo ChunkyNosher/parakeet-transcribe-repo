@@ -22,6 +22,9 @@ ProgressCallback = Callable[[float, str], None]
 CancelCheck = Callable[[], bool]
 
 MAX_BATCH_SIZE = 16
+# NeMo's RNNT/TDT buffered-inference example identifies 20-30 seconds as the
+# boundary where stateful buffered decoding becomes the primary long-audio path.
+NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS = 30.0
 
 
 def _noop_progress(_: float, __: str) -> None:
@@ -150,16 +153,31 @@ class TranscriptionService:
         chunk_results: list[ChunkResult] = []
         chunks: list[Any] = []
         used_chunking = False
+        used_nemo_streaming = prepared.duration_seconds > NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS
 
         if cancel():
             raise CancelledError("Transcription cancelled before publishing outputs.")
-        progress(progress_base, f"Transcribing {prepared.source_path.name} (NeMo long-form)")
+        inference_label = "NeMo buffered RNNT/TDT" if used_nemo_streaming else "NeMo offline"
+        progress(progress_base, f"Transcribing {prepared.source_path.name} ({inference_label})")
         try:
-            chunk_results = backend.transcribe_paths(
-                [prepared.canonical_path],
-                timestamps=timestamps,
-                batch_size=1,
-            )
+            if used_nemo_streaming:
+                streaming_result = backend.transcribe_streaming_audio(
+                    prepared.samples,
+                    prepared.sample_rate,
+                    timestamps=timestamps,
+                    progress=lambda completed, total: progress(
+                        progress_base + progress_span * 0.9 * completed / max(total, 1),
+                        f"Transcribing buffered window {completed}/{total}",
+                    ),
+                    cancel=cancel,
+                )
+                chunk_results = [streaming_result]
+            else:
+                chunk_results = backend.transcribe_paths(
+                    [prepared.canonical_path],
+                    timestamps=timestamps,
+                    batch_size=1,
+                )
         except TranscriptionError as exc:
             if str(exc) != "CUDA out of memory":
                 raise
@@ -236,6 +254,11 @@ class TranscriptionService:
         if not text:
             raise TranscriptionError(f"{prepared.source_path.name} produced an empty transcript.")
         warnings_out = list(warnings)
+        if backend.word_confidence_fallback_used:
+            warnings_out.append(
+                "NeMo returned inconsistent word-confidence counts; affected audio was retried without "
+                "per-word confidence so transcript text and timestamps could be preserved."
+            )
         if words and not segments:
             warnings_out.append(
                 "NeMo returned word timestamps but no native segment cues; SRT/VTT preview will be empty."
@@ -253,6 +276,13 @@ class TranscriptionService:
             runtime={
                 "backend": "nemo",
                 "longform_attention": not used_chunking,
+                "inference_mode": (
+                    "nemo_buffered_streaming"
+                    if used_nemo_streaming and not used_chunking
+                    else "app_chunk_fallback"
+                    if used_chunking
+                    else "nemo_offline"
+                ),
                 "key_phrase_count": len(list(key_phrases)),
                 "boost_alpha": float(boost_alpha),
                 "segment_source": "nemo_native" if segments else "none",

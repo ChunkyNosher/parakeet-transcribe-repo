@@ -96,8 +96,8 @@ def doctor_report() -> tuple[bool, str]:
                 lines.append("- OK cuda-python (NeMo CUDA-graph while-loops)")
             except ImportError:
                 lines.append(
-                    "- MISSING cuda-python: install cuda-python>=12.3 so NeMo can enable "
-                    "CUDA-graph while-loop decoding (rebuild the Docker image)"
+                    "- MISSING CUDA Python bindings: rebuild the Docker image with "
+                    "nemo_toolkit[asr,cu13] so NeMo can enable CUDA-graph while-loop decoding"
                 )
                 ready = False
     else:

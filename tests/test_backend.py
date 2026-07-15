@@ -82,6 +82,14 @@ def test_chunk_result_requires_timestamps_when_expected() -> None:
         chunk_result_from_hypothesis(hyp, expect_timestamps=True)
 
 
+def test_chunk_result_allows_empty_silent_timed_hypothesis() -> None:
+    hyp = SimpleNamespace(text="", timestamp=None)
+    result = chunk_result_from_hypothesis(hyp, expect_timestamps=True)
+    assert result.text == ""
+    assert result.words == []
+    assert result.segments == []
+
+
 def test_chunk_result_untimed_ok() -> None:
     hyp = SimpleNamespace(text="hello <en-US>", timestamp=None)
     result = chunk_result_from_hypothesis(hyp, expect_timestamps=False)
@@ -156,12 +164,47 @@ def test_configure_decoding_applies_gpu_pb_phrases() -> None:
         backend.configure_decoding(["acme"], boost_alpha=1.5)
     cfg = captured["cfg"]
     assert cfg.strategy == "greedy_batch"
+    assert cfg.preserve_alignments is True
     assert cfg.greedy.use_cuda_graph_decoder is True
     assert cfg.greedy.boosting_tree_alpha == 1.5
     assert list(cfg.greedy.boosting_tree.key_phrases_list) == ["Acme"]
+    assert cfg.confidence_cfg.preserve_frame_confidence is True
     assert cfg.confidence_cfg.preserve_word_confidence is True
     assert captured["order"][0] == "change_decoding_strategy"
     assert captured["order"][1] == ("to", "float16")
+
+
+def test_streaming_decoding_uses_tdt_durations_without_frame_alignments() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    backend = NeMoASRBackend(PARAKEET_V3)
+    captured: dict = {}
+    fake_torch = SimpleNamespace(float16="float16")
+
+    class FakeModel:
+        cfg = SimpleNamespace(decoding=OmegaConf.create({"strategy": "greedy", "greedy": {}}))
+
+        def change_decoding_strategy(self, cfg) -> None:
+            captured["cfg"] = cfg
+
+        def to(self, *args, **kwargs) -> None:
+            return None
+
+    backend.model = FakeModel()
+    with patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch):
+        backend.configure_decoding([], streaming=True, timestamps=True)
+
+    cfg = captured["cfg"]
+    assert cfg.preserve_alignments is False
+    assert cfg.compute_timestamps is False
+    assert cfg.tdt_include_token_duration is True
+    assert cfg.greedy.preserve_alignments is False
+    assert cfg.confidence_cfg.preserve_frame_confidence is False
+    assert cfg.confidence_cfg.preserve_token_confidence is False
+    assert cfg.confidence_cfg.preserve_word_confidence is False
 
 
 def test_longform_attention_casts_dtype_after_reconfigure() -> None:
@@ -219,3 +262,58 @@ def test_configure_decoding_recasts_dtype_after_strategy_change() -> None:
         # Fingerprint hit must not re-cast.
         backend.configure_decoding([])
     assert order == ["change_decoding_strategy", "to"]
+
+
+def test_word_confidence_aggregation_mismatch_retries_without_confidence() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    backend = NeMoASRBackend(PARAKEET_V3)
+    configs: list = []
+    calls = 0
+    fake_torch = SimpleNamespace(float16="float16")
+    hypothesis = SimpleNamespace(
+        text="Hello there.",
+        timestamp={
+            "word": [
+                {"word": "Hello", "start": 0.0, "end": 0.4},
+                {"word": "there.", "start": 0.45, "end": 0.9},
+            ],
+            "segment": [{"segment": "Hello there.", "start": 0.0, "end": 0.9}],
+        },
+        word_confidence=None,
+    )
+
+    class FakeModel:
+        cfg = SimpleNamespace(decoding=OmegaConf.create({"strategy": "greedy", "greedy": {}}))
+
+        def change_decoding_strategy(self, cfg) -> None:
+            configs.append(cfg)
+
+        def to(self, *args, **kwargs) -> None:
+            return None
+
+        def transcribe(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError(
+                    "Something went wrong with word-level confidence aggregation. "
+                    "len(words): 90, len(word_confidence): 91"
+                )
+            return [hypothesis]
+
+    backend.model = FakeModel()
+    with patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch):
+        results = backend.transcribe_paths(["sample.wav"], timestamps=True)
+
+    assert calls == 2
+    assert configs[-1].preserve_alignments is True
+    assert configs[-1].confidence_cfg.preserve_frame_confidence is False
+    assert configs[-1].confidence_cfg.preserve_token_confidence is False
+    assert configs[-1].confidence_cfg.preserve_word_confidence is False
+    assert backend.word_confidence_fallback_used is True
+    assert results[0].text == "Hello there."
+    assert [word.confidence for word in results[0].words] == [None, None]

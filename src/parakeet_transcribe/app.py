@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from html import escape
 from pathlib import Path
 from threading import Event
@@ -172,6 +173,7 @@ def _run_files(
     except TranscriptionError as exc:
         return _failure_outputs(f"### Transcription failed\n\n{exc}")
     except Exception as exc:  # pragma: no cover - defensive UI boundary
+        traceback.print_exc()
         return _failure_outputs(f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`")
 
 
@@ -212,6 +214,7 @@ def _run_youtube(
     except TranscriptionError as exc:
         return _failure_outputs(f"### Transcription failed\n\n{exc}")
     except Exception as exc:  # pragma: no cover - defensive UI boundary
+        traceback.print_exc()
         return _failure_outputs(f"### Unexpected failure\n\n`{type(exc).__name__}: {exc}`")
 
 
