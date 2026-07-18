@@ -5,6 +5,8 @@ Local file transcription using **NVIDIA NeMo** ASR (Parakeet / Nemotron) inside 
 ## What it runs
 
 - **NVIDIA Parakeet TDT 0.6B v3** is the default: 25 European languages, automatic language detection, punctuation, and word/segment timestamps via NeMo `transcribe(..., timestamps=True)`.
+- **NVIDIA Parakeet TDT 0.6B v2** is the English-only alternative with the family's best English WER and the same timestamp exports.
+- **NVIDIA Parakeet TDT 1.1B** is the larger English-only checkpoint (higher VRAM) with the same timestamp exports, but lowercase unpunctuated output. This legacy checkpoint requires `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`, which `compose.yaml` already sets.
 - **NVIDIA Nemotron 3.5 ASR Streaming 0.6B** is optional: broader language coverage and automatic language detection, but no timestamped subtitle exports.
 
 NeMo-backed features in this app:
@@ -76,4 +78,4 @@ uv run parakeet-transcribe doctor
 
 ## Model notices
 
-See the NVIDIA model cards for [Parakeet v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) and [Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) for licensing, language coverage, and limitations.
+See the NVIDIA model cards for [Parakeet v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [Parakeet v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), [Parakeet 1.1B](https://huggingface.co/nvidia/parakeet-tdt-1.1b), and [Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) for licensing, language coverage, and limitations.

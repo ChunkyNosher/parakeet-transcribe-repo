@@ -21,6 +21,10 @@ services:
       # NeMo's official RNNT/TDT buffered-inference script enables expandable
       # CUDA segments to prevent allocator fragmentation across streaming windows.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # Legacy checkpoints (parakeet-tdt-1.1b) predate PyTorch 2.6's weights_only
+      # default; NVIDIA documents this override to load them. All model downloads
+      # come from NVIDIA's official Hugging Face repos.
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     volumes:
       # Editable install + bind mount: host ./src changes apply without image rebuild.
       # Restart the process to reload Python imports (Compose Watch does this automatically).

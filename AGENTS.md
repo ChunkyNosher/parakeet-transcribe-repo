@@ -12,4 +12,5 @@
 - Docker Compose runs Linux GPU containers; Hugging Face / NeMo model files live on a host bind mount (`./docker-data/model_cache` → `/data/model_cache` via `HF_HOME` / `HF_HUB_CACHE`), and exports go under `./docker-data/outputs`.
 - The Docker image needs a C compiler (`build-essential` / gcc) because Linux PyTorch pulls Triton, which JIT-builds CUDA helpers at inference time; `libsndfile1` is also required for NeMo audio I/O.
 - NeMo features in-app: local-attention long-form, GPU-PB keyterm boosting, greedy CUDA-graph decoding; app silence chunking is OOM fallback only.
+- Model registry (`models.py`): parakeet-tdt-0.6b-v3 (default), parakeet-tdt-0.6b-v2 and parakeet-tdt-1.1b (English-only TDT), nemotron-3.5-asr-streaming-0.6b. The legacy 1.1b checkpoint (lowercase unpunctuated output) only loads with `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`, set in `compose.yaml`.
 - There is a long-standing segmentation issue where silence-heavy segments end with a word that belongs at the start of the next sentence/segment, despite prior fix attempts.
