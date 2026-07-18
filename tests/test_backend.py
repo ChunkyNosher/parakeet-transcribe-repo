@@ -109,6 +109,21 @@ def test_parse_key_phrases_title_cases() -> None:
     assert parse_key_phrases("  ") == []
 
 
+def test_key_phrases_lower_cased_for_lowercase_vocab() -> None:
+    assert capitalize_key_phrases(["Chunky", "NVIDIA", "multi word"], casing="lower") == [
+        "chunky",
+        "nvidia",
+        "multi word",
+    ]
+    assert parse_key_phrases("Chunky, NVIDIA\nmulti word", casing="lower") == [
+        "chunky",
+        "nvidia",
+        "multi word",
+    ]
+    # Default casing remains title-case for capitalization-vocab models.
+    assert capitalize_key_phrases(["chunky"]) == ["Chunky"]
+
+
 def test_triton_compiler_error_is_detected() -> None:
     error = RuntimeError(
         "Failed to find C compiler. Please specify via CC environment variable or set triton.knobs.build.impl."
@@ -172,6 +187,41 @@ def test_configure_decoding_applies_gpu_pb_phrases() -> None:
     assert cfg.confidence_cfg.preserve_word_confidence is True
     assert captured["order"][0] == "change_decoding_strategy"
     assert captured["order"][1] == ("to", "float16")
+
+
+def test_configure_decoding_lowercases_phrases_for_lowercase_vocab() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_11B
+
+    backend = NeMoASRBackend(PARAKEET_11B)
+    captured: dict = {}
+    fake_torch = SimpleNamespace(float16="float16")
+
+    class FakeModel:
+        cfg = SimpleNamespace(decoding=OmegaConf.create({"strategy": "greedy", "greedy": {}}))
+
+        def change_decoding_strategy(self, cfg) -> None:
+            captured["cfg"] = cfg
+
+        def to(self, *args, **kwargs) -> None:
+            return None
+
+    backend.model = FakeModel()
+    with patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch):
+        backend.configure_decoding(["Chunky", "LIMC"], boost_alpha=1.0)
+    assert list(captured["cfg"].greedy.boosting_tree.key_phrases_list) == ["chunky", "limc"]
+
+
+def test_configure_decoding_stores_lowercased_phrases_without_model() -> None:
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_11B
+
+    backend = NeMoASRBackend(PARAKEET_11B)
+    assert backend.model is None
+    backend.configure_decoding(["Chunky", "LIMC"], boost_alpha=1.0)
+    assert backend._key_phrases == ["chunky", "limc"]
 
 
 def test_streaming_decoding_uses_tdt_durations_without_frame_alignments() -> None:

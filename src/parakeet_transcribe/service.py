@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from .diarization import diarize_transcript
 from .media import prepare_audio
 from .models import DEFAULT_MODEL_KEY, get_model
 from .postprocess import apply_postprocess
+from .punctuation import restore_punctuation
 from .types import CancelledError, ChunkResult, TranscriptionError, TranscriptResult
 from .youtube import download_youtube_audio
 
@@ -289,6 +291,16 @@ class TranscriptionService:
                 "preview_audio_path": str(prepared.canonical_path),
             },
         )
+        if backend.spec.capabilities.lowercase_vocab:
+            progress(progress_base + progress_span * 0.90, "Restoring punctuation and capitalization")
+            try:
+                result = restore_punctuation(result)
+            except TranscriptionError as exc:
+                result = replace(
+                    result,
+                    warnings=[*result.warnings, f"Punctuation restoration unavailable: {exc}"],
+                    runtime={**result.runtime, "punctuation_restored": False},
+                )
         if diarize:
             progress(progress_base + progress_span * 0.92, "Running speaker diarization")
             result = diarize_transcript(
@@ -329,8 +341,9 @@ class TranscriptionService:
             raise TranscriptionError("Upload at least one audio or video file.")
         if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
             raise TranscriptionError(f"Batch size must be between 1 and {MAX_BATCH_SIZE}.")
+        casing = "lower" if get_model(model_key).capabilities.lowercase_vocab else "title"
         phrases = (
-            parse_key_phrases(key_phrases)
+            parse_key_phrases(key_phrases, casing=casing)
             if isinstance(key_phrases, str) or key_phrases is None
             else list(key_phrases)
         )

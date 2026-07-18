@@ -18,6 +18,11 @@ dependencies = [
     "torch==2.13.0; sys_platform == 'linux'",
     # Enables NeMo CUDA-graph while-loop decoding (conditional nodes).
     "cuda-python>=13.0; sys_platform == 'linux'",
+    # Punctuation/capitalization restoration for the lowercase-vocab Parakeet 1.1B
+    # checkpoint (NeMo's own PunctuationCapitalizationModel was removed in NeMo >=2.5).
+    # CPU ONNX runtime keeps this off the GPU. Linux-only (container) like NeMo.
+    "punctuators==0.0.7; sys_platform == 'linux'",
+    "onnxruntime>=1.17; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

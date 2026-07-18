@@ -32,26 +32,34 @@ def _extract_language(text: str) -> tuple[str, str | None]:
     return text[: match.start()].strip(), match.group(1)
 
 
-def capitalize_key_phrases(phrases: Sequence[str]) -> list[str]:
-    """Parakeet capitalization models expect capitalized key phrases (and full caps for abbreviations)."""
+def capitalize_key_phrases(phrases: Sequence[str], *, casing: str = "title") -> list[str]:
+    """Normalize key phrases for NeMo GPU-PB boosting.
+
+    ``casing="title"`` (default) title-cases phrases and keeps short all-caps
+    abbreviations, which Parakeet capitalization models expect. ``casing="lower"``
+    lowercases phrases for lowercase-vocab models (e.g. Parakeet 1.1B) whose
+    SentencePiece tokenizer has no uppercase tokens.
+    """
 
     normalized: list[str] = []
     for raw in phrases:
         phrase = " ".join(str(raw).split())
         if not phrase:
             continue
-        if phrase.isupper() and len(phrase) <= 6:
+        if casing == "lower":
+            normalized.append(phrase.lower())
+        elif phrase.isupper() and len(phrase) <= 6:
             normalized.append(phrase)
         else:
             normalized.append(phrase.title())
     return normalized
 
 
-def parse_key_phrases(raw: str | None) -> list[str]:
+def parse_key_phrases(raw: str | None, *, casing: str = "title") -> list[str]:
     if not raw or not str(raw).strip():
         return []
     parts = re.split(r"[\n,;]+", str(raw))
-    return capitalize_key_phrases([part.strip() for part in parts if part.strip()])
+    return capitalize_key_phrases([part.strip() for part in parts if part.strip()], casing=casing)
 
 
 def _words_from_nemo_word_timestamps(
@@ -224,7 +232,9 @@ class NeMoASRBackend:
         streaming: bool = False,
         timestamps: bool = True,
     ) -> None:
-        phrases = capitalize_key_phrases(key_phrases)
+        phrases = capitalize_key_phrases(
+            key_phrases, casing="lower" if self.spec.capabilities.lowercase_vocab else "title"
+        )
         alpha = float(boost_alpha)
         fingerprint = (
             tuple(phrases),

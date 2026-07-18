@@ -10,6 +10,7 @@ class ModelCapabilities:
     timestamps: bool
     automatic_language_detection: bool
     supported_languages: int
+    lowercase_vocab: bool = False
 
 
 @dataclass(frozen=True)

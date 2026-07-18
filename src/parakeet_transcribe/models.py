@@ -22,11 +22,14 @@ PARAKEET_V2 = ModelSpec(
 
 PARAKEET_11B = ModelSpec(
     key="parakeet-1.1b",
-    label="Parakeet TDT 1.1B — English only, timestamps, lowercase unpunctuated output",
+    label="Parakeet TDT 1.1B — English only, timestamps, punctuation auto-restored",
     model_id="nvidia/parakeet-tdt-1.1b",
     model_class="tdt",
     capabilities=ModelCapabilities(
-        timestamps=True, automatic_language_detection=False, supported_languages=1
+        timestamps=True,
+        automatic_language_detection=False,
+        supported_languages=1,
+        lowercase_vocab=True,
     ),
 )
 

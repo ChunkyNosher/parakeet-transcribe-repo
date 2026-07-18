@@ -152,12 +152,13 @@ def _run_files(
     try:
         CANCEL_REQUESTED.clear()
         run_dir = create_run_directory()
+        casing = "lower" if get_model(model_key).capabilities.lowercase_vocab else "title"
         results = SERVICE.transcribe_files(
             files or [],
             model_key=model_key,
             language=language.strip() or "auto",
             batch_size=int(batch_size),
-            key_phrases=parse_key_phrases(keyterms),
+            key_phrases=parse_key_phrases(keyterms, casing=casing),
             boost_alpha=float(boost_alpha),
             work_dir=run_dir,
             progress=lambda fraction, description: progress(fraction, desc=description),
@@ -193,12 +194,13 @@ def _run_youtube(
     try:
         CANCEL_REQUESTED.clear()
         run_dir = create_run_directory()
+        casing = "lower" if get_model(model_key).capabilities.lowercase_vocab else "title"
         results = SERVICE.transcribe_youtube(
             url,
             model_key=model_key,
             language=language.strip() or "auto",
             batch_size=int(batch_size),
-            key_phrases=parse_key_phrases(keyterms),
+            key_phrases=parse_key_phrases(keyterms, casing=casing),
             boost_alpha=float(boost_alpha),
             work_dir=run_dir,
             progress=lambda fraction, description: progress(fraction, desc=description),
@@ -259,7 +261,8 @@ def build_app() -> gr.Blocks:
                     lines=3,
                     placeholder="ProperNoun\nAcronym\nmulti word phrase",
                     info="One phrase per line (or comma-separated). Applied via NeMo GPU-PB shallow fusion. "
-                    "Phrases are Title-Cased for Parakeet; leave empty to disable.",
+                    "Phrases are Title-Cased for most models and lowercased for the lowercase-vocab "
+                    "Parakeet 1.1B; leave empty to disable.",
                 )
                 boost_alpha = gr.Slider(
                     0.0,
