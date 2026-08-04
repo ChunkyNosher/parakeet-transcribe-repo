@@ -48,7 +48,7 @@ Without watch, after editing `src/` you can still skip a rebuild and just restar
 docker compose restart
 ```
 
-Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). On container start the app warms the default Parakeet model into VRAM in the background so the first transcription skips that cold load; use **Unload model** if you need the memory back. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
+Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). Models are **not** loaded at startup: the first transcription request loads the selected model into VRAM, and it is unloaded automatically after 3 minutes of inactivity (`PARAKEET_IDLE_UNLOAD_SECONDS`, default `180`; set `0` to keep it resident). Use **Unload model** to free VRAM immediately. Checkpoints are pre-extracted once into `docker-data/model_cache/extracted` so later cold loads skip NeMo's per-load tar decompression. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
 
 
 Inside the container you can also run:
@@ -61,7 +61,7 @@ parakeet-transcribe doctor
 
 - **Keyterms** + **boost strength**: NeMo GPU-PB shallow fusion for proper nouns / rare phrases.
 - **Chunk batch size** (UI, 1–16): used when long-form local attention OOMs and the service falls back to chunked transcription. Default is 2.
-- Keep the model loaded between files in a session; only use **Unload model** when you need VRAM back.
+- **Idle unload**: the loaded model is evicted from VRAM after `PARAKEET_IDLE_UNLOAD_SECONDS` (default 180) of inactivity; `0` keeps it resident until **Unload model** is pressed. The first request after an eviction pays a cold load again.
 
 ## Host development (tests / lint only)
 

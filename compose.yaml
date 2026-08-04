@@ -18,6 +18,9 @@ services:
       PARAKEET_OUTPUT_DIR: /data/outputs
       PARAKEET_SERVER_NAME: 0.0.0.0
       PARAKEET_SERVER_PORT: "7860"
+      # Models load lazily on the first transcription request and are evicted
+      # from VRAM after this many seconds of inactivity (0 disables the eviction).
+      PARAKEET_IDLE_UNLOAD_SECONDS: "180"
       # NeMo's official RNNT/TDT buffered-inference script enables expandable
       # CUDA segments to prevent allocator fragmentation across streaming windows.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

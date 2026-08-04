@@ -173,14 +173,40 @@ def _load_sortformer() -> Any:
     if _sortformer_model is not None:
         return _sortformer_model
     import torch
-    from nemo.collections.asr.models import SortformerEncLabelModel
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable for Sortformer diarization.")
-    model = SortformerEncLabelModel.from_pretrained(SORTFORMER_MODEL_ID)
+    model = _load_sortformer_model()
     model.eval()
     model.to(torch.device("cuda"))
     _sortformer_model = model
+    return model
+
+
+def _load_sortformer_model() -> Any:
+    """Instantiate Sortformer, preferring a persistent extracted checkpoint.
+
+    Mirrors the ASR backend's pre-extraction speedup: restore from the unpacked
+    directory so NeMo skips tar decompression on every diarize job (Sortformer
+    is loaded fresh per diarization run).
+    """
+    from nemo.collections.asr.models import SortformerEncLabelModel
+    from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+
+    from .models import get_model
+    from .modelstore import ensure_extracted, extract_after_load
+
+    sortformer_spec = get_model("sortformer")
+    extracted = ensure_extracted(sortformer_spec)
+    if extracted is not None:
+        connector = SaveRestoreConnector()
+        connector.model_extracted_dir = str(extracted)
+        return SortformerEncLabelModel.restore_from(
+            str(extracted),
+            save_restore_connector=connector,
+        )
+    model = SortformerEncLabelModel.from_pretrained(SORTFORMER_MODEL_ID)
+    extract_after_load(sortformer_spec)
     return model
 
 

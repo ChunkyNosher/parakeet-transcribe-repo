@@ -29,7 +29,7 @@ _EMPTY_PREVIEW_AND_FILES = (
 
 
 def _model_choices() -> list[tuple[str, str]]:
-    return [(spec.label, key) for key, spec in MODELS.items()]
+    return [(spec.label, key) for key, spec in MODELS.items() if key != "sortformer"]
 
 
 def _model_details(model_key: str) -> str:
@@ -226,8 +226,9 @@ def build_app() -> gr.Blocks:
             "# Parakeet Transcribe\n"
             "Local file transcription with **NVIDIA NeMo** (Parakeet / Nemotron). "
             "Supported runtime: Docker Compose Linux GPU container. "
-            "Weights download once into the host-mounted cache; the default model is warmed into VRAM at startup "
-            "(use **Unload model** to free VRAM)."
+            "Weights download once into the host-mounted cache; models load on the first "
+            "transcription request and unload after 3 minutes of inactivity "
+            "(use **Unload model** to free VRAM immediately)."
         )
         with gr.Accordion("System diagnostics", open=False):
             diagnostics = gr.Markdown(_system_details())
@@ -279,7 +280,7 @@ def build_app() -> gr.Blocks:
                     step=1,
                     label="Chunk batch size (OOM fallback)",
                     info=f"Used when long-form local attention OOMs and the app falls back to chunking "
-                    f"(max {MAX_BATCH_SIZE}). Leave the model loaded between files for best throughput.",
+                    f"(max {MAX_BATCH_SIZE}). The model unloads after 3 idle minutes to free VRAM.",
                 )
                 diarize = gr.Checkbox(
                     label="Speaker diarization (Sortformer GPU, MFCC fallback)",

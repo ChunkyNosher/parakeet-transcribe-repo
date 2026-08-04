@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -14,9 +15,9 @@ from .backend import NeMoASRBackend, is_cuda_oom, parse_key_phrases
 from .chunking import merge_segments, merge_text, merge_words, split_audio
 from .diarization import diarize_transcript
 from .media import prepare_audio
-from .models import DEFAULT_MODEL_KEY, get_model
+from .models import get_model
 from .postprocess import apply_postprocess
-from .punctuation import restore_punctuation
+from .punctuation import restore_punctuation, unload_punctuation_model
 from .types import CancelledError, ChunkResult, TranscriptionError, TranscriptResult
 from .youtube import download_youtube_audio
 
@@ -27,6 +28,11 @@ MAX_BATCH_SIZE = 16
 # NeMo's RNNT/TDT buffered-inference example identifies 20-30 seconds as the
 # boundary where stateful buffered decoding becomes the primary long-audio path.
 NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS = 30.0
+
+# Models load lazily on the first transcription request and are evicted from
+# VRAM after this many seconds of inactivity. Tune via PARAKEET_IDLE_UNLOAD_SECONDS.
+IDLE_UNLOAD_SECONDS = max(10.0, float(os.environ.get("PARAKEET_IDLE_UNLOAD_SECONDS", "180")))
+_IDLE_REAPER_INTERVAL_SECONDS = 5.0
 
 
 def _noop_progress(_: float, __: str) -> None:
@@ -50,38 +56,84 @@ class TranscriptionService:
         os.environ.setdefault("HF_HOME", str(self.cache_dir))
         self._backend: NeMoASRBackend | None = None
         self._model_key: str | None = None
+        self._last_used: float | None = None
+        self._in_use = False
+        self._lock = threading.Lock()
+        self._reaper_stop = threading.Event()
+        self._reaper = threading.Thread(
+            target=self._idle_reaper_loop,
+            name="parakeet-idle-unload",
+            daemon=True,
+        )
+        self._reaper.start()
 
     def unload(self) -> str:
-        if self._backend is None:
-            return "No model is loaded."
-        self._backend.unload()
-        self._backend = None
-        self._model_key = None
+        with self._lock:
+            if self._backend is None:
+                return "No model is loaded."
+            self._release_backend_locked()
+        unload_punctuation_model()
         return "Model unloaded and CUDA cache released."
 
-    def warm_default_model(self, model_key: str = DEFAULT_MODEL_KEY) -> str:
-        """Load the default (or given) model into VRAM so the first job skips cold start."""
+    def _release_backend_locked(self) -> None:
+        """Unload the resident backend and clear state. Caller must hold the lock."""
+        if self._backend is not None:
+            self._backend.unload()
+        self._backend = None
+        self._model_key = None
+        self._last_used = None
 
-        spec = get_model(model_key)
-        print(f"Warming up {spec.model_id}...", flush=True)
-        try:
-            backend = self._get_backend(model_key)
-            backend.load()
-        except Exception as exc:
-            message = f"Model warm-up failed for {spec.model_id}: {exc}"
-            print(message, flush=True)
-            return message
-        message = f"Warmed up {spec.model_id}."
-        print(message, flush=True)
-        return message
+    def _mark_used(self) -> None:
+        self._last_used = time.monotonic()
+
+    def _idle_reaper_loop(self) -> None:
+        while not self._reaper_stop.wait(_IDLE_REAPER_INTERVAL_SECONDS):
+            try:
+                self._maybe_idle_unload()
+            except Exception:  # pragma: no cover - reaper must never die
+                pass
+
+    def _stop_reaper(self) -> None:
+        """Stop the idle-unload thread (used by tests)."""
+        self._reaper_stop.set()
+
+    def _maybe_idle_unload(self) -> bool:
+        """Unload the resident model if it has been idle long enough.
+
+        Returns True when the model was evicted. Never evicts while a
+        transcription job is running.
+        """
+        with self._lock:
+            if self._in_use or self._backend is None or self._last_used is None:
+                return False
+            if time.monotonic() - self._last_used < IDLE_UNLOAD_SECONDS:
+                return False
+            self._release_backend_locked()
+        unload_punctuation_model()
+        print(
+            f"Model idle for {IDLE_UNLOAD_SECONDS:.0f}s; unloaded and CUDA cache released.",
+            flush=True,
+        )
+        return True
 
     def _get_backend(self, model_key: str) -> NeMoASRBackend:
-        if self._backend is not None and self._model_key == model_key:
+        with self._lock:
+            if self._backend is not None:
+                if self._model_key == model_key:
+                    if self._last_used is not None and time.monotonic() - self._last_used >= IDLE_UNLOAD_SECONDS:
+                        # Stale even before the reaper fires: evict so this request
+                        # gets a fresh, warm-model load instead of a half-cold one.
+                        self._release_backend_locked()
+                    else:
+                        self._mark_used()
+                        return self._backend
+                else:
+                    # Different model selected: release the resident one first.
+                    self._release_backend_locked()
+            self._backend = NeMoASRBackend(get_model(model_key))
+            self._model_key = model_key
+            self._mark_used()
             return self._backend
-        self.unload()
-        self._backend = NeMoASRBackend(get_model(model_key))
-        self._model_key = model_key
-        return self._backend
 
     def _transcribe_chunk_groups(
         self,
@@ -350,42 +402,49 @@ class TranscriptionService:
         progress = progress or _noop_progress
         cancel = cancel or _not_cancelled
         backend = self._get_backend(model_key)
+        with self._lock:
+            self._in_use = True
         started = time.perf_counter()
-        results: list[TranscriptResult] = []
-        media_dir = work_dir / ".work"
-        for index, path in enumerate(paths):
-            if cancel():
-                raise CancelledError("Transcription cancelled before publishing outputs.")
-            base = index / len(paths)
-            span = 1 / len(paths)
-            progress(base, f"Normalizing {Path(path).name}")
-            prepared = prepare_audio(path, media_dir / str(index))
-            result = self._transcribe_prepared(
-                backend,
-                prepared,
-                batch_size=batch_size,
-                language=language or "auto",
-                key_phrases=phrases,
-                boost_alpha=float(boost_alpha),
-                progress=progress,
-                cancel=cancel,
-                progress_base=base,
-                progress_span=span,
-                work_dir=media_dir / str(index),
-                diarize=diarize,
-                summarize=summarize,
-                redact_pii=redact_pii,
-                clean_format=clean_format,
-            )
-            result.runtime = {
-                **result.runtime,
-                "model_key": model_key,
-                "elapsed_seconds": round(time.perf_counter() - started, 3),
-                "requested_batch_size": batch_size,
-            }
-            results.append(result)
-        progress(1.0, "Finalizing downloads")
-        return results
+        try:
+            results: list[TranscriptResult] = []
+            media_dir = work_dir / ".work"
+            for index, path in enumerate(paths):
+                if cancel():
+                    raise CancelledError("Transcription cancelled before publishing outputs.")
+                base = index / len(paths)
+                span = 1 / len(paths)
+                progress(base, f"Normalizing {Path(path).name}")
+                prepared = prepare_audio(path, media_dir / str(index))
+                result = self._transcribe_prepared(
+                    backend,
+                    prepared,
+                    batch_size=batch_size,
+                    language=language or "auto",
+                    key_phrases=phrases,
+                    boost_alpha=float(boost_alpha),
+                    progress=progress,
+                    cancel=cancel,
+                    progress_base=base,
+                    progress_span=span,
+                    work_dir=media_dir / str(index),
+                    diarize=diarize,
+                    summarize=summarize,
+                    redact_pii=redact_pii,
+                    clean_format=clean_format,
+                )
+                result.runtime = {
+                    **result.runtime,
+                    "model_key": model_key,
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                    "requested_batch_size": batch_size,
+                }
+                results.append(result)
+            progress(1.0, "Finalizing downloads")
+            return results
+        finally:
+            with self._lock:
+                self._in_use = False
+            self._mark_used()
 
     def transcribe_youtube(
         self,

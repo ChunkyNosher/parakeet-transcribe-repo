@@ -43,8 +43,20 @@ NEMOTRON_35 = ModelSpec(
     ),
 )
 
+# Sortformer is not exposed in the UI model dropdown; the spec only exists so
+# the modelstore pre-extraction helpers can locate its checkpoint by HF id.
+SORTFORMER = ModelSpec(
+    key="sortformer",
+    label="Sortformer diarization (4-speaker)",
+    model_id="nvidia/diar_sortformer_4spk-v1",
+    model_class="sortformer",
+    capabilities=ModelCapabilities(
+        timestamps=True, automatic_language_detection=False, supported_languages=1
+    ),
+)
+
 MODELS: dict[str, ModelSpec] = {
-    spec.key: spec for spec in (PARAKEET_V3, PARAKEET_V2, PARAKEET_11B, NEMOTRON_35)
+    spec.key: spec for spec in (PARAKEET_V3, PARAKEET_V2, PARAKEET_11B, NEMOTRON_35, SORTFORMER)
 }
 DEFAULT_MODEL_KEY = PARAKEET_V3.key
 

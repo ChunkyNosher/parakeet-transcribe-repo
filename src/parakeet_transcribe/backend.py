@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from .modelstore import ensure_extracted, extract_after_load
 from .types import CancelledError, ChunkResult, ModelSpec, Segment, TranscriptionError, WordTimestamp
 
 SAMPLE_RATE = 16000
@@ -137,6 +138,43 @@ def chunk_result_from_hypothesis(hypothesis: Any, *, expect_timestamps: bool) ->
     return ChunkResult(text=text, words=words, detected_language=detected_language, segments=segments)
 
 
+def _import_nemo_asr() -> Any:
+    import nemo.collections.asr as nemo_asr
+
+    return nemo_asr
+
+
+def _import_save_restore_connector() -> Any:
+    from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+
+    return SaveRestoreConnector
+
+
+def _load_nemo_model(spec: ModelSpec) -> Any:
+    """Instantiate a NeMo ASR model, preferring a persistent extracted checkpoint.
+
+    When a pre-extracted directory exists (see ``modelstore``), restore from it
+    with ``SaveRestoreConnector.model_extracted_dir`` so NeMo skips the ~2.5 GB
+    tar decompression it otherwise performs on every ``from_pretrained`` call.
+    Falls back to the stock ``from_pretrained`` path (which also handles the
+    first-ever download) and then triggers a best-effort extraction so the next
+    cold start is faster.
+    """
+    nemo_asr = _import_nemo_asr()
+
+    extracted = ensure_extracted(spec)
+    if extracted is not None:
+        connector = _import_save_restore_connector()()
+        connector.model_extracted_dir = str(extracted)
+        return nemo_asr.models.ASRModel.restore_from(
+            str(extracted),
+            save_restore_connector=connector,
+        )
+    model = nemo_asr.models.ASRModel.from_pretrained(spec.model_id)
+    extract_after_load(spec)
+    return model
+
+
 class NeMoASRBackend:
     """In-process NeMo ASR backend for NVIDIA Parakeet TDT and Nemotron RNNT checkpoints."""
 
@@ -158,7 +196,7 @@ class NeMoASRBackend:
             return
         torch = _torch_runtime()
         try:
-            import nemo.collections.asr as nemo_asr
+            _import_nemo_asr()
         except ImportError as exc:  # pragma: no cover - installation / platform error
             raise TranscriptionError(
                 "NeMo ASR is required. Use Docker Compose on a Linux GPU host "
@@ -170,7 +208,7 @@ class NeMoASRBackend:
                 "CUDA is unavailable. Run inside the Docker Compose Linux GPU container."
             )
         try:
-            self.model = nemo_asr.models.ASRModel.from_pretrained(self.spec.model_id)
+            self.model = _load_nemo_model(self.spec)
             self.model.eval()
             self.model.to(torch.device("cuda"))
             # Attention/decoding rebuild modules in FP32; cast precision after those calls.
