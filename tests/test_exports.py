@@ -1,6 +1,8 @@
 import json
 import zipfile
+from pathlib import Path
 
+from parakeet_transcribe.app import _publish_results
 from parakeet_transcribe.exports import create_run_directory, write_bundle, write_result
 from parakeet_transcribe.types import Segment, TranscriptResult, WordTimestamp
 
@@ -20,6 +22,23 @@ def test_timed_result_writes_all_subtitle_formats(tmp_path) -> None:
     assert "00:00:00,000" in files["srt"].read_text(encoding="utf-8")
     assert files["vtt"].read_text(encoding="utf-8").startswith("WEBVTT")
     assert json.loads(files["json"].read_text(encoding="utf-8"))["detected_language"] == "en-US"
+
+
+def test_txt_export_is_plain_text_without_timestamps(tmp_path) -> None:
+    run_dir = create_run_directory(tmp_path)
+    files = write_result(_result(), run_dir)
+    body = files["txt"].read_text(encoding="utf-8")
+    assert body == "Hello world.\n"
+    assert "-->" not in body
+    assert "00:00" not in body
+
+
+def test_publish_results_surfaces_txt_download(tmp_path) -> None:
+    run_dir = create_run_directory(tmp_path)
+    result = _result()
+    outputs = _publish_results([result], run_dir)
+    assert outputs[8] == str(run_dir / "meeting.txt")
+    assert Path(outputs[8]).is_file()
 
 
 def test_untimed_result_never_writes_fake_subtitles(tmp_path) -> None:

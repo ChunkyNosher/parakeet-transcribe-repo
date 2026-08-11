@@ -25,6 +25,7 @@ _EMPTY_PREVIEW_AND_FILES = (
     None,
     None,
     None,
+    None,
 )
 
 
@@ -100,7 +101,7 @@ def _failure_outputs(message: str) -> tuple:
 
 def _publish_results(
     results: list[TranscriptResult], run_dir: Path
-) -> tuple[str, str, str, list[list[object]], str | None, str | None, str | None, str | None]:
+) -> tuple[str, str, str, list[list[object]], str | None, str | None, str | None, str | None, str | None]:
     artifacts = [write_result(result, run_dir) for result in results]
     bundle = write_bundle(results, run_dir)
     transcript = "\n\n".join(f"## {result.source_name}\n\n{result.text}" for result in results)
@@ -133,6 +134,7 @@ def _publish_results(
         str(first["json"]),
         str(first.get("srt")) if first.get("srt") else None,
         str(first.get("vtt")) if first.get("vtt") else None,
+        str(first["txt"]),
     )
 
 
@@ -321,6 +323,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     srt_file = gr.File(label="First file SRT")
                     vtt_file = gr.File(label="First file VTT")
+                    txt_file = gr.File(label="First file TXT (no timestamps)")
         option_inputs = [
             files,
             model,
@@ -342,6 +345,7 @@ def build_app() -> gr.Blocks:
             json_file,
             srt_file,
             vtt_file,
+            txt_file,
         ]
         file_event = run.click(
             _run_files,
