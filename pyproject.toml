@@ -23,6 +23,9 @@ dependencies = [
     # CPU ONNX runtime keeps this off the GPU. Linux-only (container) like NeMo.
     "punctuators==0.0.7; sys_platform == 'linux'",
     "onnxruntime>=1.17; sys_platform == 'linux'",
+    # FP16 safetensors checkpoint cache for fast model loads (modelstore).
+    # Linux-only like NeMo; Windows hosts run mocked tests without it.
+    "safetensors>=0.4; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

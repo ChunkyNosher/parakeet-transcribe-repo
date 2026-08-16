@@ -21,6 +21,12 @@ services:
       # Models load lazily on the first transcription request and are evicted
       # from VRAM after this many seconds of inactivity (0 disables the eviction).
       PARAKEET_IDLE_UNLOAD_SECONDS: "180"
+      # Optional: load this model key into VRAM in the background at startup
+      # (e.g. "parakeet-v3"). Off by default; unset keeps lazy loading.
+      PARAKEET_PRELOAD_MODEL: ""
+      # Persist Triton's JIT-compiled CUDA helpers across restarts/rebuilds so
+      # repeated cold starts do not recompile them.
+      TRITON_CACHE_DIR: /data/model_cache/triton
       # NeMo's official RNNT/TDT buffered-inference script enables expandable
       # CUDA segments to prevent allocator fragmentation across streaming windows.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

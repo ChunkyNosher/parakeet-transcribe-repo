@@ -158,3 +158,43 @@ def test_in_use_guard_blocks_eviction_during_job() -> None:
     with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0):
         assert service._maybe_idle_unload() is False
     assert service._backend is backend
+
+
+def test_warmup_loads_backend_and_marks_used() -> None:
+    service = _fresh_service()
+    loaded: list[bool] = []
+
+    class WarmBackend:
+        def __init__(self, spec) -> None:
+            self.spec = spec
+
+        def load(self) -> None:
+            loaded.append(True)
+
+        def unload(self) -> None:
+            return None
+
+    with (
+        patch("parakeet_transcribe.service.NeMoASRBackend", WarmBackend),
+        patch("parakeet_transcribe.service.time.monotonic", return_value=42.0),
+    ):
+        service.warmup("parakeet-v3")
+
+    assert loaded == [True]
+    assert service._model_key == "parakeet-v3"
+    # The idle timer restarts from the completed warm-up.
+    assert service._last_used == 42.0
+
+
+def test_warmup_reuses_resident_backend() -> None:
+    service = _fresh_service()
+    backend = SimpleNamespace(spec=SimpleNamespace(key="parakeet-v3"), loaded=0)
+    backend.load = lambda: setattr(backend, "loaded", backend.loaded + 1)
+    backend.unload = lambda: None
+    service._backend = backend
+    service._model_key = "parakeet-v3"
+    service._last_used = 1.0
+    with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS - 1.0):
+        service.warmup("parakeet-v3")
+    assert backend.loaded == 1
+    assert service._backend is backend

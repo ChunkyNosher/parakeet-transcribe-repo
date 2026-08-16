@@ -75,6 +75,18 @@ class TranscriptionService:
         unload_punctuation_model()
         return "Model unloaded and CUDA cache released."
 
+    def warmup(self, model_key: str) -> None:
+        """Load a model into VRAM ahead of demand (optional startup preload).
+
+        Uses the same backend path as transcription requests, so a concurrent
+        request either shares this warmed backend or waits on its load lock.
+        Marks the backend as freshly used so the idle timer starts after the
+        warm-up completes.
+        """
+        backend = self._get_backend(model_key)
+        backend.load()
+        self._mark_used()
+
     def _release_backend_locked(self) -> None:
         """Unload the resident backend and clear state. Caller must hold the lock."""
         if self._backend is not None:

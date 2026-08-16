@@ -186,19 +186,28 @@ def _load_sortformer() -> Any:
 def _load_sortformer_model() -> Any:
     """Instantiate Sortformer, preferring a persistent extracted checkpoint.
 
-    Mirrors the ASR backend's pre-extraction speedup: restore from the unpacked
-    directory so NeMo skips tar decompression on every diarize job (Sortformer
-    is loaded fresh per diarization run).
+    Mirrors the ASR backend's speedups: restore from the unpacked directory so
+    NeMo skips tar decompression on every diarize job (Sortformer is loaded
+    fresh per diarization run), using the same fast restore path (overlapped
+    GPU weight I/O, FP16 safetensors once converted) with a NeMo fallback.
     """
     from nemo.collections.asr.models import SortformerEncLabelModel
     from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 
     from .models import get_model
-    from .modelstore import ensure_extracted, extract_after_load
+    from .modelstore import ensure_extracted, extract_after_load, restore_extracted_model
 
     sortformer_spec = get_model("sortformer")
     extracted = ensure_extracted(sortformer_spec)
     if extracted is not None:
+        try:
+            return restore_extracted_model(sortformer_spec, SortformerEncLabelModel, extracted)
+        except Exception as exc:
+            print(
+                f"Fast checkpoint restore failed for {sortformer_spec.model_id} ({exc}); "
+                "falling back to NeMo restore_from.",
+                flush=True,
+            )
         connector = SaveRestoreConnector()
         connector.model_extracted_dir = str(extracted)
         return SortformerEncLabelModel.restore_from(

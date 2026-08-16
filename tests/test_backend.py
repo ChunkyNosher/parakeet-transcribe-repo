@@ -181,7 +181,7 @@ def test_configure_decoding_applies_gpu_pb_phrases() -> None:
     cfg = captured["cfg"]
     assert cfg.strategy == "greedy_batch"
     assert cfg.preserve_alignments is True
-    assert cfg.greedy.use_cuda_graph_decoder is True
+    assert cfg.greedy.use_cuda_graph_decoder is False  # NeMo #15423: graph capture breaks later torch.load
     assert cfg.greedy.boosting_tree_alpha == 1.5
     assert list(cfg.greedy.boosting_tree.key_phrases_list) == ["Acme"]
     assert cfg.confidence_cfg.preserve_frame_confidence is True
@@ -346,6 +346,9 @@ def test_word_confidence_aggregation_mismatch_retries_without_confidence() -> No
         def to(self, *args, **kwargs) -> None:
             return None
 
+        def eval(self) -> None:
+            return None
+
         def transcribe(self, *args, **kwargs):
             nonlocal calls
             calls += 1
@@ -370,7 +373,46 @@ def test_word_confidence_aggregation_mismatch_retries_without_confidence() -> No
     assert [word.confidence for word in results[0].words] == [None, None]
 
 
-def test_load_nemo_model_uses_extracted_dir_when_present() -> None:
+def test_load_nemo_model_prefers_fast_restore_when_extracted() -> None:
+    from pathlib import Path
+
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    extracted = Path("/cache/extracted/parakeet-v3")
+    captured: dict = {}
+
+    class FakeASRModel:
+        @classmethod
+        def restore_from(cls, restore_path: str, **kwargs) -> str:
+            captured["restore_from"] = restore_path
+            return "restored-model"
+
+        @classmethod
+        def from_pretrained(cls, model_id: str) -> str:
+            captured["pretrained"] = model_id
+            return "pretrained-model"
+
+    class FakeASRModels:
+        models = SimpleNamespace(ASRModel=FakeASRModel)
+
+    def fake_fast_restore(spec, model_cls, extracted_dir):
+        captured["fast"] = (spec, model_cls, extracted_dir)
+        return "fast-model"
+
+    with (
+        patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
+        patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
+        patch("parakeet_transcribe.backend.restore_extracted_model", side_effect=fake_fast_restore),
+    ):
+        model = _load_nemo_model(PARAKEET_V3)
+
+    assert model == "fast-model"
+    assert captured["fast"] == (PARAKEET_V3, FakeASRModel, extracted)
+    assert "restore_from" not in captured
+    assert "pretrained" not in captured
+
+
+def test_load_nemo_model_falls_back_to_restore_from_when_fast_restore_fails() -> None:
     from pathlib import Path
 
     from parakeet_transcribe.models import PARAKEET_V3
@@ -389,11 +431,6 @@ def test_load_nemo_model_uses_extracted_dir_when_present() -> None:
             captured["connector"] = kwargs["save_restore_connector"]
             return "restored-model"
 
-        @classmethod
-        def from_pretrained(cls, model_id: str) -> str:
-            captured["pretrained"] = model_id
-            return "pretrained-model"
-
     class FakeASRModels:
         models = SimpleNamespace(ASRModel=FakeASRModel)
 
@@ -401,13 +438,16 @@ def test_load_nemo_model_uses_extracted_dir_when_present() -> None:
         patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
         patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
         patch("parakeet_transcribe.backend._import_save_restore_connector", return_value=FakeConnector),
+        patch(
+            "parakeet_transcribe.backend.restore_extracted_model",
+            side_effect=RuntimeError("fast path broke"),
+        ),
     ):
         model = _load_nemo_model(PARAKEET_V3)
 
     assert model == "restored-model"
     assert captured["path"] == str(extracted)
     assert captured["connector"].model_extracted_dir == str(extracted)
-    assert "pretrained" not in captured
 
 
 def test_load_nemo_model_falls_back_to_pretrained_without_extracted_dir() -> None:
