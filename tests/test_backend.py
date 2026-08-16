@@ -373,6 +373,59 @@ def test_word_confidence_aggregation_mismatch_retries_without_confidence() -> No
     assert [word.confidence for word in results[0].words] == [None, None]
 
 
+def test_load_nemo_model_prefers_ready_snapshot_when_available() -> None:
+    from pathlib import Path
+
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    extracted = Path("/cache/extracted/parakeet-v3")
+    captured: dict = {}
+
+    class FakeASRModels:
+        models = SimpleNamespace(ASRModel=object)
+
+    def fake_ready_restore(spec, model_cls, extracted_dir):
+        captured["ready"] = (spec, extracted_dir)
+        return "ready-model"
+
+    with (
+        patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
+        patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
+        patch("parakeet_transcribe.backend.ready_snapshot_available", return_value=True),
+        patch("parakeet_transcribe.backend.restore_ready_model", side_effect=fake_ready_restore),
+        patch("parakeet_transcribe.backend.restore_extracted_model") as standard_restore,
+    ):
+        model, ready = _load_nemo_model(PARAKEET_V3)
+
+    assert model == "ready-model"
+    assert ready is True
+    assert captured["ready"] == (PARAKEET_V3, extracted)
+    standard_restore.assert_not_called()
+
+
+def test_load_nemo_model_ready_failure_falls_back_to_fast_restore() -> None:
+    from pathlib import Path
+
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    extracted = Path("/cache/extracted/parakeet-v3")
+
+    class FakeASRModels:
+        models = SimpleNamespace(ASRModel=object)
+
+    with (
+        patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
+        patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
+        patch("parakeet_transcribe.backend.ready_snapshot_available", return_value=True),
+        patch("parakeet_transcribe.backend.restore_ready_model", side_effect=RuntimeError("broke")),
+        patch("parakeet_transcribe.backend.restore_extracted_model", return_value="fast-model"),
+    ):
+        model, ready = _load_nemo_model(PARAKEET_V3)
+
+    assert model == "fast-model"
+    assert ready is False
+
+
 def test_load_nemo_model_prefers_fast_restore_when_extracted() -> None:
     from pathlib import Path
 
@@ -402,11 +455,13 @@ def test_load_nemo_model_prefers_fast_restore_when_extracted() -> None:
     with (
         patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
         patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
+        patch("parakeet_transcribe.backend.ready_snapshot_available", return_value=False),
         patch("parakeet_transcribe.backend.restore_extracted_model", side_effect=fake_fast_restore),
     ):
-        model = _load_nemo_model(PARAKEET_V3)
+        model, ready = _load_nemo_model(PARAKEET_V3)
 
     assert model == "fast-model"
+    assert ready is False
     assert captured["fast"] == (PARAKEET_V3, FakeASRModel, extracted)
     assert "restore_from" not in captured
     assert "pretrained" not in captured
@@ -438,14 +493,16 @@ def test_load_nemo_model_falls_back_to_restore_from_when_fast_restore_fails() ->
         patch("parakeet_transcribe.backend.ensure_extracted", return_value=extracted),
         patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
         patch("parakeet_transcribe.backend._import_save_restore_connector", return_value=FakeConnector),
+        patch("parakeet_transcribe.backend.ready_snapshot_available", return_value=False),
         patch(
             "parakeet_transcribe.backend.restore_extracted_model",
             side_effect=RuntimeError("fast path broke"),
         ),
     ):
-        model = _load_nemo_model(PARAKEET_V3)
+        model, ready = _load_nemo_model(PARAKEET_V3)
 
     assert model == "restored-model"
+    assert ready is False
     assert captured["path"] == str(extracted)
     assert captured["connector"].model_extracted_dir == str(extracted)
 
@@ -471,9 +528,10 @@ def test_load_nemo_model_falls_back_to_pretrained_without_extracted_dir() -> Non
         patch("parakeet_transcribe.backend._import_nemo_asr", return_value=FakeASRModels()),
         patch("parakeet_transcribe.backend._import_save_restore_connector") as connector_import,
     ):
-        model = _load_nemo_model(PARAKEET_V3)
+        model, ready = _load_nemo_model(PARAKEET_V3)
 
     assert model == "pretrained-model"
+    assert ready is False
     extract_after.assert_called_once_with(PARAKEET_V3)
     connector_import.assert_not_called()
 
@@ -509,11 +567,161 @@ def test_backend_load_uses_helper_and_keeps_existing_model() -> None:
     backend = NeMoASRBackend(PARAKEET_V3)
     with (
         patch("parakeet_transcribe.backend._import_nemo_asr", return_value=object()),
-        patch("parakeet_transcribe.backend._load_nemo_model", return_value=FakeModel()) as loader,
+        patch("parakeet_transcribe.backend._load_nemo_model", return_value=(FakeModel(), False)) as loader,
         patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch),
+        patch("parakeet_transcribe.backend.write_ready_snapshot") as snapshot,
     ):
         backend.load()
         backend.load()
 
     assert loader.call_count == 1
     assert backend.model is not None
+
+
+def test_backend_load_ready_model_skips_rebuilds_and_sets_fingerprint() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    order: list = []
+
+    class FakeModel:
+        cfg = SimpleNamespace(
+            decoding=OmegaConf.create({"strategy": "greedy", "greedy": {}}),
+        )
+
+        def eval(self) -> None:
+            order.append("eval")
+
+        def to(self, *args, **kwargs) -> None:
+            order.append(("to", kwargs.get("dtype", args[0] if args else None)))
+
+        def change_attention_model(self, **kwargs) -> None:
+            order.append("change_attention_model")
+
+        def change_decoding_strategy(self, cfg) -> None:
+            order.append("change_decoding_strategy")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True),
+        device=lambda *args, **kwargs: "cuda",
+        float16="float16",
+    )
+    backend = NeMoASRBackend(PARAKEET_V3)
+    with (
+        patch("parakeet_transcribe.backend._import_nemo_asr", return_value=object()),
+        patch("parakeet_transcribe.backend._load_nemo_model", return_value=(FakeModel(), True)),
+        patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch),
+        patch("parakeet_transcribe.backend.write_ready_snapshot") as snapshot,
+    ):
+        backend.load()
+
+    # Ready-state models arrive fully configured: no attention/decoding
+    # rebuild, no FP32 upcast — only the leftover-buffer FP16 cast.
+    assert order == ["eval", ("to", "float16")]
+    # The baked default decoding (no phrases, offline, timestamps) is marked
+    # active so the first configure_decoding call is a no-op.
+    assert backend._decoding_fingerprint == ((), 1.0, True, False, True)
+    snapshot.assert_not_called()
+
+
+def test_build_decoding_config_bakes_ready_default() -> None:
+    from omegaconf import OmegaConf
+
+    from parakeet_transcribe.backend import build_decoding_config
+
+    base = OmegaConf.create({"strategy": "greedy", "greedy": {"max_symbols": 10}})
+    cfg = build_decoding_config(base, phrases=(), alpha=1.0, word_confidence=True)
+    assert cfg.strategy == "greedy_batch"
+    assert cfg.preserve_alignments is True
+    assert cfg.compute_timestamps is True
+    assert cfg.greedy.use_cuda_graph_decoder is False  # NeMo #15423 invariant
+    assert cfg.greedy.loop_labels is True
+    assert cfg.greedy.preserve_alignments is True
+    assert "boosting_tree" not in cfg.greedy
+    assert cfg.confidence_cfg.preserve_word_confidence is True
+
+
+def test_backend_park_and_revive_round_trip() -> None:
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    calls: list = []
+
+    class FakeModel:
+        def eval(self) -> None:
+            calls.append("eval")
+
+        def to(self, *args, **kwargs) -> None:
+            calls.append(args[0] if args else kwargs)
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+        device=lambda *args, **kwargs: "cuda",
+        float16="float16",
+    )
+    backend = NeMoASRBackend(PARAKEET_V3)
+    backend._decoding_fingerprint = ((), 1.0, True, False, True)
+    backend.model = FakeModel()
+    with patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch):
+        backend.park()
+        assert backend.parked is True
+        assert calls == ["cpu"]
+        # Revive moves the same object back to CUDA without reconstruction.
+        backend.load()
+    assert backend.parked is False
+    assert calls == ["cpu", "cuda", "eval"]
+    assert backend.model is not None
+    # Parking preserves the decoding fingerprint; no reconfiguration needed.
+    assert backend._decoding_fingerprint == ((), 1.0, True, False, True)
+
+
+def test_backend_park_failure_falls_back_to_unload() -> None:
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    class FakeModel:
+        def to(self, *args, **kwargs) -> None:
+            raise RuntimeError("device move failed")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+        device=lambda *args, **kwargs: "cuda",
+        float16="float16",
+    )
+    backend = NeMoASRBackend(PARAKEET_V3)
+    backend.model = FakeModel()
+    with patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch):
+        backend.park()
+    # VRAM release is guaranteed: a failed park fully unloads.
+    assert backend.parked is False
+    assert backend.model is None
+
+
+def test_backend_revive_failure_unloads_and_raises() -> None:
+    from parakeet_transcribe.backend import NeMoASRBackend
+    from parakeet_transcribe.models import PARAKEET_V3
+
+    class FakeModel:
+        def eval(self) -> None:
+            return None
+
+        def to(self, *args, **kwargs) -> None:
+            raise RuntimeError("cuda oom")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+        device=lambda *args, **kwargs: "cuda",
+        float16="float16",
+    )
+    backend = NeMoASRBackend(PARAKEET_V3)
+    backend.model = FakeModel()
+    backend._parked = True
+    with (
+        patch("parakeet_transcribe.backend._torch_runtime", return_value=fake_torch),
+        pytest.raises(TranscriptionError, match="Failed to revive"),
+    ):
+        backend.load()
+    assert backend.model is None
+    assert backend.parked is False

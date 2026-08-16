@@ -48,7 +48,7 @@ Without watch, after editing `src/` you can still skip a rebuild and just restar
 docker compose restart
 ```
 
-Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). Models are **not** loaded at startup: the first transcription request loads the selected model into VRAM, and it is unloaded automatically after 3 minutes of inactivity (`PARAKEET_IDLE_UNLOAD_SECONDS`, default `180`; set `0` to keep it resident). Use **Unload model** to free VRAM immediately. Checkpoints are pre-extracted once into `docker-data/model_cache/extracted` so later cold loads skip NeMo's per-load tar decompression. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
+Open `http://127.0.0.1:7860`. Model weights download once into the host bind mount `docker-data/model_cache` (not baked into the image). Models are **not** loaded at startup: the first transcription request loads the selected model into VRAM. After 3 minutes of inactivity (`PARAKEET_IDLE_UNLOAD_SECONDS`, default `180`; `0` keeps it in VRAM) the model is **parked in system RAM** — VRAM is freed and the next request revives it in seconds — unless `PARAKEET_IDLE_PARK=0` drops it entirely. Use **Unload model** to free VRAM *and* RAM immediately. Cold loads are layered: checkpoints are pre-extracted once into `docker-data/model_cache/extracted`, converted once to FP16 safetensors (mirrored to fast container-local storage at startup via `PARAKEET_CACHE_PREWARM`), and after the first successful load a ready-state snapshot (local-attention config + post-reconfiguration FP16 weights) is saved so later cold loads skip NeMo's attention/decoding rebuilds and the tar decompression entirely. Triton's JIT cache is persisted under `docker-data/model_cache/triton` so JIT compilation is paid once, not per container. Exports are written to `docker-data/outputs` (`PARAKEET_OUTPUT_DIR=/data/outputs`) and are served through Gradio via `allowed_paths`. Stop the service with `docker compose down`.
 
 
 Inside the container you can also run:
@@ -61,7 +61,8 @@ parakeet-transcribe doctor
 
 - **Keyterms** + **boost strength**: NeMo GPU-PB shallow fusion for proper nouns / rare phrases.
 - **Chunk batch size** (UI, 1–16): used when long-form local attention OOMs and the service falls back to chunked transcription. Default is 2.
-- **Idle unload**: the loaded model is evicted from VRAM after `PARAKEET_IDLE_UNLOAD_SECONDS` (default 180) of inactivity; `0` keeps it resident until **Unload model** is pressed. The first request after an eviction pays a cold load again.
+- **Idle park**: after `PARAKEET_IDLE_UNLOAD_SECONDS` (default 180) of inactivity the model moves from VRAM to system RAM (freeing VRAM; ~1.3 GB RAM for a 0.6B FP16 model) and the next request revives it in ~1-3s. `0` disables idle eviction (model stays in VRAM); `PARAKEET_IDLE_PARK=0` drops the model entirely instead of parking (frees all memory, next request pays a cold load).
+- **Cold-load caches**: a disk-only startup pre-warm (`PARAKEET_CACHE_PREWARM`, default on; extra models via `PARAKEET_PREWARM_MODELS`) extracts checkpoints, builds the one-time FP16 safetensors, and mirrors weights to container-local storage before the first request. After the first successful load of a model, a ready-state snapshot makes later cold loads skip the attention/decoding rebuilds. The first-ever load of each model is the only slow one.
 
 ## Host development (tests / lint only)
 

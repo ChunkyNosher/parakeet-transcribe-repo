@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -7,7 +8,14 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .modelstore import ensure_extracted, extract_after_load, restore_extracted_model
+from .modelstore import (
+    ensure_extracted,
+    extract_after_load,
+    ready_snapshot_available,
+    restore_extracted_model,
+    restore_ready_model,
+    write_ready_snapshot,
+)
 from .types import CancelledError, ChunkResult, ModelSpec, Segment, TranscriptionError, WordTimestamp
 
 SAMPLE_RATE = 16000
@@ -152,25 +160,42 @@ def _import_save_restore_connector() -> Any:
     return SaveRestoreConnector
 
 
-def _load_nemo_model(spec: ModelSpec) -> Any:
-    """Instantiate a NeMo ASR model, preferring a persistent extracted checkpoint.
+def _ready_restore_enabled() -> bool:
+    """PARAKEET_READY_RESTORE=0 disables the ready-state snapshot fast path."""
+    return os.environ.get("PARAKEET_READY_RESTORE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-    When a pre-extracted directory exists (see ``modelstore``), restore from it
-    via the fast path (overlapped GPU weight I/O + construction, direct tensor
-    assignment, FP16 safetensors once converted). If the fast path fails for
-    any reason, fall back to NeMo's stock ``restore_from`` with
-    ``SaveRestoreConnector.model_extracted_dir`` so NeMo skips the ~2.5 GB tar
-    decompression it otherwise performs on every ``from_pretrained`` call.
-    Falls back to the stock ``from_pretrained`` path (which also handles the
-    first-ever download) and then triggers a best-effort extraction so the next
-    cold start is faster.
+
+def _load_nemo_model(spec: ModelSpec) -> tuple[Any, bool]:
+    """Instantiate a NeMo ASR model, preferring the fastest cached source.
+
+    Returns ``(model, ready)`` where ``ready`` means the model was restored
+    from a ready-state snapshot: long-form local attention, the default greedy
+    decoding, and FP16 weights are already baked in, so the caller skips the
+    attention/decoding rebuilds and the FP32→FP16 cast.
+
+    Source priority: ready-state snapshot → pre-extracted directory via the
+    fast path (overlapped GPU weight I/O + construction, direct tensor
+    assignment, FP16 safetensors once converted) → NeMo's stock
+    ``restore_from`` with ``SaveRestoreConnector.model_extracted_dir`` (skips
+    the ~2.5 GB tar decompression ``from_pretrained`` performs every call) →
+    stock ``from_pretrained`` (first-ever download, followed by a best-effort
+    extraction so the next cold start is faster).
     """
     nemo_asr = _import_nemo_asr()
 
     extracted = ensure_extracted(spec)
     if extracted is not None:
+        if ready_snapshot_available(extracted) and _ready_restore_enabled():
+            try:
+                return restore_ready_model(spec, nemo_asr.models.ASRModel, extracted), True
+            except Exception as exc:
+                print(
+                    f"Ready-state restore failed for {spec.model_id} ({exc}); "
+                    "falling back to the standard restore.",
+                    flush=True,
+                )
         try:
-            return restore_extracted_model(spec, nemo_asr.models.ASRModel, extracted)
+            return restore_extracted_model(spec, nemo_asr.models.ASRModel, extracted), False
         except Exception as exc:
             print(
                 f"Fast checkpoint restore failed for {spec.model_id} ({exc}); "
@@ -179,13 +204,16 @@ def _load_nemo_model(spec: ModelSpec) -> Any:
             )
         connector = _import_save_restore_connector()()
         connector.model_extracted_dir = str(extracted)
-        return nemo_asr.models.ASRModel.restore_from(
-            str(extracted),
-            save_restore_connector=connector,
+        return (
+            nemo_asr.models.ASRModel.restore_from(
+                str(extracted),
+                save_restore_connector=connector,
+            ),
+            False,
         )
     model = nemo_asr.models.ASRModel.from_pretrained(spec.model_id)
     extract_after_load(spec)
-    return model
+    return model, False
 
 
 def _disable_decoder_cuda_graphs(model: Any) -> None:
@@ -208,6 +236,73 @@ def _disable_decoder_cuda_graphs(model: Any) -> None:
             pass
 
 
+def build_decoding_config(
+    base_decoding: Any,
+    *,
+    phrases: Sequence[str],
+    alpha: float,
+    word_confidence: bool,
+    streaming: bool = False,
+    timestamps: bool = True,
+) -> Any:
+    """Build the greedy decoding config installed via ``change_decoding_strategy``.
+
+    Pure function of the model's base decoding config so the ready-state
+    snapshot can bake the identical no-key-phrase default into its saved
+    config (see ``modelstore.write_ready_snapshot``). Must stay in sync with
+    what ``NeMoASRBackend`` requests at transcription time.
+    """
+    from omegaconf import OmegaConf, open_dict
+
+    decoding_cfg = OmegaConf.create(OmegaConf.to_container(base_decoding, resolve=True))
+    with open_dict(decoding_cfg):
+        decoding_cfg.strategy = "greedy_batch"
+        # Offline NeMo timestamps are reconstructed from preserved alignments. NeMo's
+        # stateful RNNT/TDT streaming path instead carries token durations between
+        # bounded encoder windows, so retaining frame alignments would defeat the
+        # bounded-memory design.
+        decoding_cfg.preserve_alignments = not streaming
+        decoding_cfg.compute_timestamps = bool(timestamps and not streaming)
+        decoding_cfg.tdt_include_token_duration = bool(timestamps and streaming)
+        greedy = decoding_cfg.setdefault("greedy", {})
+        # CUDA-graph capture in the TDT label-looping decoder corrupts
+        # torch.load(weights_only=True) for the rest of the process
+        # (NeMo issue #15423): from the first graph-captured
+        # model.transcribe() on, deserializing a payload with 4+ tensors
+        # fails with "Trying to call reduce for unrecognized function ...".
+        # This app evicts and reloads models (torch.load-based fallback
+        # and FP16 conversion), so keep the decoder graph-free.
+        greedy["use_cuda_graph_decoder"] = False
+        greedy["loop_labels"] = True
+        greedy["preserve_alignments"] = not streaming
+        if phrases:
+            greedy["boosting_tree"] = {
+                "key_phrases_list": list(phrases),
+                "context_score": 1.0,
+                "depth_scaling": 2.0,
+            }
+            greedy["boosting_tree_alpha"] = alpha
+        else:
+            greedy.pop("boosting_tree", None)
+            greedy.pop("boosting_tree_alpha", None)
+        preserve_confidence = word_confidence and not streaming
+        decoding_cfg["confidence_cfg"] = {
+            "preserve_frame_confidence": preserve_confidence,
+            "preserve_token_confidence": preserve_confidence,
+            "preserve_word_confidence": preserve_confidence,
+            "aggregation": "min",
+            "exclude_blank": True,
+            "tdt_include_duration": False,
+            "method_cfg": {
+                "name": "entropy",
+                "entropy_type": "tsallis",
+                "alpha": 0.33,
+                "entropy_norm": "exp",
+            },
+        }
+    return decoding_cfg
+
+
 class NeMoASRBackend:
     """In-process NeMo ASR backend for NVIDIA Parakeet TDT and Nemotron RNNT checkpoints."""
 
@@ -219,6 +314,7 @@ class NeMoASRBackend:
         self._word_confidence_enabled = True
         self._word_confidence_fallback_used = False
         self._decoding_fingerprint: tuple[tuple[str, ...], float, bool, bool, bool] | None = None
+        self._parked = False
         # Serializes load() when the optional startup preload thread and a
         # user request race for the same backend instance.
         self._load_lock = threading.Lock()
@@ -227,11 +323,53 @@ class NeMoASRBackend:
     def word_confidence_fallback_used(self) -> bool:
         return self._word_confidence_fallback_used
 
+    @property
+    def parked(self) -> bool:
+        return self._parked and self.model is not None
+
     def load(self) -> None:
         with self._load_lock:
             if self.model is not None:
+                if self._parked:
+                    self._revive_locked()
                 return
             self._load_locked()
+
+    def park(self) -> None:
+        """Release VRAM while keeping the configured model resident in system RAM.
+
+        The next ``load()`` revives it with a host→GPU copy (~seconds) instead
+        of a full checkpoint restore. Full teardown stays available via
+        ``unload()``.
+        """
+        if self.model is None or self._parked:
+            return
+        torch = _torch_runtime()
+        try:
+            self.model.to("cpu")
+        except Exception:  # pragma: no cover - guarantee VRAM release anyway
+            self.unload()
+            return
+        self._parked = True
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _revive_locked(self) -> None:
+        """Move a parked model back to CUDA (host→GPU copy, no rebuilds)."""
+        assert self.model is not None
+        torch = _torch_runtime()
+        started = time.perf_counter()
+        try:
+            self.model.to(torch.device("cuda"))
+            self.model.eval()
+        except Exception as exc:
+            self.unload()
+            raise TranscriptionError(f"Failed to revive parked model {self.spec.model_id}: {exc}") from exc
+        self._parked = False
+        print(
+            f"Model {self.spec.model_id} revived from system RAM in {time.perf_counter() - started:.2f}s",
+            flush=True,
+        )
 
     def _load_locked(self) -> None:
         torch = _torch_runtime()
@@ -250,39 +388,99 @@ class NeMoASRBackend:
                 "CUDA is unavailable. Run inside the Docker Compose Linux GPU container."
             )
         import_elapsed = time.perf_counter() - phase_started
+        ready = False
+        base_decoding: Any = None
         try:
             phase_started = time.perf_counter()
-            self.model = _load_nemo_model(self.spec)
+            self.model, ready = _load_nemo_model(self.spec)
             restore_elapsed = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
             self.model.eval()
-            self.model.to(torch.device("cuda"))
-            # Attention/decoding rebuild modules in FP32; cast precision after those calls.
-            self._configure_longform_attention()
+            if not ready:
+                self.model.to(torch.device("cuda"))
+                # Captured before configure_decoding replaces the node: the
+                # ready-snapshot writer bakes the default decoding from it.
+                base_decoding = self.model.cfg.decoding
+                # Attention/decoding rebuild modules in FP32; cast precision after those calls.
+                self._configure_longform_attention()
             attention_elapsed = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
-            self.configure_decoding(self._key_phrases, self._boost_alpha)
+            if ready:
+                # Belt-and-suspenders: the baked decoding already has decoder
+                # CUDA graphs disabled (NeMo #15423), but re-assert it.
+                _disable_decoder_cuda_graphs(self.model)
+                self._init_ready_decoding_fingerprint()
+            else:
+                self.configure_decoding(self._key_phrases, self._boost_alpha)
             decoding_elapsed = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
-            self._apply_inference_dtype()
+            if ready:
+                # Parameters are already FP16 from the snapshot; only leftover
+                # floating buffers (built FP32) need the cast.
+                self.model.to(dtype=torch.float16)
+            else:
+                self._apply_inference_dtype()
             dtype_elapsed = time.perf_counter() - phase_started
 
+            warmup_started = time.perf_counter()
             self._warmup_decode()
+            warmup_elapsed = time.perf_counter() - warmup_started
             print(
                 f"Model {self.spec.model_id} ready in {time.perf_counter() - load_started:.2f}s "
                 f"(import {import_elapsed:.2f}s, restore {restore_elapsed:.2f}s, "
                 f"attention {attention_elapsed:.2f}s, decoding {decoding_elapsed:.2f}s, "
-                f"dtype {dtype_elapsed:.2f}s)",
+                f"dtype {dtype_elapsed:.2f}s, warmup {warmup_elapsed:.2f}s"
+                f"{', ready-state snapshot' if ready else ''})",
                 flush=True,
             )
+            if not ready:
+                self._spawn_ready_snapshot(base_decoding)
         except Exception as exc:
             self.model = None
             self._decoding_fingerprint = None
+            self._parked = False
             raise_if_triton_compiler_error(exc)
             raise
+
+    def _init_ready_decoding_fingerprint(self) -> None:
+        """Mark the snapshot's baked-in default decoding as active.
+
+        The snapshot bakes the no-key-phrase greedy default, so the first
+        ``configure_decoding`` call with no phrases must be a no-op. A pending
+        key-phrase request still rebuilds the decoding strategy as usual.
+        """
+        if self._key_phrases:
+            self.configure_decoding(self._key_phrases, self._boost_alpha)
+            return
+        self._decoding_fingerprint = (
+            (),
+            float(self._boost_alpha),
+            self._word_confidence_enabled,
+            False,
+            True,
+        )
+
+    def _spawn_ready_snapshot(self, base_decoding: Any) -> None:
+        """Save the ready-state snapshot in the background after a standard load."""
+        assert self.model is not None
+        decoding_cfg = build_decoding_config(
+            base_decoding,
+            phrases=(),
+            alpha=1.0,
+            word_confidence=True,
+        )
+        model, spec = self.model, self.spec
+
+        def _work() -> None:
+            try:
+                write_ready_snapshot(spec, model, decoding_cfg)
+            except Exception as exc:  # pragma: no cover - best-effort cache
+                print(f"Ready-state snapshot skipped for {spec.model_id}: {exc}", flush=True)
+
+        threading.Thread(target=_work, name="parakeet-ready-snapshot", daemon=True).start()
 
     def _warmup_decode(self) -> None:
         """Run one tiny silent decode so the first real transcription is warm.
@@ -351,6 +549,7 @@ class NeMoASRBackend:
         except Exception:  # pragma: no cover - best-effort teardown
             pass
         self.model = None
+        self._parked = False
         self._decoding_fingerprint = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -403,59 +602,14 @@ class NeMoASRBackend:
     ) -> None:
         assert self.model is not None
         try:
-            from omegaconf import OmegaConf, open_dict
-        except ImportError as exc:  # pragma: no cover
-            raise TranscriptionError("omegaconf is required for NeMo decoding configuration.") from exc
-
-        decoding_cfg = OmegaConf.create(
-            OmegaConf.to_container(self.model.cfg.decoding, resolve=True)
-        )
-        with open_dict(decoding_cfg):
-            decoding_cfg.strategy = "greedy_batch"
-            # Offline NeMo timestamps are reconstructed from preserved alignments. NeMo's
-            # stateful RNNT/TDT streaming path instead carries token durations between
-            # bounded encoder windows, so retaining frame alignments would defeat the
-            # bounded-memory design.
-            decoding_cfg.preserve_alignments = not streaming
-            decoding_cfg.compute_timestamps = bool(timestamps and not streaming)
-            decoding_cfg.tdt_include_token_duration = bool(timestamps and streaming)
-            greedy = decoding_cfg.setdefault("greedy", {})
-            # CUDA-graph capture in the TDT label-looping decoder corrupts
-            # torch.load(weights_only=True) for the rest of the process
-            # (NeMo issue #15423): from the first graph-captured
-            # model.transcribe() on, deserializing a payload with 4+ tensors
-            # fails with "Trying to call reduce for unrecognized function ...".
-            # This app evicts and reloads models (torch.load-based fallback
-            # and FP16 conversion), so keep the decoder graph-free.
-            greedy["use_cuda_graph_decoder"] = False
-            greedy["loop_labels"] = True
-            greedy["preserve_alignments"] = not streaming
-            if phrases:
-                greedy["boosting_tree"] = {
-                    "key_phrases_list": list(phrases),
-                    "context_score": 1.0,
-                    "depth_scaling": 2.0,
-                }
-                greedy["boosting_tree_alpha"] = alpha
-            else:
-                greedy.pop("boosting_tree", None)
-                greedy.pop("boosting_tree_alpha", None)
-            preserve_confidence = self._word_confidence_enabled and not streaming
-            decoding_cfg["confidence_cfg"] = {
-                "preserve_frame_confidence": preserve_confidence,
-                "preserve_token_confidence": preserve_confidence,
-                "preserve_word_confidence": preserve_confidence,
-                "aggregation": "min",
-                "exclude_blank": True,
-                "tdt_include_duration": False,
-                "method_cfg": {
-                    "name": "entropy",
-                    "entropy_type": "tsallis",
-                    "alpha": 0.33,
-                    "entropy_norm": "exp",
-                },
-            }
-        try:
+            decoding_cfg = build_decoding_config(
+                self.model.cfg.decoding,
+                phrases=phrases,
+                alpha=alpha,
+                word_confidence=self._word_confidence_enabled,
+                streaming=streaming,
+                timestamps=timestamps,
+            )
             self.model.change_decoding_strategy(decoding_cfg)
             _disable_decoder_cuda_graphs(self.model)
         except Exception as exc:

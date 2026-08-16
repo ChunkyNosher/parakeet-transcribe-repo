@@ -282,12 +282,13 @@ def build_app() -> gr.Blocks:
                     step=1,
                     label="Chunk batch size (OOM fallback)",
                     info=f"Used when long-form local attention OOMs and the app falls back to chunking "
-                    f"(max {MAX_BATCH_SIZE}). The model unloads after 3 idle minutes to free VRAM.",
+                    f"(max {MAX_BATCH_SIZE}). The model parks in system RAM after 3 idle minutes to free VRAM "
+f"(next request revives it in seconds).",
                 )
                 diarize = gr.Checkbox(
                     label="Speaker diarization (Sortformer GPU, MFCC fallback)",
                     value=False,
-                    info="Unloads ASR briefly, runs NeMo Sortformer on CUDA, then falls back to CPU MFCC if needed. Best with Parakeet timestamps.",
+                    info="Parks ASR in RAM briefly, runs NeMo Sortformer on CUDA, then falls back to CPU MFCC if needed. Best with Parakeet timestamps.",
                 )
                 summarize = gr.Checkbox(
                     label="Extractive summary + chapters",

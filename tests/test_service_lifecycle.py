@@ -9,8 +9,9 @@ from parakeet_transcribe.service import IDLE_UNLOAD_SECONDS, TranscriptionServic
 
 
 def _fake_backend() -> SimpleNamespace:
-    backend = SimpleNamespace(unloaded=False)
+    backend = SimpleNamespace(unloaded=False, parked=False)
     backend.unload = lambda: setattr(backend, "unloaded", True)
+    backend.park = lambda: setattr(backend, "parked", True)
     return backend
 
 
@@ -24,7 +25,7 @@ def _fresh_service() -> TranscriptionService:
 
 
 def _reload_service_module(monkeypatch) -> object:
-    """Reload service.py so IDLE_UNLOAD_SECONDS re-reads the environment."""
+    """Reload service.py so module-level constants re-read the environment."""
     import parakeet_transcribe.service as service_module
 
     try:
@@ -32,6 +33,7 @@ def _reload_service_module(monkeypatch) -> object:
         yield service_module
     finally:
         monkeypatch.delenv("PARAKEET_IDLE_UNLOAD_SECONDS", raising=False)
+        monkeypatch.delenv("PARAKEET_IDLE_PARK", raising=False)
         importlib.reload(service_module)
 
 
@@ -49,6 +51,34 @@ def test_idle_unload_constant_clamps_below_10(monkeypatch) -> None:
     monkeypatch.setenv("PARAKEET_IDLE_UNLOAD_SECONDS", "2")
     for module in _reload_service_module(monkeypatch):
         assert module.IDLE_UNLOAD_SECONDS == 10.0
+
+
+def test_idle_unload_zero_disables_eviction(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_IDLE_UNLOAD_SECONDS", "0")
+    for module in _reload_service_module(monkeypatch):
+        assert module.IDLE_UNLOAD_SECONDS == 0.0
+        service = module.TranscriptionService(cache_dir=Path("."))
+        service._stop_reaper()
+        service._reaper.join(timeout=5.0)
+        backend = _fake_backend()
+        service._backend = backend
+        service._model_key = "parakeet-v3"
+        service._last_used = 1.0
+        with patch.object(module.time, "monotonic", return_value=1_000.0):
+            assert service._maybe_idle_unload() is False
+        assert backend.unloaded is False
+        assert backend.parked is False
+
+
+def test_idle_parking_enabled_by_default(monkeypatch) -> None:
+    for module in _reload_service_module(monkeypatch):
+        assert module.IDLE_PARK_ENABLED is True
+
+
+def test_idle_parking_disabled_via_env(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_IDLE_PARK", "0")
+    for module in _reload_service_module(monkeypatch):
+        assert module.IDLE_PARK_ENABLED is False
 
 
 def test_unload_when_nothing_loaded() -> None:
@@ -72,14 +102,53 @@ def test_unload_releases_backend_and_clears_timer() -> None:
     unload_punct.assert_called_once()
 
 
-def test_reaper_evicts_after_idle_timeout() -> None:
+def test_reaper_parks_after_idle_timeout() -> None:
     service = _fresh_service()
-    service._backend = _fake_backend()
+    backend = _fake_backend()
+    service._backend = backend
     service._model_key = "parakeet-v3"
     service._last_used = 1.0
-    with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0):
+    with (
+        patch("parakeet_transcribe.service.unload_punctuation_model") as unload_punct,
+        patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0),
+    ):
         assert service._maybe_idle_unload() is True
-    assert service._backend is None
+    # Idle eviction parks the model in system RAM: the backend (and its
+    # configured decoding fingerprint) is kept for a fast revive.
+    assert backend.parked is True
+    assert backend.unloaded is False
+    assert service._backend is backend
+    assert service._last_used is None
+    unload_punct.assert_called_once()
+
+
+def test_reaper_skips_already_parked_backend() -> None:
+    service = _fresh_service()
+    backend = _fake_backend()
+    backend.parked = True
+    service._backend = backend
+    service._model_key = "parakeet-v3"
+    service._last_used = None
+    assert service._maybe_idle_unload() is False
+    assert service._backend is backend
+
+
+def test_reaper_drops_when_parking_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_IDLE_PARK", "0")
+    for module in _reload_service_module(monkeypatch):
+        service = module.TranscriptionService(cache_dir=Path("."))
+        service._stop_reaper()
+        service._reaper.join(timeout=5.0)
+        backend = _fake_backend()
+        service._backend = backend
+        service._model_key = "parakeet-v3"
+        service._last_used = 1.0
+        with patch.object(module.time, "monotonic", return_value=1.0 + module.IDLE_UNLOAD_SECONDS + 1.0):
+            assert service._maybe_idle_unload() is True
+        # PARAKEET_IDLE_PARK=0 restores the pre-parking full-drop behavior.
+        assert backend.unloaded is True
+        assert backend.parked is False
+        assert service._backend is None
 
 
 def test_reaper_keeps_freshly_used_model() -> None:
@@ -91,6 +160,7 @@ def test_reaper_keeps_freshly_used_model() -> None:
     with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS - 1.0):
         assert service._maybe_idle_unload() is False
     assert service._backend is backend
+    assert backend.parked is False
 
 
 def test_reaper_never_evicts_during_job() -> None:
@@ -103,6 +173,7 @@ def test_reaper_never_evicts_during_job() -> None:
     with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0):
         assert service._maybe_idle_unload() is False
     assert service._backend is backend
+    assert backend.parked is False
 
 
 def test_get_backend_reuses_fresh_backend() -> None:
@@ -117,21 +188,33 @@ def test_get_backend_reuses_fresh_backend() -> None:
     assert service._last_used == 1.0 + IDLE_UNLOAD_SECONDS - 1.0
 
 
-def test_get_backend_reloads_stale_model() -> None:
+def test_get_backend_reuses_idle_same_key_backend() -> None:
     service = _fresh_service()
-    stale = _fake_backend()
-    service._backend = stale
+    resident = _fake_backend()
+    service._backend = resident
     service._model_key = "parakeet-v3"
     service._last_used = 1.0
-    with (
-        patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0),
-        patch("parakeet_transcribe.service.NeMoASRBackend") as backend_cls,
-    ):
-        backend_cls.return_value = _fake_backend()
+    with patch("parakeet_transcribe.service.time.monotonic", return_value=1.0 + IDLE_UNLOAD_SECONDS + 1.0):
         backend = service._get_backend("parakeet-v3")
-    assert stale.unloaded is True
-    assert backend is not stale
-    assert service._model_key == "parakeet-v3"
+    # A resident-but-idle backend is reused as-is: it is either still warm in
+    # VRAM or parked, and backend.load() revives a parked one cheaply.
+    assert backend is resident
+    assert resident.unloaded is False
+    assert resident.parked is False
+    assert service._last_used == 1.0 + IDLE_UNLOAD_SECONDS + 1.0
+
+
+def test_get_backend_reuses_parked_backend_and_restarts_timer() -> None:
+    service = _fresh_service()
+    backend = _fake_backend()
+    backend.parked = True
+    service._backend = backend
+    service._model_key = "parakeet-v3"
+    service._last_used = None
+    with patch("parakeet_transcribe.service.time.monotonic", return_value=42.0):
+        resolved = service._get_backend("parakeet-v3")
+    assert resolved is backend
+    assert service._last_used == 42.0
 
 
 def test_get_backend_swaps_model_key() -> None:

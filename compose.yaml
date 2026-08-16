@@ -18,9 +18,19 @@ services:
       PARAKEET_OUTPUT_DIR: /data/outputs
       PARAKEET_SERVER_NAME: 0.0.0.0
       PARAKEET_SERVER_PORT: "7860"
-      # Models load lazily on the first transcription request and are evicted
-      # from VRAM after this many seconds of inactivity (0 disables the eviction).
+      # Models load lazily on the first transcription request. After this many
+      # seconds of inactivity the model is evicted from VRAM — by default parked
+      # in system RAM so the next request revives it in seconds (0 disables
+      # eviction entirely and keeps it in VRAM).
       PARAKEET_IDLE_UNLOAD_SECONDS: "180"
+      # 0 restores the pre-parking behavior: idle eviction drops the model
+      # entirely instead of keeping it in system RAM (~1.3 GB for 0.6B FP16).
+      PARAKEET_IDLE_PARK: "1"
+      # Disk-only startup pre-warm: extracts checkpoints, performs the one-time
+      # FP16 conversion, and mirrors weights to container-local storage before
+      # the first request. Uses no VRAM. Extra models: comma-separated keys.
+      PARAKEET_CACHE_PREWARM: "1"
+      PARAKEET_PREWARM_MODELS: ""
       # Optional: load this model key into VRAM in the background at startup
       # (e.g. "parakeet-v3"). Off by default; unset keeps lazy loading.
       PARAKEET_PRELOAD_MODEL: ""

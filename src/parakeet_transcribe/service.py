@@ -29,9 +29,27 @@ MAX_BATCH_SIZE = 16
 # boundary where stateful buffered decoding becomes the primary long-audio path.
 NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS = 30.0
 
-# Models load lazily on the first transcription request and are evicted from
-# VRAM after this many seconds of inactivity. Tune via PARAKEET_IDLE_UNLOAD_SECONDS.
-IDLE_UNLOAD_SECONDS = max(10.0, float(os.environ.get("PARAKEET_IDLE_UNLOAD_SECONDS", "180")))
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _idle_unload_seconds() -> float:
+    """Idle seconds before the resident model is evicted from VRAM.
+
+    0 disables idle eviction entirely (the model stays in VRAM); positive
+    values are clamped to a 10s floor so the reaper cannot thrash. Tune via
+    PARAKEET_IDLE_UNLOAD_SECONDS.
+    """
+    raw = os.environ.get("PARAKEET_IDLE_UNLOAD_SECONDS", "180").strip()
+    value = float(raw) if raw else 180.0
+    if value <= 0:
+        return 0.0
+    return max(10.0, value)
+
+
+IDLE_UNLOAD_SECONDS = _idle_unload_seconds()
+# Idle eviction parks the model in system RAM (fast revive on the next
+# request) instead of dropping it; PARAKEET_IDLE_PARK=0 restores the drop.
+IDLE_PARK_ENABLED = os.environ.get("PARAKEET_IDLE_PARK", "1").strip().lower() not in _FALSY
 _IDLE_REAPER_INTERVAL_SECONDS = 5.0
 
 
@@ -95,6 +113,22 @@ class TranscriptionService:
         self._model_key = None
         self._last_used = None
 
+    def _evict_locked(self) -> None:
+        """Free the resident model's VRAM. Caller must hold the lock.
+
+        With idle parking enabled the model moves to system RAM and the
+        backend object is kept, so the next request revives it with a
+        host→GPU copy instead of a full reload. Otherwise the backend is
+        dropped entirely (the pre-parking behavior).
+        """
+        if IDLE_PARK_ENABLED and self._backend is not None:
+            self._backend.park()
+            # `_last_used = None` also marks the parked state so the reaper
+            # does not try to park again on every tick.
+            self._last_used = None
+            return
+        self._release_backend_locked()
+
     def _mark_used(self) -> None:
         self._last_used = time.monotonic()
 
@@ -110,38 +144,41 @@ class TranscriptionService:
         self._reaper_stop.set()
 
     def _maybe_idle_unload(self) -> bool:
-        """Unload the resident model if it has been idle long enough.
+        """Release the resident model's VRAM if it has been idle long enough.
 
-        Returns True when the model was evicted. Never evicts while a
-        transcription job is running.
+        Parks it in system RAM (fast revive on the next request) when idle
+        parking is enabled, otherwise drops it entirely. Returns True when the
+        model was evicted. Never evicts while a transcription job is running.
         """
         with self._lock:
+            if IDLE_UNLOAD_SECONDS <= 0:
+                return False
             if self._in_use or self._backend is None or self._last_used is None:
+                # `_last_used is None` also covers an already-parked backend.
                 return False
             if time.monotonic() - self._last_used < IDLE_UNLOAD_SECONDS:
                 return False
-            self._release_backend_locked()
+            self._evict_locked()
         unload_punctuation_model()
-        print(
-            f"Model idle for {IDLE_UNLOAD_SECONDS:.0f}s; unloaded and CUDA cache released.",
-            flush=True,
+        action = (
+            "parked in system RAM for a fast revive"
+            if IDLE_PARK_ENABLED
+            else "unloaded and CUDA cache released"
         )
+        print(f"Model idle for {IDLE_UNLOAD_SECONDS:.0f}s; {action}.", flush=True)
         return True
 
     def _get_backend(self, model_key: str) -> NeMoASRBackend:
         with self._lock:
             if self._backend is not None:
                 if self._model_key == model_key:
-                    if self._last_used is not None and time.monotonic() - self._last_used >= IDLE_UNLOAD_SECONDS:
-                        # Stale even before the reaper fires: evict so this request
-                        # gets a fresh, warm-model load instead of a half-cold one.
-                        self._release_backend_locked()
-                    else:
-                        self._mark_used()
-                        return self._backend
-                else:
-                    # Different model selected: release the resident one first.
-                    self._release_backend_locked()
+                    # Same model: reuse the backend whether it is resident in
+                    # VRAM or parked in RAM — backend.load() revives a parked
+                    # model with a host→GPU copy.
+                    self._mark_used()
+                    return self._backend
+                # Different model selected: release the resident one first.
+                self._release_backend_locked()
             self._backend = NeMoASRBackend(get_model(model_key))
             self._model_key = model_key
             self._mark_used()
@@ -372,7 +409,9 @@ class TranscriptionService:
                 prepared.samples,
                 prepared.sample_rate,
                 audio_path=prepared.canonical_path,
-                release_vram=backend.unload,
+                # Park (RAM) instead of dropping: frees VRAM for Sortformer
+                # while keeping a fast revive for any follow-up request.
+                release_vram=backend.park,
             )
         if summarize or redact_pii or clean_format:
             progress(progress_base + progress_span * 0.96, "Applying transcript post-processing")
