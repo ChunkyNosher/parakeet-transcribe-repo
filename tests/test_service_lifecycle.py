@@ -34,6 +34,7 @@ def _reload_service_module(monkeypatch) -> object:
     finally:
         monkeypatch.delenv("PARAKEET_IDLE_UNLOAD_SECONDS", raising=False)
         monkeypatch.delenv("PARAKEET_IDLE_PARK", raising=False)
+        monkeypatch.delenv("PARAKEET_FORCE_INFERENCE_MODE", raising=False)
         importlib.reload(service_module)
 
 
@@ -281,3 +282,126 @@ def test_warmup_reuses_resident_backend() -> None:
         service.warmup("parakeet-v3")
     assert backend.loaded == 1
     assert service._backend is backend
+
+
+def test_force_inference_mode_defaults_to_auto(monkeypatch) -> None:
+    monkeypatch.delenv("PARAKEET_FORCE_INFERENCE_MODE", raising=False)
+    for module in _reload_service_module(monkeypatch):
+        assert module.FORCE_INFERENCE_MODE == "auto"
+
+
+def test_force_inference_mode_respects_env(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_FORCE_INFERENCE_MODE", "streaming")
+    for module in _reload_service_module(monkeypatch):
+        assert module.FORCE_INFERENCE_MODE == "streaming"
+
+
+def test_force_inference_mode_ignores_unknown_values(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_FORCE_INFERENCE_MODE", "banana")
+    for module in _reload_service_module(monkeypatch):
+        assert module.FORCE_INFERENCE_MODE == "auto"
+
+
+def _fake_prepared(duration_seconds: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        duration_seconds=duration_seconds,
+        source_path=Path("sample.wav"),
+        samples=SimpleNamespace(),
+        sample_rate=16000,
+        canonical_path=Path("sample.wav"),
+    )
+
+
+def _fake_backend_for_routing() -> SimpleNamespace:
+    backend = SimpleNamespace(
+        spec=SimpleNamespace(
+            model_id="nvidia/parakeet-tdt-0.6b-v3",
+            capabilities=SimpleNamespace(timestamps=True, lowercase_vocab=False),
+        ),
+        word_confidence_fallback_used=False,
+        used_paths=[],
+        used_streaming=[],
+    )
+
+    def configure_decoding(key_phrases, boost_alpha) -> None:
+        return None
+
+    def transcribe_paths(paths, *, timestamps, batch_size=1):
+        backend.used_paths.append(([str(path) for path in paths], timestamps, batch_size))
+        from parakeet_transcribe.types import ChunkResult
+
+        return [ChunkResult(text="offline text", words=[], detected_language=None, segments=[])]
+
+    def transcribe_streaming_audio(samples, sample_rate, *, timestamps, progress=None, cancel=None):
+        backend.used_streaming.append((timestamps, sample_rate))
+        from parakeet_transcribe.types import ChunkResult
+
+        return ChunkResult(text="streaming text", words=[], detected_language=None, segments=[])
+
+    backend.configure_decoding = configure_decoding
+    backend.transcribe_paths = transcribe_paths
+    backend.transcribe_streaming_audio = transcribe_streaming_audio
+    return backend
+
+
+def _run_prepared(module, backend, prepared) -> object:
+    service = module.TranscriptionService(cache_dir=Path("."))
+    service._stop_reaper()
+    service._reaper.join(timeout=5.0)
+    return service._transcribe_prepared(
+        backend,
+        prepared,
+        batch_size=1,
+        language="auto",
+        key_phrases=[],
+        boost_alpha=1.0,
+        progress=lambda fraction, description: None,
+        cancel=lambda: False,
+        progress_base=0.0,
+        progress_span=1.0,
+        work_dir=Path("."),
+    )
+
+
+def test_routing_uses_streaming_for_long_audio_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("PARAKEET_FORCE_INFERENCE_MODE", raising=False)
+    for module in _reload_service_module(monkeypatch):
+        backend = _fake_backend_for_routing()
+        result = _run_prepared(module, backend, _fake_prepared(duration_seconds=120.0))
+        assert backend.used_streaming == [(True, 16000)]
+        assert backend.used_paths == []
+        assert result.text == "streaming text"
+        assert result.runtime["inference_mode"] == "nemo_buffered_streaming"
+
+
+def test_routing_uses_offline_for_short_audio_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("PARAKEET_FORCE_INFERENCE_MODE", raising=False)
+    for module in _reload_service_module(monkeypatch):
+        backend = _fake_backend_for_routing()
+        result = _run_prepared(module, backend, _fake_prepared(duration_seconds=10.0))
+        assert backend.used_paths == [(["sample.wav"], True, 1)]
+        assert backend.used_streaming == []
+        assert result.text == "offline text"
+        assert result.runtime["inference_mode"] == "nemo_offline"
+
+
+def test_routing_force_offline_overrides_duration(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_FORCE_INFERENCE_MODE", "offline")
+    for module in _reload_service_module(monkeypatch):
+        backend = _fake_backend_for_routing()
+        result = _run_prepared(module, backend, _fake_prepared(duration_seconds=120.0))
+        assert backend.used_paths == [(["sample.wav"], True, 1)]
+        assert backend.used_streaming == []
+        assert result.text == "offline text"
+        assert result.runtime["inference_mode"] == "nemo_offline"
+
+
+def test_routing_force_streaming_overrides_duration(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_FORCE_INFERENCE_MODE", "streaming")
+    for module in _reload_service_module(monkeypatch):
+        backend = _fake_backend_for_routing()
+        result = _run_prepared(module, backend, _fake_prepared(duration_seconds=10.0))
+        assert backend.used_streaming == [(True, 16000)]
+        assert backend.used_paths == []
+        assert result.text == "streaming text"
+        assert result.runtime["inference_mode"] == "nemo_buffered_streaming"

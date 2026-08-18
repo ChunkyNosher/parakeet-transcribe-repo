@@ -24,3 +24,5 @@ logs/
 .pytest-tmp3
 .pytest-tmp*
 .zcode/
+.jspace/
+agent-artifacts/

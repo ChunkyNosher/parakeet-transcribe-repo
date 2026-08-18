@@ -29,6 +29,14 @@ MAX_BATCH_SIZE = 16
 # boundary where stateful buffered decoding becomes the primary long-audio path.
 NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS = 30.0
 
+# PARAKEET_FORCE_INFERENCE_MODE=auto|offline|streaming overrides the duration
+# routing so A/B harnesses can compare the offline long-form path against the
+# buffered streaming path on the same audio. "auto" (default) keeps the
+# >30s -> buffered streaming behavior.
+FORCE_INFERENCE_MODE = os.environ.get("PARAKEET_FORCE_INFERENCE_MODE", "auto").strip().lower()
+if FORCE_INFERENCE_MODE not in {"auto", "offline", "streaming"}:
+    FORCE_INFERENCE_MODE = "auto"
+
 _FALSY = {"0", "false", "no", "off"}
 
 
@@ -256,7 +264,12 @@ class TranscriptionService:
         chunk_results: list[ChunkResult] = []
         chunks: list[Any] = []
         used_chunking = False
-        used_nemo_streaming = prepared.duration_seconds > NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS
+        if FORCE_INFERENCE_MODE == "offline":
+            used_nemo_streaming = False
+        elif FORCE_INFERENCE_MODE == "streaming":
+            used_nemo_streaming = True
+        else:
+            used_nemo_streaming = prepared.duration_seconds > NEMO_BUFFERED_INFERENCE_THRESHOLD_SECONDS
 
         if cancel():
             raise CancelledError("Transcription cancelled before publishing outputs.")
